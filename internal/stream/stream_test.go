@@ -1,9 +1,12 @@
 package stream_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,18 +15,18 @@ import (
 
 // TestReader_DispatchesAllKnownTypes feeds one of every known event
 // kind through Reader.Next and asserts the concrete type plus a few
-// representative payload fields on each.
+// representative payload fields on each. The input is a realistic
+// session loaded from testdata/session.jsonl so the fixture doubles
+// as documentation of the wire format.
 func TestReader_DispatchesAllKnownTypes(t *testing.T) {
 	t.Parallel()
 
-	const input = `{"type":"system","subtype":"init","model":"opus","tools":["Read","Edit"]}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}]},"tool_use_result":{"file":"x"}}
-{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"tokens","status":"warning","utilization":0.75,"resetsAt":1700000000,"isUsingOverage":true}}
-{"type":"result","subtype":"success","num_turns":7,"duration_ms":1234,"total_cost_usd":0.42,"is_error":false,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":3},"structured_output":{"status":"DONE"}}
-`
+	input, err := os.ReadFile(filepath.Join("testdata", "session.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
 
-	r := stream.NewReader(strings.NewReader(input))
+	r := stream.NewReader(bytes.NewReader(input))
 
 	// system
 	ev, err := r.Next()

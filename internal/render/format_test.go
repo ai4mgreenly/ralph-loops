@@ -9,6 +9,7 @@ import (
 )
 
 func TestFormatToolCallParam(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		tool  string
@@ -65,7 +66,9 @@ func TestFormatToolCallParam(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
 			if got != tc.want {
 				t.Errorf("formatToolCallParam(%q, %s) = %q, want %q", tc.tool, tc.input, got, tc.want)
@@ -82,6 +85,7 @@ func TestFormatToolCallParam(t *testing.T) {
 // the same multi-key input and assert every call returns the same
 // string.
 func TestFormatToolCallParam_DeterministicFallback(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		tool  string
@@ -100,7 +104,9 @@ func TestFormatToolCallParam_DeterministicFallback(t *testing.T) {
 	}
 
 	for _, tc := range cases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			first := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
 			if first == "" {
 				t.Fatalf("expected non-empty result, got empty for input %s", tc.input)
@@ -116,6 +122,7 @@ func TestFormatToolCallParam_DeterministicFallback(t *testing.T) {
 }
 
 func TestFormatToolResult(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		tool       string
@@ -127,7 +134,7 @@ func TestFormatToolResult(t *testing.T) {
 			name:       "bash with stdout and stderr",
 			tool:       "Bash",
 			structured: `{"stdout":"hello\n","stderr":"warn\n"}`,
-			want:       "stdout=6b stderr=5b",
+			want:       "stdout=6B stderr=5B",
 		},
 		{
 			name:       "bash interrupted",
@@ -139,7 +146,7 @@ func TestFormatToolResult(t *testing.T) {
 			name:  "non-bash falls back to content size",
 			tool:  "Read",
 			block: stream.Block{Content: json.RawMessage(`"file contents here"`)},
-			want:  "size=18b",
+			want:  "size=18B",
 		},
 		{
 			name: "non-bash with array content sums lengths",
@@ -147,11 +154,13 @@ func TestFormatToolResult(t *testing.T) {
 			block: stream.Block{
 				Content: json.RawMessage(`[{"type":"text","text":"hello"},{"type":"text","text":" world"}]`),
 			},
-			want: "size=11b",
+			want: "size=11B",
 		},
 	}
 	for _, tc := range tests {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := formatToolResult(tc.tool, tc.block, json.RawMessage(tc.structured))
 			if got != tc.want {
 				t.Errorf("formatToolResult(%q) = %q, want %q", tc.tool, got, tc.want)

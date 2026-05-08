@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/pricing"
@@ -21,15 +20,6 @@ import (
 // Ruby driver's ljust(18).
 const statsLabelWidth = 18
 
-// statsRuleFallbackWidth is the rule width used when the terminal
-// width is unknown (output piped, NO_TERM, etc). Matches the historic
-// fixed-width rule.
-const statsRuleFallbackWidth = 70
-
-// statsRuleChar is the unicode horizontal rule character used to
-// bracket the panel.
-const statsRuleChar = "─"
-
 // stats accumulates per-run telemetry across every iteration. It is
 // not safe for concurrent use; the iteration driver pushes updates
 // from a single goroutine, then the outer loop reads it once at the
@@ -37,6 +27,14 @@ const statsRuleChar = "─"
 type stats struct {
 	model     string
 	startTime time.Time
+
+	// now is the wall-clock source. Held as a func so tests can pin
+	// timestamps; production code passes [time.Now].
+	now func() time.Time
+
+	// resultsHome is the directory where the JSONL results log lives.
+	// Empty disables logging.
+	resultsHome string
 
 	iterations int
 
@@ -86,15 +84,22 @@ var orderedBlockTypes = []string{
 	stream.BlockToolResult,
 }
 
-// newStats returns a zero-valued accumulator anchored to time.Now and
+// newStats returns a zero-valued accumulator anchored to now() and
 // configured to compute cost against the named model. Unknown models
 // produce zero-cost output; the operator still gets the token counts.
-func newStats(model string) *stats {
+// resultsHome is the directory the closing panel's JSONL log gets
+// written to; an empty string disables that log.
+func newStats(model string, now func() time.Time, resultsHome string) *stats {
+	if now == nil {
+		now = time.Now
+	}
 	return &stats{
-		model:     model,
-		startTime: time.Now(),
-		events:    make(map[string]int),
-		blocks:    make(map[string]int),
+		model:       model,
+		now:         now,
+		resultsHome: resultsHome,
+		startTime:   now(),
+		events:      make(map[string]int),
+		blocks:      make(map[string]int),
 	}
 }
 
@@ -134,17 +139,33 @@ func (s *stats) TrackUsage(u *stream.Usage) {
 		int64(u.CacheCreationInputTokens)*rate.CacheCreate/1_000_000
 }
 
-// CostUSD returns the running cost in dollars as a float64. It is the
-// only sanctioned way to read the cost from outside the accumulator;
-// internal arithmetic stays in micro-USD.
-func (s *stats) CostUSD() float64 {
-	return float64(s.cost) / float64(pricing.MicroUSDPerUSD)
-}
-
 // formatUSD renders an integer micro-USD amount as "$X.YYYY" — four
 // decimal places to match the existing on-screen panel format.
 func formatUSD(microUSD int64) string {
 	return fmt.Sprintf("$%.4f", float64(microUSD)/float64(pricing.MicroUSDPerUSD))
+}
+
+// costUSD is a run cost stored in integer micro-USD (millionths of a
+// USD) but serialized to JSON as a USD float. The integer
+// representation keeps the in-memory arithmetic exact; the float
+// representation preserves the public results.jsonl schema, which has
+// always exposed cost as a number-shaped "cost" field.
+type costUSD int64
+
+// MarshalJSON emits c as a USD float (micro-USD divided by
+// [pricing.MicroUSDPerUSD]).
+func (c costUSD) MarshalJSON() ([]byte, error) {
+	return json.Marshal(float64(c) / float64(pricing.MicroUSDPerUSD))
+}
+
+// UnmarshalJSON accepts a USD float and stores it as integer micro-USD.
+func (c *costUSD) UnmarshalJSON(b []byte) error {
+	var f float64
+	if err := json.Unmarshal(b, &f); err != nil {
+		return err
+	}
+	*c = costUSD(f * float64(pricing.MicroUSDPerUSD))
+	return nil
 }
 
 // summary is the per-run record rendered both as the operator-facing
@@ -158,60 +179,10 @@ type summary struct {
 	Events     map[string]int `json:"events"`
 	Blocks     map[string]int `json:"blocks"`
 	Tokens     summaryTokens  `json:"tokens"`
-	// CostMicroUSD is the run cost in integer micro-USD. The JSON
-	// representation is a float dollar amount under the "cost" key —
-	// see [summary.MarshalJSON] — so external consumers of
-	// results.jsonl continue to see a number-shaped field.
-	CostMicroUSD int64       `json:"-"`
-	Time         summaryTime `json:"time"`
-}
-
-// summaryJSON mirrors [summary] but with cost expressed as a float
-// dollar amount. It exists only to drive (un)marshaling and preserve
-// the public results.jsonl schema.
-type summaryJSON struct {
-	Reqs       string         `json:"reqs"`
-	Exit       string         `json:"exit,omitempty"`
-	Iterations int            `json:"iterations"`
-	Events     map[string]int `json:"events"`
-	Blocks     map[string]int `json:"blocks"`
-	Tokens     summaryTokens  `json:"tokens"`
-	Cost       float64        `json:"cost"`
-	Time       summaryTime    `json:"time"`
-}
-
-// MarshalJSON renders sum with cost as a USD float, preserving the
-// existing results.jsonl schema.
-func (sum summary) MarshalJSON() ([]byte, error) {
-	return json.Marshal(summaryJSON{
-		Reqs:       sum.Reqs,
-		Exit:       sum.Exit,
-		Iterations: sum.Iterations,
-		Events:     sum.Events,
-		Blocks:     sum.Blocks,
-		Tokens:     sum.Tokens,
-		Cost:       float64(sum.CostMicroUSD) / float64(pricing.MicroUSDPerUSD),
-		Time:       sum.Time,
-	})
-}
-
-// UnmarshalJSON is the inverse of MarshalJSON: it accepts the float
-// "cost" field from the wire and converts it back into integer
-// micro-USD on the in-memory record.
-func (sum *summary) UnmarshalJSON(data []byte) error {
-	var aux summaryJSON
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	sum.Reqs = aux.Reqs
-	sum.Exit = aux.Exit
-	sum.Iterations = aux.Iterations
-	sum.Events = aux.Events
-	sum.Blocks = aux.Blocks
-	sum.Tokens = aux.Tokens
-	sum.CostMicroUSD = int64(aux.Cost * float64(pricing.MicroUSDPerUSD))
-	sum.Time = aux.Time
-	return nil
+	// Cost is the run cost in integer micro-USD; see [costUSD] for the
+	// JSON shape (a float dollar amount under the "cost" key).
+	Cost costUSD     `json:"cost"`
+	Time summaryTime `json:"time"`
 }
 
 type summaryTokens struct {
@@ -234,8 +205,8 @@ type summaryTime struct {
 // snapshot freezes the current accumulator state into a [summary]. It
 // reads the wall clock to compute elapsed time, so callers should
 // invoke it once at the end of the run.
-func (s *stats) snapshot(reqs, exitReason string) summary {
-	end := time.Now()
+func (s *stats) snapshot(reqs string, exit exitReason) summary {
+	end := s.now()
 	elapsed := end.Sub(s.startTime)
 	other := elapsed - s.llmTime - s.toolTime
 	if other < 0 {
@@ -243,7 +214,7 @@ func (s *stats) snapshot(reqs, exitReason string) summary {
 	}
 	return summary{
 		Reqs:       reqs,
-		Exit:       exitReason,
+		Exit:       exit.String(),
 		Iterations: s.iterations,
 		Events:     maps.Clone(s.events),
 		Blocks:     maps.Clone(s.blocks),
@@ -254,7 +225,7 @@ func (s *stats) snapshot(reqs, exitReason string) summary {
 			Output:      s.tokens.output,
 			Total:       s.tokens.total(),
 		},
-		CostMicroUSD: s.cost,
+		Cost: costUSD(s.cost),
 		Time: summaryTime{
 			Start:        s.startTime,
 			End:          end,
@@ -266,18 +237,11 @@ func (s *stats) snapshot(reqs, exitReason string) summary {
 	}
 }
 
-// writePanel renders the closing summary block to w. exitReason is a
-// short noun describing why the loop ended (e.g. "done", "timeout",
-// "interrupted"); it may be empty if the panel is being printed mid-
-// run for some reason. reqs is the requirements path shown at the top
-// of the panel.
-func (s *stats) writePanel(w io.Writer, reqs, exitReason string) {
-	s.snapshot(reqs, exitReason).writeText(w)
-}
-
 // writeText renders sum to w in the operator-facing panel format.
-func (sum summary) writeText(w io.Writer) {
-	rule := buildRule()
+// width controls the bracketing horizontal rule; pass the value of
+// [ui.Theme.Width], or 0 to fall back to [ui.RuleFallbackWidth].
+func (sum summary) writeText(w io.Writer, width int) {
+	rule := ui.BuildRule(width)
 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, rule)
@@ -302,7 +266,7 @@ func (sum summary) writeText(w io.Writer) {
 	fmt.Fprintf(w, "  output:       %s\n", ui.FormatNumber(sum.Tokens.Output))
 	fmt.Fprintf(w, "  total:        %s\n\n", ui.FormatNumber(sum.Tokens.Total))
 
-	fmt.Fprintf(w, "cost:        %s\n\n", formatUSD(sum.CostMicroUSD))
+	fmt.Fprintf(w, "cost:        %s\n\n", formatUSD(int64(sum.Cost)))
 
 	fmt.Fprintln(w, "time:")
 	fmt.Fprintf(w, "  start:  %s\n", sum.Time.Start.Format(time.RFC3339))
@@ -313,17 +277,6 @@ func (sum summary) writeText(w io.Writer) {
 	fmt.Fprintf(w, "  total:  %s\n", ui.FormatElapsed(sum.Time.TotalSeconds))
 
 	fmt.Fprintln(w, rule)
-}
-
-// buildRule returns a horizontal rule sized to the current terminal
-// width, falling back to [statsRuleFallbackWidth] when the width is
-// unknown (e.g. stdout is piped).
-func buildRule() string {
-	width := ui.TerminalWidth()
-	if width <= 0 {
-		width = statsRuleFallbackWidth
-	}
-	return strings.Repeat(statsRuleChar, width)
 }
 
 // writeCountSection prints a labelled counts block, listing first the
@@ -347,11 +300,9 @@ func writeCountSection(w io.Writer, counts map[string]int, order []string) {
 	}
 }
 
-// resultsHomePath returns the directory that holds the JSONL log, or
-// "" if the user's home directory cannot be determined. It is a var
-// so tests can redirect writes to a temporary directory.
-var resultsHomePath = defaultResultsHomePath
-
+// defaultResultsHomePath returns the directory that holds the JSONL
+// log, or "" if the user's home directory cannot be determined.
+// [Config.ResultsHome] overrides this default.
 func defaultResultsHomePath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -360,13 +311,12 @@ func defaultResultsHomePath() string {
 	return filepath.Join(home, ".ralph-loops")
 }
 
-// appendResultsJSONL appends one JSON line to ~/.ralph-loops/
-// results.jsonl, creating the directory if necessary. Every failure
-// mode — unknown home, mkdir denied, open denied, marshal error,
-// short write — is swallowed: the JSONL log is best-effort
-// observability and must never break a run.
-func appendResultsJSONL(sum summary) {
-	dir := resultsHomePath()
+// appendResultsJSONL appends one JSON line to <dir>/results.jsonl,
+// creating the directory if necessary. Every failure mode — empty
+// dir, mkdir denied, open denied, marshal error, short write — is
+// swallowed: the JSONL log is best-effort observability and must
+// never break a run.
+func appendResultsJSONL(dir string, sum summary) {
 	if dir == "" {
 		return
 	}

@@ -20,11 +20,9 @@
 package render
 
 import (
-	"strings"
 	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
-	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
 // Recorder accumulates per-event accounting that the [Emitter]
@@ -51,23 +49,4 @@ type Recorder interface {
 	// TrackUsage rolls a single result event's token usage into the
 	// running totals. A nil pointer is tolerated and ignored.
 	TrackUsage(u *stream.Usage)
-}
-
-// ruleFallbackWidth is the rule width used when the terminal width is
-// unknown (output piped, NO_TERM, etc).
-const ruleFallbackWidth = 70
-
-// ruleChar is the unicode horizontal rule character used to bracket
-// the iteration banner.
-const ruleChar = "─"
-
-// buildRule returns a horizontal rule sized to the current terminal
-// width, falling back to [ruleFallbackWidth] when the width is unknown
-// (e.g. stdout is piped).
-func buildRule() string {
-	width := ui.TerminalWidth()
-	if width <= 0 {
-		width = ruleFallbackWidth
-	}
-	return strings.Repeat(ruleChar, width)
 }

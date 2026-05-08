@@ -1,20 +1,17 @@
-// Package agent wraps the claude CLI as a long-lived child process
-// behind a Spawner / Session pair. The driver in [internal/loop]
-// depends on these interfaces and is therefore decoupled from
-// [os/exec], the wire-format envelope, and process-group plumbing.
+// Package agent wraps the claude CLI as a long-lived child process.
+// It exposes concrete types — [Claude] and its session — that the
+// driver in [internal/loop] consumes through its own Spawner / Session
+// interfaces. Putting the interface declarations on the consumer side
+// (loop, not agent) follows the standard Go convention.
 //
-// Production code calls [NewClaude] to obtain a Spawner that runs the
-// real `claude` binary. Tests can supply their own Spawner — typically
-// one whose Session yields a stream.Reader over canned bytes — and
-// drive the loop with no subprocess at all.
+// Production code calls [NewClaude] to obtain a [*Claude] that runs
+// the real `claude` binary. Tests in the loop package supply their
+// own Spawner / Session pair — typically one whose Session yields a
+// stream.Reader over canned bytes — and drive the loop with no
+// subprocess at all.
 package agent
 
-import (
-	"context"
-	"fmt"
-
-	"github.com/ai4mgreenly/ralph-loops/internal/stream"
-)
+import "fmt"
 
 // Config captures the per-spawn knobs ralph forwards to the claude
 // CLI. It is intentionally smaller than loop.Config: nothing here
@@ -46,42 +43,6 @@ type Config struct {
 	// WorkDir is the working directory for the spawned process. The
 	// agent reads and writes inside this tree.
 	WorkDir string
-}
-
-// Spawner produces a [Session] for one iteration of the ralph loop.
-// Implementations may share state (e.g. a binary path) across spawns
-// but each Session is single-use.
-type Spawner interface {
-	Spawn(ctx context.Context, cfg Config) (Session, error)
-}
-
-// Session is one running agent process. The lifecycle is:
-//
-//  1. [Session.Send] one or more user messages.
-//  2. Read events from [Session.Events] until a result arrives.
-//  3. [Session.Close] to shut down stdin and reap the process.
-//
-// Cancelling the ctx passed to [Spawner.Spawn] sends SIGINT to the
-// process group and (after a brief grace period) SIGKILL. Close then
-// returns whatever exit information is available.
-type Session interface {
-	// Events returns the stream reader bound to the agent's stdout.
-	// The same reader is returned on every call.
-	Events() *stream.Reader
-
-	// Send writes a single user-message envelope to the agent's
-	// stdin, followed by a newline (the stream-json line framing).
-	Send(text string) error
-
-	// Close closes stdin so the agent can exit cleanly, waits for
-	// the process to reap, and returns the outcome:
-	//
-	//   - nil               the process exited 0 (clean).
-	//   - *[ExitError]      the process exited with a non-zero code.
-	//   - any other error   I/O failure or signal death.
-	//
-	// Close is idempotent.
-	Close() error
 }
 
 // ExitError reports a non-zero exit from the agent process. The loop

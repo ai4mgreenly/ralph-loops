@@ -2,7 +2,8 @@ package pricing
 
 import "testing"
 
-func TestLookupHasExpectedAliases(t *testing.T) {
+func TestLookup_KnownAliases(t *testing.T) {
+	t.Parallel()
 	for _, alias := range []string{"haiku", "sonnet", "opus"} {
 		if _, ok := Lookup(alias); !ok {
 			t.Errorf("Lookup missing alias %q", alias)
@@ -10,7 +11,8 @@ func TestLookupHasExpectedAliases(t *testing.T) {
 	}
 }
 
-func TestLookupIsCaseInsensitiveAndTrimmed(t *testing.T) {
+func TestLookup_CaseInsensitiveAndTrimmed(t *testing.T) {
+	t.Parallel()
 	for _, alias := range []string{"HAIKU", "  Sonnet ", "Opus"} {
 		if _, ok := Lookup(alias); !ok {
 			t.Errorf("Lookup(%q) should resolve via case-insensitive match", alias)
@@ -18,7 +20,8 @@ func TestLookupIsCaseInsensitiveAndTrimmed(t *testing.T) {
 	}
 }
 
-func TestLookupUnknownReturnsFalse(t *testing.T) {
+func TestLookup_UnknownAliasReturnsFalse(t *testing.T) {
+	t.Parallel()
 	p, ok := Lookup("nonexistent")
 	if ok {
 		t.Errorf("expected ok=false for unknown alias, got %+v", p)
@@ -28,8 +31,32 @@ func TestLookupUnknownReturnsFalse(t *testing.T) {
 	}
 }
 
-func TestModelsRatesAreSane(t *testing.T) {
-	forEachModel(func(alias string, p Pricing) {
+func TestHasModel(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		alias string
+		want  bool
+	}{
+		{"known/haiku", "haiku", true},
+		{"known/sonnet", "Sonnet", true},
+		{"known/opus-padded", "  opus  ", true},
+		{"unknown", "gpt-4", false},
+		{"empty", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := HasModel(tc.alias); got != tc.want {
+				t.Errorf("HasModel(%q) = %v, want %v", tc.alias, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestModels_RatesAreSane(t *testing.T) {
+	t.Parallel()
+	for alias, p := range models {
 		if p.Input <= 0 || p.Output <= 0 || p.CacheRead <= 0 || p.CacheCreate <= 0 {
 			t.Errorf("%s: non-positive rate in %+v", alias, p)
 		}
@@ -39,10 +66,11 @@ func TestModelsRatesAreSane(t *testing.T) {
 		if p.CacheRead >= p.Input {
 			t.Errorf("%s: cache-read (%d) should be cheaper than base input (%d)", alias, p.CacheRead, p.Input)
 		}
-	})
+	}
 }
 
-func TestModelsRelativeOrdering(t *testing.T) {
+func TestModels_RelativeOrdering(t *testing.T) {
+	t.Parallel()
 	haiku, _ := Lookup("haiku")
 	sonnet, _ := Lookup("sonnet")
 	opus, _ := Lookup("opus")

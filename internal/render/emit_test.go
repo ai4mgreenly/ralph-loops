@@ -115,7 +115,7 @@ func TestIterationBanner(t *testing.T) {
 	if !strings.Contains(out, "iteration: 3") {
 		t.Errorf("banner missing iteration line: %q", out)
 	}
-	if !strings.Contains(out, ruleChar+ruleChar+ruleChar) {
+	if !strings.Contains(out, ui.RuleChar+ui.RuleChar+ui.RuleChar) {
 		t.Errorf("banner missing horizontal rule: %q", out)
 	}
 	// Banner must have the rule both before and after the iteration line.
@@ -123,10 +123,10 @@ func TestIterationBanner(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("iteration line missing")
 	}
-	if !strings.Contains(out[:idx], ruleChar) {
+	if !strings.Contains(out[:idx], ui.RuleChar) {
 		t.Errorf("rule should appear above the iteration line, got %q", out[:idx])
 	}
-	if !strings.Contains(out[idx:], ruleChar) {
+	if !strings.Contains(out[idx:], ui.RuleChar) {
 		t.Errorf("rule should appear below the iteration line, got %q", out[idx:])
 	}
 }
@@ -136,12 +136,10 @@ func TestIterationBanner(t *testing.T) {
 // ResetIteration() before invoking the On* methods.
 func newTestEmitter(t *testing.T) (*Emitter, *bytes.Buffer, *fakeRecorder) {
 	t.Helper()
-	ui.SetColor(false)
-	t.Cleanup(func() { ui.SetColor(false) })
-
 	var buf bytes.Buffer
 	rec := newFakeRecorder()
-	e := NewEmitter(&buf, rec)
+	theme := ui.NewThemeWith(false, 0)
+	e := NewEmitter(&buf, rec, theme)
 	e.now = fakeClock(time.Unix(0, 0).UTC(), time.Millisecond)
 	e.ResetIteration()
 	return e, &buf, rec
@@ -207,8 +205,6 @@ func TestEmitter_ToolResultPairsWithCall(t *testing.T) {
 
 func TestEmitter_EditRendersDiff(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	ui.SetTerminalWidth(0)
-	t.Cleanup(func() { ui.SetTerminalWidth(0) })
 
 	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
@@ -236,8 +232,6 @@ func TestEmitter_EditRendersDiff(t *testing.T) {
 
 func TestEmitter_WriteRendersContent(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	ui.SetTerminalWidth(0)
-	t.Cleanup(func() { ui.SetTerminalWidth(0) })
 
 	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
@@ -284,12 +278,10 @@ func TestEmitter_ResultExtractsStatusAndTracksTokens(t *testing.T) {
 }
 
 func TestEmitter_TimingAttribution(t *testing.T) {
-	ui.SetColor(false)
-	t.Cleanup(func() { ui.SetColor(false) })
-
 	var buf bytes.Buffer
 	rec := newFakeRecorder()
-	e := NewEmitter(&buf, rec)
+	theme := ui.NewThemeWith(false, 0)
+	e := NewEmitter(&buf, rec, theme)
 
 	now := time.Unix(0, 0).UTC()
 	clock := func(advance time.Duration) {
@@ -318,7 +310,7 @@ func TestEmitter_TimingAttribution(t *testing.T) {
 
 func TestEmitter_SystemAndRateLimit(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	e.Verbose = true
+	e.verbose = true
 	e.OnSystem(stream.System{
 		Subtype: "init", Model: "opus", PermissionMode: "default",
 		Tools: []string{"Bash", "Read"},
@@ -357,8 +349,6 @@ func TestEmitter_NonVerboseSuppressesSystemAndRateLimit(t *testing.T) {
 // flagged IsError must lead with [markerError], not [markerResult].
 func TestEmitter_BashErrorUsesErrorMarker(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	ui.SetTerminalWidth(0)
-	t.Cleanup(func() { ui.SetTerminalWidth(0) })
 
 	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
@@ -385,6 +375,174 @@ func TestEmitter_BashErrorUsesErrorMarker(t *testing.T) {
 	// markerResult is also used elsewhere; this checks the gutter.
 	if strings.Contains(got, markerResult+"  boom") {
 		t.Errorf("error result should not lead stderr line with markerResult %q:\n%s", markerResult, got)
+	}
+}
+
+// TestEmitter_ReadResultStripsLineNumbers exercises emitReadResult by
+// pairing a Read tool_use with a tool_result whose `content` is the
+// agent's `cat -n`-style line-numbered text. The result block must
+// surface the bare source lines (no leading line number, no tab).
+func TestEmitter_ReadResultStripsLineNumbers(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+		{
+			Type:  stream.BlockToolUse,
+			ID:    "tool_1",
+			Name:  "Read",
+			Input: json.RawMessage(`{"file_path":"/tmp/x.txt"}`),
+		},
+	}}})
+	buf.Reset()
+
+	// `cat -n` style: spaces, digits, tab, source line.
+	const numbered = "     1\tfirst line\n     2\tsecond line\n     3\tthird line"
+	contentJSON, err := json.Marshal(numbered)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
+		{Type: stream.BlockToolResult, ToolUseID: "tool_1", Content: contentJSON},
+	}}})
+
+	got := buf.String()
+	for _, want := range []string{"first line", "second line", "third line"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in Read result:\n%s", want, got)
+		}
+	}
+	// And the literal "cat -n" prefix must NOT survive.
+	for _, prefix := range []string{"     1\t", "     2\t", "     3\t"} {
+		if strings.Contains(got, prefix) {
+			t.Errorf("line-number prefix %q leaked through:\n%s", prefix, got)
+		}
+	}
+}
+
+// TestEmitter_ReadResultArrayContent feeds the alternative
+// {"content":[{"type":"text","text":"..."}]} shape extractContentText
+// supports and confirms the renderer concatenates the array's text
+// fields.
+func TestEmitter_ReadResultArrayContent(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+		{
+			Type:  stream.BlockToolUse,
+			ID:    "tool_1",
+			Name:  "Read",
+			Input: json.RawMessage(`{"file_path":"/tmp/x.txt"}`),
+		},
+	}}})
+	buf.Reset()
+
+	contentJSON := json.RawMessage(`[{"type":"text","text":"alpha\n"},{"type":"text","text":"beta"}]`)
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
+		{Type: stream.BlockToolResult, ToolUseID: "tool_1", Content: contentJSON},
+	}}})
+
+	got := buf.String()
+	for _, want := range []string{"alpha", "beta"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in Read array-content output:\n%s", want, got)
+		}
+	}
+}
+
+// TestExtractContentText covers the three shapes the helper supports:
+// a bare JSON string, an array of {text} objects, and an unrecognised
+// shape that yields the empty string.
+func TestExtractContentText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   json.RawMessage
+		want string
+	}{
+		{
+			name: "empty content",
+			in:   nil,
+			want: "",
+		},
+		{
+			name: "bare string",
+			in:   json.RawMessage(`"hello world"`),
+			want: "hello world",
+		},
+		{
+			name: "array of text objects",
+			in:   json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`),
+			want: "ab",
+		},
+		{
+			name: "unrecognised shape returns empty",
+			in:   json.RawMessage(`12345`),
+			want: "",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := extractContentText(stream.Block{Content: tc.in})
+			if got != tc.want {
+				t.Errorf("extractContentText(%s) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStripLineNumber covers each branch of the cat-n prefix stripper:
+// a well-formed prefix is removed, content without the pattern passes
+// through, and the leading-spaces/digits-only edge case (no tab) is
+// preserved verbatim.
+func TestStripLineNumber(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"canonical cat -n prefix", "     1\thello", "hello"},
+		{"large line number", "  1234\tlast", "last"},
+		{"no tab keeps line intact", "  1234 not a prefix", "  1234 not a prefix"},
+		{"no digits keeps line intact", "no number here", "no number here"},
+		{"only spaces keeps line intact", "   ", "   "},
+		{"empty string", "", ""},
+		{"digits only no tab", "42", "42"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := stripLineNumber(tc.in)
+			if got != tc.want {
+				t.Errorf("stripLineNumber(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEmitter_UserTextBlock exercises the emitUserText path, which is
+// the kickoff prompt replay rendered as an output block. The body
+// should reach the buffer line-by-line under the markerResult gutter.
+func TestEmitter_UserTextBlock(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
+		{Type: stream.BlockText, Text: "first line\nsecond line\n"},
+	}}})
+
+	got := buf.String()
+	if !strings.Contains(got, "→  first line") {
+		t.Errorf("expected leading marker on first user line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "second line") {
+		t.Errorf("expected continuation line in user text, got:\n%s", got)
 	}
 }
 

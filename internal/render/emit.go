@@ -36,12 +36,43 @@ const (
 type Emitter struct {
 	out         io.Writer
 	rec         Recorder
+	theme       *ui.Theme
 	tools       map[string]toolRef
 	lastAt      time.Time
 	now         func() time.Time
-	Verbose     bool
-	Spinner     *ui.Spinner
-	OutputLines int
+	verbose     bool
+	spinner     *ui.Spinner
+	outputLines int
+}
+
+// EmitterOption configures one knob on an [Emitter] at construction
+// time. Pass options to [NewEmitter] rather than mutating exported
+// fields after the fact.
+type EmitterOption func(*Emitter)
+
+// WithVerbose toggles the rendering of low-signal events ("system",
+// "rate_limit"). Defaults to false: those events are suppressed and
+// only diagnostic kinds reach the operator.
+func WithVerbose(v bool) EmitterOption {
+	return func(e *Emitter) { e.verbose = v }
+}
+
+// WithOutputLines caps the number of tool-output lines replayed in
+// the activity log per result. A value <= 0 leaves the built-in
+// default ([defaultOutputLines]) in place.
+func WithOutputLines(n int) EmitterOption {
+	return func(e *Emitter) {
+		if n > 0 {
+			e.outputLines = n
+		}
+	}
+}
+
+// WithSpinner overrides the [ui.Spinner] the emitter constructs by
+// default. Tests pass a writer-only spinner here; production code
+// usually relies on the default.
+func WithSpinner(s *ui.Spinner) EmitterOption {
+	return func(e *Emitter) { e.spinner = s }
 }
 
 // toolRef is the input to a not-yet-completed tool call, retained so
@@ -52,19 +83,31 @@ type toolRef struct {
 	input json.RawMessage
 }
 
-// NewEmitter constructs an Emitter writing to out and updating rec.
-// The wall-clock source is taken indirectly through `time.Now` so
-// tests can install a deterministic clock.
-func NewEmitter(out io.Writer, rec Recorder) *Emitter {
-	return &Emitter{
+// NewEmitter constructs an Emitter writing to out and updating rec,
+// using theme for colour and width decisions. The wall-clock source
+// is taken indirectly through `time.Now` so tests can install a
+// deterministic clock. opts override the documented defaults; see
+// [WithVerbose], [WithOutputLines], and [WithSpinner].
+func NewEmitter(out io.Writer, rec Recorder, theme *ui.Theme, opts ...EmitterOption) *Emitter {
+	e := &Emitter{
 		out:         out,
 		rec:         rec,
+		theme:       theme,
 		tools:       make(map[string]toolRef),
 		now:         time.Now,
-		Spinner:     ui.NewSpinner(out, "waiting for claude"),
-		OutputLines: defaultOutputLines,
+		spinner:     ui.NewSpinner(out, "waiting for claude", theme.UseColor()),
+		outputLines: defaultOutputLines,
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
+
+// Spinner returns the [ui.Spinner] the emitter brackets each event
+// read with. Exposed so the loop driver can toggle the rotator on
+// either side of a blocking stream read.
+func (e *Emitter) Spinner() *ui.Spinner { return e.spinner }
 
 // ResetIteration prepares the Emitter for a fresh iteration: drop any
 // in-flight tool-call references (they cannot survive a new claude
@@ -79,7 +122,7 @@ func (e *Emitter) ResetIteration() {
 // terminal width (or the panel fallback width when stdout is not a
 // terminal).
 func (e *Emitter) IterationBanner(n int) {
-	rule := buildRule()
+	rule := e.theme.Rule()
 	fmt.Fprintln(e.out)
 	fmt.Fprintln(e.out, rule)
 	fmt.Fprintf(e.out, "iteration: %d\n", n)
@@ -96,7 +139,7 @@ func (e *Emitter) OnAssistant(a stream.Assistant) {
 
 	blocks := a.Message.Content
 	if len(blocks) == 0 {
-		ui.Decorate(e.out, markerCall, "assistant (empty)")
+		e.theme.Decorate(e.out, markerCall, "assistant (empty)")
 		return
 	}
 
@@ -104,7 +147,7 @@ func (e *Emitter) OnAssistant(a stream.Assistant) {
 		e.rec.TallyBlock(b.Type)
 		switch b.Type {
 		case stream.BlockText:
-			ui.Lead(e.out, markerCall, strings.TrimRight(b.Text, " \t\r\n"))
+			e.theme.Lead(e.out, markerCall, strings.TrimRight(b.Text, " \t\r\n"))
 		case stream.BlockToolUse:
 			e.tools[b.ID] = toolRef{name: b.Name, input: b.Input}
 			e.emitToolCall(b)
@@ -112,10 +155,10 @@ func (e *Emitter) OnAssistant(a stream.Assistant) {
 			// Skip the noise from "… thinking (0 chars)" preludes that
 			// claude emits before some tool calls; they carry no signal.
 			if n := len(b.Thinking); n > 0 {
-				ui.Decorate(e.out, markerCall, fmt.Sprintf("thinking (%d chars)", n))
+				e.theme.Decorate(e.out, markerCall, fmt.Sprintf("thinking (%d chars)", n))
 			}
 		default:
-			ui.Decorate(e.out, markerCall, "assistant ["+b.Type+"]")
+			e.theme.Decorate(e.out, markerCall, "assistant ["+b.Type+"]")
 		}
 	}
 }
@@ -131,7 +174,7 @@ func (e *Emitter) OnUser(u stream.User) {
 
 	blocks := u.Message.Content
 	if len(blocks) == 0 {
-		ui.Decorate(e.out, markerResult, "user (empty)")
+		e.theme.Decorate(e.out, markerResult, "user (empty)")
 		return
 	}
 
@@ -143,7 +186,7 @@ func (e *Emitter) OnUser(u stream.User) {
 		case stream.BlockText:
 			e.emitUserText(b.Text)
 		default:
-			ui.Decorate(e.out, markerResult, "user ["+b.Type+"]")
+			e.theme.Decorate(e.out, markerResult, "user ["+b.Type+"]")
 		}
 	}
 }
@@ -156,16 +199,16 @@ func (e *Emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 	}
 
 	switch ref.name {
-	case "Bash":
+	case stream.ToolBash:
 		e.emitBashResult(b, structured)
 		return
-	case "Read":
+	case stream.ToolRead:
 		e.emitReadResult(b, ref)
 		return
-	case "Edit":
+	case stream.ToolEdit:
 		e.emitEditResult(b, ref)
 		return
-	case "Write":
+	case stream.ToolWrite:
 		e.emitWriteResult(b, ref)
 		return
 	}
@@ -187,7 +230,7 @@ func (e *Emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 	if b.IsError {
 		marker = markerError
 	}
-	ui.Decorate(e.out, marker, strings.Join(parts, "  "))
+	e.theme.Decorate(e.out, marker, strings.Join(parts, "  "))
 }
 
 // emitToolCall renders one assistant tool_use block. Every tool call
@@ -198,21 +241,21 @@ func (e *Emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 // stay consistent across every tool-call line in the UI.
 func (e *Emitter) emitToolCall(b stream.Block) {
 	switch b.Name {
-	case "Bash":
-		ui.Tool(e.out, markerCall, bashCommand(b.Input), true)
+	case stream.ToolBash:
+		e.theme.Tool(e.out, markerCall, bashCommand(b.Input), true)
 		return
-	case "Read":
-		ui.Tool(e.out, markerCall, "Read  "+readTarget(b.Input), true)
+	case stream.ToolRead:
+		e.theme.Tool(e.out, markerCall, "Read  "+readTarget(b.Input), true)
 		return
-	case "Edit", "Write":
-		ui.Tool(e.out, markerCall, b.Name+"  "+filePathOf(b.Input), true)
+	case stream.ToolEdit, stream.ToolWrite:
+		e.theme.Tool(e.out, markerCall, b.Name+"  "+filePathOf(b.Input), true)
 		return
 	}
 	content := b.Name
 	if param := formatToolCallParam(b.Name, b.Input); param != "" {
 		content += "  " + param
 	}
-	ui.Tool(e.out, markerCall, content, true)
+	e.theme.Tool(e.out, markerCall, content, true)
 }
 
 // defaultOutputLines bounds how many lines of tool output we replay
@@ -232,7 +275,7 @@ const defaultOutputLines = 10
 // [Emitter.OutputLines] input lines are supplied the overflow is
 // dropped and a `...` line is appended.
 func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
-	maxLines := e.OutputLines
+	maxLines := e.outputLines
 	if maxLines <= 0 {
 		maxLines = defaultOutputLines
 	}
@@ -244,7 +287,7 @@ func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
 	if truncated {
 		lines = append(lines, ui.Line{Text: "..."})
 	}
-	ui.WriteBlock(e.out, marker, lines, true)
+	e.theme.WriteBlock(e.out, marker, lines, true)
 }
 
 // emitBashResult renders the result of a Bash tool call as a tight
@@ -313,7 +356,7 @@ func (e *Emitter) emitReadResult(b stream.Block, ref toolRef) {
 		stripped = stripped[:n-1]
 	}
 
-	highlighted := highlightLines(filePathOf(ref.input), strings.Join(stripped, "\n"))
+	highlighted := highlightLines(filePathOf(ref.input), strings.Join(stripped, "\n"), e.theme.UseColor())
 	if len(highlighted) != len(stripped) {
 		highlighted = stripped
 	}
@@ -350,8 +393,8 @@ func (e *Emitter) emitEditResult(b stream.Block, ref toolRef) {
 	_ = json.Unmarshal(ref.input, &input)
 
 	filePath := filePathOf(ref.input)
-	highlightedOld := indexHighlightedLines(filePath, input.OldString)
-	highlightedNew := indexHighlightedLines(filePath, input.NewString)
+	highlightedOld := indexHighlightedLines(filePath, input.OldString, e.theme.UseColor())
+	highlightedNew := indexHighlightedLines(filePath, input.NewString, e.theme.UseColor())
 
 	d := diffLines(input.OldString, input.NewString)
 	lines := make([]ui.Line, 0, len(d))
@@ -386,12 +429,12 @@ func (e *Emitter) emitEditResult(b stream.Block, ref toolRef) {
 // count out of sync with the source. Callers pair the returned slice
 // with the original lines so a fall-through to plain text is always
 // possible per line.
-func indexHighlightedLines(filePath, content string) []string {
+func indexHighlightedLines(filePath, content string, useColor bool) []string {
 	if content == "" {
 		return nil
 	}
 	plain := splitDiffLines(content)
-	hi := highlightLines(filePath, content)
+	hi := highlightLines(filePath, content, useColor)
 	if len(hi) != len(plain) {
 		return plain
 	}
@@ -430,7 +473,7 @@ func (e *Emitter) emitWriteResult(b stream.Block, ref toolRef) {
 	}
 
 	plain := strings.Split(content, "\n")
-	hi := indexHighlightedLines(filePathOf(ref.input), content)
+	hi := indexHighlightedLines(filePathOf(ref.input), content, e.theme.UseColor())
 
 	lines := make([]ui.Line, len(plain))
 	for i, raw := range plain {
@@ -572,7 +615,7 @@ func (e *Emitter) emitUserText(text string) {
 func (e *Emitter) OnResult(r stream.Result) {
 	e.rec.TrackUsage(r.Usage)
 
-	bits := []string{}
+	var bits []string
 	if status := DecodeStatus(r.StructuredOutput); status != "" {
 		bits = append(bits, "status="+status)
 	}
@@ -594,13 +637,22 @@ func (e *Emitter) OnResult(r stream.Result) {
 	if len(bits) > 0 {
 		content += "  " + strings.Join(bits, "  ")
 	}
-	ui.Decorate(e.out, marker, content)
+	e.theme.Decorate(e.out, marker, content)
+}
+
+// OnDecodeError surfaces a [stream.DecodeError] through the emitter's
+// configured writer so the operator sees the offending raw line in the
+// same activity log as every other event. The line is rendered with
+// %q to escape non-printable or non-UTF-8 bytes, since malformed event
+// lines may contain arbitrary garbage from the wire.
+func (e *Emitter) OnDecodeError(de stream.DecodeError) {
+	e.theme.Decorate(e.out, markerError, fmt.Sprintf("decode error: line %d: %q", de.Line, de.Bytes))
 }
 
 // OnSystem handles "system" events: session boot, model selection,
 // permission mode, tool list, etc.
 func (e *Emitter) OnSystem(s stream.System) {
-	if !e.Verbose {
+	if !e.verbose {
 		return
 	}
 	subtype := s.Subtype
@@ -608,7 +660,7 @@ func (e *Emitter) OnSystem(s stream.System) {
 		subtype = "system"
 	}
 
-	bits := []string{}
+	var bits []string
 	if s.Model != "" {
 		bits = append(bits, "model="+s.Model)
 	}
@@ -626,13 +678,13 @@ func (e *Emitter) OnSystem(s stream.System) {
 	if len(bits) > 0 {
 		content += "  " + strings.Join(bits, "  ")
 	}
-	ui.Decorate(e.out, markerCall, content)
+	e.theme.Decorate(e.out, markerCall, content)
 }
 
 // OnRateLimit reports the rate-limit envelope claude attaches to some
 // events. The fields surfaced match the Ruby driver's set.
 func (e *Emitter) OnRateLimit(r stream.RateLimit) {
-	if !e.Verbose {
+	if !e.verbose {
 		return
 	}
 	info := r.Info
@@ -640,7 +692,7 @@ func (e *Emitter) OnRateLimit(r stream.RateLimit) {
 		info = &stream.RateLimitInfo{}
 	}
 
-	bits := []string{}
+	var bits []string
 	if info.RateLimitType != "" {
 		bits = append(bits, "type="+info.RateLimitType)
 	}
@@ -661,7 +713,7 @@ func (e *Emitter) OnRateLimit(r stream.RateLimit) {
 	if len(bits) > 0 {
 		content += "  " + strings.Join(bits, "  ")
 	}
-	ui.Decorate(e.out, markerCall, content)
+	e.theme.Decorate(e.out, markerCall, content)
 }
 
 // DecodeStatus extracts the schema-constrained status field from a

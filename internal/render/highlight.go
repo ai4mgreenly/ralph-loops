@@ -6,8 +6,6 @@ import (
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
-
-	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
 // highlightStyle is the chroma style applied to every Read, Write, and
@@ -23,11 +21,11 @@ const highlightStyle = "monokai"
 //
 // Each returned line is self-contained: any SGR span that crossed a
 // `\n` in chroma's raw output is closed at the line break and reopened
-// at the start of the next line, so [ui.WriteBlock]'s per-line
+// at the start of the next line, so [ui.Theme.WriteBlock]'s per-line
 // painting and wrapping never run into half-open spans.
-func highlightLines(filePath, content string) []string {
+func highlightLines(filePath, content string, useColor bool) []string {
 	plain := splitLinesNoTrailing(content)
-	if !ui.UseColor() || filePath == "" {
+	if !useColor || filePath == "" {
 		return plain
 	}
 	lexer := lexers.Match(filePath)

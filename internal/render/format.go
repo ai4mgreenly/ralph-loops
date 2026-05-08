@@ -42,7 +42,7 @@ func formatToolCallParam(name string, rawInput json.RawMessage) string {
 		return ""
 	}
 
-	return fmt.Sprintf("%s=%s", key, strconv.Quote(truncate(collapseWhitespace(stringify(val)), paramTruncate)))
+	return fmt.Sprintf("%s=%s", key, strconv.Quote(truncateRunes(collapseWhitespace(stringify(val)), paramTruncate)))
 }
 
 // primaryParamKey returns the input field worth showing in line for
@@ -50,11 +50,11 @@ func formatToolCallParam(name string, rawInput json.RawMessage) string {
 // fallback is deterministic) if the tool is unknown.
 func primaryParamKey(name string, input map[string]any) string {
 	switch name {
-	case "Bash":
+	case stream.ToolBash:
 		return "command"
-	case "Read", "Write", "Edit", "NotebookEdit":
+	case stream.ToolRead, stream.ToolWrite, stream.ToolEdit, stream.ToolNotebookEdit:
 		return "file_path"
-	case "Glob", "Grep":
+	case stream.ToolGlob, stream.ToolGrep:
 		return "pattern"
 	}
 	return firstSortedKey(input)
@@ -83,7 +83,7 @@ func firstSortedKey(m map[string]any) string {
 // interrupted flag from there. For every other tool we fall back to
 // the size of the content array.
 func formatToolResult(name string, block stream.Block, structured json.RawMessage) string {
-	if name == "Bash" && len(structured) > 0 {
+	if name == stream.ToolBash && len(structured) > 0 {
 		var s struct {
 			Stdout      string `json:"stdout"`
 			Stderr      string `json:"stderr"`
@@ -176,14 +176,14 @@ func collapseWhitespace(s string) string {
 	return strings.TrimRight(b.String(), " ")
 }
 
-// truncate shortens s to at most max runes, replacing the last rune
-// with an ellipsis when truncation occurs. The Ruby driver uses 60
-// chars + a single Unicode ellipsis byte, which happens to align
+// truncateRunes shortens s to at most limit runes, replacing the last
+// rune with an ellipsis when truncation occurs. The Ruby driver uses
+// 60 chars + a single Unicode ellipsis byte, which happens to align
 // here too.
-func truncate(s string, max int) string {
-	if len([]rune(s)) <= max {
+func truncateRunes(s string, limit int) string {
+	if len([]rune(s)) <= limit {
 		return s
 	}
 	r := []rune(s)
-	return string(r[:max-1]) + "…"
+	return string(r[:limit-1]) + "…"
 }

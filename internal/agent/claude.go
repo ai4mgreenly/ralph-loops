@@ -24,22 +24,25 @@ const claudeBinary = "claude"
 // the runtime escalates to SIGKILL on the process group.
 const waitDelay = 10 * time.Second
 
-// NewClaude returns the production [Spawner] that runs the `claude`
+// NewClaude returns the production [*Claude] that runs the `claude`
 // CLI from $PATH. Each Spawn invokes the binary anew; nothing is
-// cached between iterations.
-func NewClaude() Spawner {
-	return &claudeSpawner{binary: claudeBinary}
+// cached between iterations. Callers in the loop package wrap the
+// return value in their own Spawner adapter.
+func NewClaude() *Claude {
+	return &Claude{binary: claudeBinary}
 }
 
-type claudeSpawner struct {
+// Claude is the production agent: its Spawn method launches the real
+// `claude` CLI as a child process. Construct via [NewClaude].
+type Claude struct {
 	binary string
 }
 
-// Spawn launches one claude process and returns a [Session] that
-// owns its stdin pipe, stream.Reader, and lifecycle. ctx is wired
-// through [exec.CommandContext]: cancelling it triggers SIGINT to the
-// whole process group.
-func (s *claudeSpawner) Spawn(ctx context.Context, cfg Config) (Session, error) {
+// Spawn launches one claude process and returns a session that owns
+// its stdin pipe, stream.Reader, and lifecycle. ctx is wired through
+// [exec.CommandContext]: cancelling it triggers SIGINT to the whole
+// process group.
+func (s *Claude) Spawn(ctx context.Context, cfg Config) (*ClaudeSession, error) {
 	cmd := exec.CommandContext(ctx, s.binary, buildArgs(cfg)...)
 	cmd.Env = buildEnv(cfg)
 	cmd.Dir = cfg.WorkDir
@@ -72,34 +75,42 @@ func (s *claudeSpawner) Spawn(ctx context.Context, cfg Config) (Session, error) 
 		return nil, fmt.Errorf("start %s: %w", s.binary, err)
 	}
 
-	return &claudeSession{
+	return &ClaudeSession{
 		cmd:    cmd,
 		stdin:  stdin,
+		stdout: stdout,
 		reader: stream.NewReader(stdout),
 	}, nil
 }
 
-type claudeSession struct {
+type ClaudeSession struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
+	stdout io.ReadCloser
 	reader *stream.Reader
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-func (s *claudeSession) Events() *stream.Reader { return s.reader }
+func (s *ClaudeSession) Events() *stream.Reader { return s.reader }
 
-func (s *claudeSession) Send(text string) error {
+func (s *ClaudeSession) Send(text string) error {
 	return writeUserMessage(s.stdin, text)
 }
 
 // Close closes stdin (so claude can exit cleanly), waits for the
 // process to reap, and translates the wait outcome into the package's
 // public error contract. Subsequent calls return the original result.
-func (s *claudeSession) Close() error {
+func (s *ClaudeSession) Close() error {
 	s.closeOnce.Do(func() {
 		_ = s.stdin.Close()
+		// exec.Cmd documents that Wait must not be called until all
+		// reads from a StdoutPipe have completed; otherwise the pipe's
+		// reader can deadlock against Wait closing it. Drain to EOF
+		// before reaping so cancellation paths (where the iteration
+		// stopped reading mid-stream) cannot wedge here.
+		_, _ = io.Copy(io.Discard, s.stdout)
 		s.closeErr = translateWaitErr(s.cmd.Wait())
 	})
 	return s.closeErr
@@ -120,29 +131,36 @@ func translateWaitErr(err error) error {
 	return err
 }
 
+// messageContent is one content block inside a user message. The only
+// kind ralph emits is "text".
+type messageContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// messagePayload is the inner Message field of a user-message envelope.
+type messagePayload struct {
+	Role    string           `json:"role"`
+	Content []messageContent `json:"content"`
+}
+
 // userMessage is the wire-format envelope for a single stream-json
 // user message line written to claude's stdin.
 type userMessage struct {
-	Type    string `json:"type"`
-	Message struct {
-		Role    string `json:"role"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	} `json:"message"`
+	Type    string         `json:"type"`
+	Message messagePayload `json:"message"`
 }
 
 // writeUserMessage writes a single stream-json user message line to
 // w, terminated with a newline as required by the protocol.
 func writeUserMessage(w io.Writer, text string) error {
-	var msg userMessage
-	msg.Type = "user"
-	msg.Message.Role = "user"
-	msg.Message.Content = []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}{{Type: "text", Text: text}}
+	msg := userMessage{
+		Type: "user",
+		Message: messagePayload{
+			Role:    "user",
+			Content: []messageContent{{Type: "text", Text: text}},
+		},
+	}
 
 	encoded, err := json.Marshal(msg)
 	if err != nil {
@@ -195,19 +213,4 @@ func buildEnv(cfg Config) []string {
 		env = append(env, "ENABLE_CLAUDEAI_MCP_SERVERS=false")
 	}
 	return env
-}
-
-// setProcessGroup arranges for cmd to run in its own process group so
-// signals delivered to -pgid reach the entire subtree (claude plus any
-// tool grandchildren). Unix-only; the syscall.SysProcAttr.Setpgid
-// field is not portable to Windows, but ralph is Unix-only.
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
-// signalProcessGroup sends sig to the process group whose leader has
-// the given pid. Negating the pid is the syscall.Kill convention for
-// "deliver to every member of the group."
-func signalProcessGroup(pid int, sig syscall.Signal) error {
-	return syscall.Kill(-pid, sig)
 }

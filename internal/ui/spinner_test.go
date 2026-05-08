@@ -2,12 +2,163 @@ package ui
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestSpinnerFormatElapsed(t *testing.T) {
+// safeBuffer is a goroutine-safe wrapper around bytes.Buffer used by
+// the spinner tests so the test goroutine and the paint goroutine
+// don't race on the underlying buffer's internal state.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *safeBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+// compile-time check that safeBuffer is a writer.
+var _ io.Writer = (*safeBuffer)(nil)
+
+// fakeClock is a deterministic [clock] used by the spinner tests so
+// paint timing isn't tied to the wall clock. Tests advance time via
+// [fakeClock.advance] and [fakeClock.fireAfter] / [fakeClock.tick] to
+// drive the spinner's pre-roll and ticker channels.
+type fakeClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	afterCh chan time.Time // pending After() channel; tests close to fire it
+	tickCh  chan time.Time // pending NewTicker channel; tests send to fire
+}
+
+func newFakeClock(start time.Time) *fakeClock {
+	return &fakeClock{now: start}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// After hands the spinner a channel the test will fire when it wants
+// the pre-roll to end. Only one outstanding After is supported, which
+// matches the spinner's actual usage pattern.
+func (c *fakeClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	c.afterCh = ch
+	return ch
+}
+
+// NewTicker hands the spinner a channel the test will manually drive
+// to model paint ticks. Only one outstanding ticker is supported.
+func (c *fakeClock) NewTicker(d time.Duration) (<-chan time.Time, func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	c.tickCh = ch
+	stop := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.tickCh = nil
+	}
+	return ch, stop
+}
+
+// advance moves fake time forward; subsequent Now() calls observe the
+// new instant. Used together with [fakeClock.firePreRoll] /
+// [fakeClock.fireTick] to drive deterministic elapsed-time annotations.
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// reset clears the pending After/Ticker channels so a subsequent
+// waitForAfter / waitForTicker observes the next iteration's setup
+// rather than a stale entry from a previous Start/Stop cycle.
+func (c *fakeClock) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.afterCh = nil
+	c.tickCh = nil
+}
+
+// firePreRoll fires the After() channel set up by the spinner's
+// goroutine. Returns false if the spinner hasn't called After yet.
+func (c *fakeClock) firePreRoll() bool {
+	c.mu.Lock()
+	ch := c.afterCh
+	now := c.now
+	c.mu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- now:
+		return true
+	default:
+		return false
+	}
+}
+
+// fireTick fires one tick on the NewTicker channel set up by the
+// spinner. Returns false if NewTicker hasn't been called yet.
+func (c *fakeClock) fireTick() bool {
+	c.mu.Lock()
+	ch := c.tickCh
+	now := c.now
+	c.mu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- now:
+		return true
+	default:
+		return false
+	}
+}
+
+// waitFor polls fn until it returns true or timeout elapses. Used to
+// synchronize on the spinner goroutine reaching the next blocking
+// step (calling After / NewTicker), since those calls happen inside a
+// goroutine the test does not own.
+func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("waitFor timed out after %v", timeout)
+}
+
+func TestSpinner_FormatElapsed_AllRanges(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		in   time.Duration
 		want string
@@ -33,48 +184,82 @@ func TestSpinnerFormatElapsed(t *testing.T) {
 	}
 }
 
-func TestSpinnerDisabledWhenNotTTY(t *testing.T) {
+func TestSpinner_DisabledWhenNotTTY(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
-	s := NewSpinner(&buf, "waiting")
+	s := NewSpinner(&buf, "waiting", false)
 	if s.enabled {
 		t.Fatal("spinner should auto-disable for non-*os.File writer")
 	}
+	// A disabled spinner is a no-op: Start/Stop must not write anything,
+	// and the test does not need to wait for any goroutine.
 	s.Start()
-	time.Sleep(20 * time.Millisecond)
 	s.Stop()
 	if buf.Len() != 0 {
 		t.Errorf("disabled spinner wrote %q", buf.String())
 	}
 }
 
-func TestSpinnerSilentBeforeDelay(t *testing.T) {
-	var buf bytes.Buffer
-	s := NewSpinner(&buf, "waiting")
+// TestSpinner_SilentBeforeDelay drives the pre-roll path without
+// firing After: the spinner must paint nothing and Stop must clean up
+// without hanging.
+func TestSpinner_SilentBeforeDelay(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
+
+	s := NewSpinner(buf, "waiting", false)
 	s.enabled = true
-	s.delay = 100 * time.Millisecond
-	s.tick = 10 * time.Millisecond
+	_ = s.withClock(clk)
 
 	s.Start()
-	time.Sleep(20 * time.Millisecond) // well under the 100ms pre-roll
+	// Wait for the goroutine to actually call After (otherwise Stop
+	// could win the race before the goroutine hits its select).
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.afterCh != nil
+	})
 	s.Stop()
+
 	if buf.Len() != 0 {
 		t.Errorf("spinner painted before pre-roll elapsed: %q", buf.String())
 	}
 }
 
-func TestSpinnerPaintsAfterDelay(t *testing.T) {
-	prev := useColor.Load()
-	SetColor(false)
-	defer SetColor(prev)
+// TestSpinner_PaintsAfterPreRoll fires the pre-roll channel and one
+// tick; the buffer should contain the label, a frame, an elapsed
+// annotation, and end with the erase sequence.
+func TestSpinner_PaintsAfterPreRoll(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
 
-	var buf bytes.Buffer
-	s := NewSpinner(&buf, "waiting for claude")
+	s := NewSpinner(buf, "waiting for claude", false)
 	s.enabled = true
-	s.delay = 10 * time.Millisecond
-	s.tick = 10 * time.Millisecond
+	_ = s.withClock(clk)
 
 	s.Start()
-	time.Sleep(80 * time.Millisecond)
+	// Wait for After to be installed, then advance the fake clock by
+	// the spinner's delay so the elapsed-time annotation comes back as
+	// "3s", and fire the pre-roll.
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.afterCh != nil
+	})
+	clk.advance(s.delay)
+	if !clk.firePreRoll() {
+		t.Fatal("pre-roll fire returned false")
+	}
+	// Wait for NewTicker to be installed (the goroutine paints once
+	// then enters the ticker select).
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.tickCh != nil
+	})
+
 	s.Stop()
 
 	out := buf.String()
@@ -84,69 +269,69 @@ func TestSpinnerPaintsAfterDelay(t *testing.T) {
 	if !strings.ContainsAny(out, string(spinnerFrames)) {
 		t.Errorf("output missing any braille frame: %q", out)
 	}
-	if !strings.Contains(out, "(0s)") && !strings.Contains(out, "0s)") {
-		t.Errorf("output missing elapsed-time annotation: %q", out)
+	// 3s elapsed because we advanced by spinnerDefaultDelay (3s).
+	if !strings.Contains(out, "(3s)") {
+		t.Errorf("output missing elapsed-time annotation (3s): %q", out)
 	}
-	// Final write should erase the spinner line.
 	if !strings.HasSuffix(out, eraseLine) {
 		t.Errorf("output should end with the erase sequence, got tail %q", tail(out, 16))
 	}
 }
 
-func TestSpinnerFirstPaintShowsDelayAsElapsed(t *testing.T) {
-	prev := useColor.Load()
-	SetColor(false)
-	defer SetColor(prev)
+// TestSpinner_StopBeforeFirstPaint exercises the path where Stop
+// arrives before the pre-roll channel has fired — nothing should be
+// painted and the goroutine should exit cleanly.
+func TestSpinner_StopBeforeFirstPaint(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
 
-	var buf bytes.Buffer
-	s := NewSpinner(&buf, "waiting")
+	s := NewSpinner(buf, "waiting", false)
 	s.enabled = true
-	// Use a known whole-second delay so we can assert the elapsed
-	// rendering exactly. The default is 3s; any whole-second delay
-	// exercises the same property: when the goroutine first paints,
-	// time.Since(start) >= delay, so int seconds == delay seconds.
-	s.delay = 1 * time.Second
-	s.tick = 50 * time.Millisecond
+	_ = s.withClock(clk)
 
 	s.Start()
-	// Sleep just past the delay; one paint should land before we stop.
-	time.Sleep(s.delay + 30*time.Millisecond)
-	s.Stop()
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.afterCh != nil
+	})
+	s.Stop() // before firing pre-roll
 
-	out := buf.String()
-	if !strings.Contains(out, "(1s)") {
-		t.Errorf("first paint should show elapsed = delay (1s), got %q", out)
-	}
-}
-
-func TestSpinnerStopBeforeFirstPaint(t *testing.T) {
-	var buf bytes.Buffer
-	s := NewSpinner(&buf, "waiting")
-	s.enabled = true
-	s.delay = 100 * time.Millisecond
-	s.tick = 10 * time.Millisecond
-
-	s.Start()
-	s.Stop() // immediate stop, well before delay
 	if buf.Len() != 0 {
 		t.Errorf("spinner stopped before paint should leave nothing on stdout, got %q", buf.String())
 	}
 }
 
-func TestSpinnerStartStopReusable(t *testing.T) {
-	prev := useColor.Load()
-	SetColor(false)
-	defer SetColor(prev)
+// TestSpinner_StartStopReusable exercises the reuse contract: a
+// Spinner accepts repeated Start/Stop pairs and continues to paint
+// labels under a fake clock.
+func TestSpinner_StartStopReusable(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
 
-	var buf bytes.Buffer
-	s := NewSpinner(&buf, "x")
+	s := NewSpinner(buf, "x", false)
 	s.enabled = true
-	s.delay = 5 * time.Millisecond
-	s.tick = 5 * time.Millisecond
+	_ = s.withClock(clk)
 
 	for i := 0; i < 3; i++ {
+		clk.reset()
 		s.Start()
-		time.Sleep(20 * time.Millisecond)
+		waitFor(t, time.Second, func() bool {
+			clk.mu.Lock()
+			defer clk.mu.Unlock()
+			return clk.afterCh != nil
+		})
+		clk.advance(s.delay)
+		if !clk.firePreRoll() {
+			t.Fatalf("iteration %d: pre-roll fire returned false", i)
+		}
+		waitFor(t, time.Second, func() bool {
+			clk.mu.Lock()
+			defer clk.mu.Unlock()
+			return clk.tickCh != nil
+		})
 		s.Stop()
 	}
 	if !strings.Contains(buf.String(), "x") {
@@ -154,11 +339,216 @@ func TestSpinnerStartStopReusable(t *testing.T) {
 	}
 }
 
+// TestSpinner_TickAdvancesFrame fires multiple ticks and asserts the
+// frame index rotates: the painted output should contain at least two
+// distinct braille frames.
+func TestSpinner_TickAdvancesFrame(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
+
+	s := NewSpinner(buf, "x", false)
+	s.enabled = true
+	_ = s.withClock(clk)
+
+	s.Start()
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.afterCh != nil
+	})
+	clk.advance(s.delay)
+	clk.firePreRoll()
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.tickCh != nil
+	})
+
+	// Drive a few ticks, snapshotting the buffer length each time so
+	// we know each tick produced output. Polling is needed because the
+	// spinner goroutine paints asynchronously after receiving a tick.
+	prev := buf.Len()
+	for i := 0; i < 3; i++ {
+		clk.advance(s.tick)
+		if !clk.fireTick() {
+			t.Fatalf("tick %d: fire returned false", i)
+		}
+		waitFor(t, time.Second, func() bool {
+			return buf.Len() > prev
+		})
+		prev = buf.Len()
+	}
+	s.Stop()
+
+	out := buf.String()
+	// Count distinct frames seen. With at least 4 paints (initial +
+	// 3 ticks) we should observe at least two different frames.
+	seen := make(map[rune]bool)
+	for _, r := range out {
+		for _, f := range spinnerFrames {
+			if r == f {
+				seen[r] = true
+			}
+		}
+	}
+	if len(seen) < 2 {
+		t.Errorf("ticks did not advance the frame: saw %d distinct frames in %q", len(seen), out)
+	}
+}
+
+// TestSpinner_RealClockWiring is a smoke test that the production
+// realClock plumbing actually paints — we use the same shape as the
+// rest but with the default clock and a real (short) delay. This
+// guards against a regression where the clock seam compiled but
+// realClock no longer produced ticks.
+func TestSpinner_RealClockWiring(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	s := NewSpinner(buf, "real", false)
+	s.enabled = true
+	s.delay = 5 * time.Millisecond
+	s.tick = 5 * time.Millisecond
+
+	s.Start()
+	time.Sleep(40 * time.Millisecond)
+	s.Stop()
+
+	out := buf.String()
+	if !strings.Contains(out, "real") {
+		t.Errorf("real-clock smoke test missing label: %q", out)
+	}
+}
+
 func TestIsTTY_BufferIsNotTTY(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if IsTTY(&buf) {
 		t.Error("bytes.Buffer is not a TTY")
 	}
+}
+
+// TestIsTTY_NonCharDeviceFile covers the path where w is an *os.File
+// but the file is not a character device (a regular file). IsTTY
+// must return false.
+func TestIsTTY_NonCharDeviceFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	f, err := os.Create(dir + "/out")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer f.Close()
+	if IsTTY(f) {
+		t.Error("regular file is not a character device; IsTTY should be false")
+	}
+}
+
+// TestIsTTY_StatErrorOnClosedFile drives the err != nil branch of
+// IsTTY: a closed *os.File can't be Stat'd, so IsTTY must return
+// false instead of panicking.
+func TestIsTTY_StatErrorOnClosedFile(t *testing.T) {
+	t.Parallel()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	f.Close()
+	if IsTTY(f) {
+		t.Error("closed file should not be reported as TTY")
+	}
+}
+
+// TestSpinner_DoubleStartIgnored covers the running.CompareAndSwap
+// false branch in Start: a second Start call while the spinner is
+// already running must be a no-op.
+func TestSpinner_DoubleStartIgnored(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
+
+	s := NewSpinner(buf, "x", false)
+	s.enabled = true
+	_ = s.withClock(clk)
+
+	s.Start()
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.afterCh != nil
+	})
+	// Second Start should short-circuit and NOT clobber stopCh/doneCh.
+	s.Start()
+	s.Stop()
+}
+
+// TestSpinner_PaintsWithColor exercises dimIfColor and resetIfColor
+// when useColor is true: the painted output should be wrapped in the
+// dim ANSI escape and the reset escape.
+func TestSpinner_PaintsWithColor(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	clk := newFakeClock(time.Unix(0, 0).UTC())
+
+	s := NewSpinner(buf, "wait", true) // useColor=true
+	s.enabled = true
+	_ = s.withClock(clk)
+
+	s.Start()
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.afterCh != nil
+	})
+	clk.advance(s.delay)
+	clk.firePreRoll()
+	waitFor(t, time.Second, func() bool {
+		clk.mu.Lock()
+		defer clk.mu.Unlock()
+		return clk.tickCh != nil
+	})
+	s.Stop()
+
+	out := buf.String()
+	if !strings.Contains(out, dimEscape) {
+		t.Errorf("colored spinner missing dim escape, got %q", out)
+	}
+	if !strings.Contains(out, resetEscape) {
+		t.Errorf("colored spinner missing reset escape, got %q", out)
+	}
+}
+
+// TestSpinner_DimResetHelpers covers the false branches of
+// dimIfColor / resetIfColor: when useColor is off they must return
+// the empty string.
+func TestSpinner_DimResetHelpers(t *testing.T) {
+	t.Parallel()
+	off := &Spinner{useColor: false}
+	if off.dimIfColor() != "" {
+		t.Errorf("dimIfColor with useColor=false should be empty, got %q", off.dimIfColor())
+	}
+	if off.resetIfColor() != "" {
+		t.Errorf("resetIfColor with useColor=false should be empty, got %q", off.resetIfColor())
+	}
+	on := &Spinner{useColor: true}
+	if on.dimIfColor() != dimEscape {
+		t.Errorf("dimIfColor with useColor=true = %q, want %q", on.dimIfColor(), dimEscape)
+	}
+	if on.resetIfColor() != resetEscape {
+		t.Errorf("resetIfColor with useColor=true = %q, want %q", on.resetIfColor(), resetEscape)
+	}
+}
+
+// TestSpinner_DoubleStopIgnored covers the running.CompareAndSwap
+// false branch in Stop: a second Stop call while the spinner is
+// already stopped must be a no-op.
+func TestSpinner_DoubleStopIgnored(t *testing.T) {
+	t.Parallel()
+	buf := &safeBuffer{}
+	s := NewSpinner(buf, "x", false)
+	// Never started — Stop should short-circuit cleanly.
+	s.Stop()
+	s.Stop()
 }
 
 func tail(s string, n int) string {

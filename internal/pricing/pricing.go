@@ -47,11 +47,10 @@ func Lookup(alias string) (Pricing, bool) {
 	return p, ok
 }
 
-// forEachModel invokes fn once for every alias in the table. It exists
-// so that in-package tests can assert table-wide invariants without
-// re-exporting the underlying map.
-func forEachModel(fn func(alias string, p Pricing)) {
-	for alias, p := range models {
-		fn(alias, p)
-	}
+// HasModel reports whether alias resolves to a known pricing entry.
+// It is a thin convenience over [Lookup] for callers that only need
+// the membership check, e.g. config validation at a package boundary.
+func HasModel(alias string) bool {
+	_, ok := Lookup(alias)
+	return ok
 }

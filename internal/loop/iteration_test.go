@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestCorrectionMessageMentionsSchema(t *testing.T) {
+func TestCorrectionMessage_MentionsSchema(t *testing.T) {
 	got := correctionMessage(errBadStructuredOutput)
 	for _, sub := range []string{"DONE", "CONTINUE", "structured"} {
 		if !strings.Contains(got, sub) {

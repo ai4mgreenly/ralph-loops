@@ -58,6 +58,21 @@ const (
 	StatusContinue = "CONTINUE"
 )
 
+// Tool names as they appear in the `name` field of a tool_use block
+// (or the `tools` list of a `system` event). Only tools the codebase
+// dispatches on by name are listed here; new tools can be matched as
+// string literals until a renderer or stats path needs to special-case
+// them.
+const (
+	ToolBash         = "Bash"
+	ToolRead         = "Read"
+	ToolEdit         = "Edit"
+	ToolWrite        = "Write"
+	ToolGlob         = "Glob"
+	ToolGrep         = "Grep"
+	ToolNotebookEdit = "NotebookEdit"
+)
+
 // SchemaJSON is the JSON Schema passed to claude via --json-schema.
 // It forces the model to emit exactly {"status":"DONE"} or
 // {"status":"CONTINUE"} as its structured output.
@@ -162,31 +177,31 @@ func (r *Reader) Next() (Event, error) {
 	case TypeAssistant:
 		var ev Assistant
 		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: assistant: %v", ErrMalformed, err)}
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: assistant: %w", ErrMalformed, err)}
 		}
 		return ev, nil
 	case TypeUser:
 		var ev User
 		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: user: %v", ErrMalformed, err)}
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: user: %w", ErrMalformed, err)}
 		}
 		return ev, nil
 	case TypeResult:
 		var ev Result
 		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: result: %v", ErrMalformed, err)}
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: result: %w", ErrMalformed, err)}
 		}
 		return ev, nil
 	case TypeSystem:
 		var ev System
 		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: system: %v", ErrMalformed, err)}
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: system: %w", ErrMalformed, err)}
 		}
 		return ev, nil
 	case TypeRateLimit:
 		var ev RateLimit
 		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: rate_limit: %v", ErrMalformed, err)}
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: rate_limit: %w", ErrMalformed, err)}
 		}
 		return ev, nil
 	default:

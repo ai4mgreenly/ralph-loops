@@ -24,6 +24,20 @@ Make sure `$HOME/.local/bin` is on your `$PATH`. If you prefer not to
 install, `make build` produces `bin/ralph` and you can invoke it
 directly. Requires Go 1.26+ and the `claude` CLI on `$PATH`.
 
+### Build, test, lint
+
+The Makefile wraps the usual Go workflow:
+
+- `make build` — compile `bin/ralph`.
+- `make test` — run the test suite.
+- `make lint` — run `golangci-lint` (skipped with a hint if it isn't
+  installed).
+- `make check` — `fmt`, `vet`, `lint`, and `test` together; this is
+  what CI runs.
+
+For a tour of the package layout and architectural conventions, see
+[CLAUDE.md](./CLAUDE.md).
+
 ## Use
 
 Scaffold a new project with a starter spec directory:

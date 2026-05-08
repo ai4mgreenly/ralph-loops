@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,31 @@ const (
 // emits elsewhere.
 const eraseLine = "\r\x1b[2K"
 
+// clock is the wall-clock seam used by [Spinner]. The production
+// implementation, [realClock], delegates to the time package; tests
+// can substitute a controlled implementation to advance paint timing
+// deterministically.
+//
+// NewTicker returns the tick channel together with a stop function so
+// the spinner can release the underlying goroutine when it shuts down,
+// without forcing the abstraction to leak [time.Ticker]'s concrete
+// type to test doubles.
+type clock interface {
+	Now() time.Time
+	After(d time.Duration) <-chan time.Time
+	NewTicker(d time.Duration) (<-chan time.Time, func())
+}
+
+// realClock implements [clock] against the standard library.
+type realClock struct{}
+
+func (realClock) Now() time.Time                         { return time.Now() }
+func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+func (realClock) NewTicker(d time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTicker(d)
+	return t.C, t.Stop
+}
+
 // Spinner displays a braille rotator on the line where the next piece
 // of output would appear, annotated with a "waiting for X (Hh Mm Ss)"
 // label. It paints from a goroutine that the caller starts and stops;
@@ -34,13 +60,15 @@ const eraseLine = "\r\x1b[2K"
 // Start/Stop pair brackets one wait. Calling Start while already
 // running, or Stop while not running, is a no-op.
 type Spinner struct {
-	out     io.Writer
-	label   string
-	delay   time.Duration
-	tick    time.Duration
-	enabled bool
+	out      io.Writer
+	label    string
+	delay    time.Duration
+	tick     time.Duration
+	enabled  bool
+	useColor bool
+	clk      clock
 
-	running bool
+	running atomic.Bool
 	start   time.Time
 	stopCh  chan struct{}
 	doneCh  chan struct{}
@@ -50,26 +78,40 @@ type Spinner struct {
 // label, after a 3 second pre-roll — long enough that brief waits
 // leave no trace on the terminal. The first painted frame already
 // shows the elapsed-time annotation as "3s". If out is not a
-// terminal the spinner is permanently disabled.
-func NewSpinner(out io.Writer, label string) *Spinner {
+// terminal the spinner is permanently disabled. useColor controls
+// whether the painted line is wrapped in dim-grey ANSI escapes;
+// callers normally pass [Theme.UseColor].
+func NewSpinner(out io.Writer, label string, useColor bool) *Spinner {
 	return &Spinner{
-		out:     out,
-		label:   label,
-		delay:   spinnerDefaultDelay,
-		tick:    spinnerDefaultTick,
-		enabled: IsTTY(out),
+		out:      out,
+		label:    label,
+		delay:    spinnerDefaultDelay,
+		tick:     spinnerDefaultTick,
+		enabled:  IsTTY(out),
+		useColor: useColor,
+		clk:      realClock{},
 	}
+}
+
+// withClock swaps in an alternative [clock] implementation. Intended
+// for tests that need deterministic paint timing; production code
+// keeps the [realClock] installed by [NewSpinner].
+func (s *Spinner) withClock(c clock) *Spinner {
+	s.clk = c
+	return s
 }
 
 // Start begins a new wait interval. The spinner pre-rolls for the
 // configured delay before the first paint, so short waits leave no
 // trace on the terminal.
 func (s *Spinner) Start() {
-	if !s.enabled || s.running {
+	if !s.enabled {
 		return
 	}
-	s.running = true
-	s.start = time.Now()
+	if !s.running.CompareAndSwap(false, true) {
+		return
+	}
+	s.start = s.clk.Now()
 	s.stopCh = make(chan struct{})
 	s.doneCh = make(chan struct{})
 	go s.run()
@@ -79,12 +121,11 @@ func (s *Spinner) Start() {
 // drew. Safe to call when Start was never called or after a previous
 // Stop.
 func (s *Spinner) Stop() {
-	if !s.running {
+	if !s.running.CompareAndSwap(true, false) {
 		return
 	}
 	close(s.stopCh)
 	<-s.doneCh
-	s.running = false
 }
 
 func (s *Spinner) run() {
@@ -95,31 +136,31 @@ func (s *Spinner) run() {
 	select {
 	case <-s.stopCh:
 		return
-	case <-time.After(s.delay):
+	case <-s.clk.After(s.delay):
 	}
 
 	frame := 0
 	paint := func() {
 		fmt.Fprintf(s.out, "%s%s%c %s (%s)%s",
 			eraseLine,
-			dimIfColor(),
+			s.dimIfColor(),
 			spinnerFrames[frame],
 			s.label,
-			formatElapsed(time.Since(s.start)),
-			resetIfColor(),
+			formatElapsed(s.clk.Now().Sub(s.start)),
+			s.resetIfColor(),
 		)
 		frame = (frame + 1) % len(spinnerFrames)
 	}
 	paint()
 
-	ticker := time.NewTicker(s.tick)
-	defer ticker.Stop()
+	tickCh, tickStop := s.clk.NewTicker(s.tick)
+	defer tickStop()
 	for {
 		select {
 		case <-s.stopCh:
 			fmt.Fprint(s.out, eraseLine)
 			return
-		case <-ticker.C:
+		case <-tickCh:
 			paint()
 		}
 	}
@@ -166,15 +207,15 @@ func IsTTY(w io.Writer) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-func dimIfColor() string {
-	if useColor.Load() {
+func (s *Spinner) dimIfColor() string {
+	if s.useColor {
 		return dimEscape
 	}
 	return ""
 }
 
-func resetIfColor() string {
-	if useColor.Load() {
+func (s *Spinner) resetIfColor() string {
+	if s.useColor {
 		return resetEscape
 	}
 	return ""

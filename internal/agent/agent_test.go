@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestBuildArgs(t *testing.T) {
+func TestBuildArgs_FullConfig(t *testing.T) {
 	cfg := Config{
 		Model:           "opus",
 		Effort:          "medium",
@@ -37,7 +37,7 @@ func TestBuildArgs(t *testing.T) {
 	}
 }
 
-func TestBuildArgsOmitsTools(t *testing.T) {
+func TestBuildArgs_OmitsTools(t *testing.T) {
 	cfg := Config{Model: "opus", Effort: "medium"}
 	got := buildArgs(cfg)
 	if slices.Contains(got, "--tools") {
@@ -45,7 +45,7 @@ func TestBuildArgsOmitsTools(t *testing.T) {
 	}
 }
 
-func TestBuildArgsOmitsSkipPermissions(t *testing.T) {
+func TestBuildArgs_OmitsSkipPermissions(t *testing.T) {
 	cfg := Config{Model: "opus", Effort: "medium", SkipPermissions: false}
 	got := buildArgs(cfg)
 	if slices.Contains(got, "--dangerously-skip-permissions") {
@@ -53,7 +53,7 @@ func TestBuildArgsOmitsSkipPermissions(t *testing.T) {
 	}
 }
 
-func TestBuildEnv(t *testing.T) {
+func TestBuildEnv_FullConfig(t *testing.T) {
 	cfg := Config{
 		ConfigDir:   "/tmp/cfg",
 		OneMContext: true,
@@ -73,7 +73,7 @@ func TestBuildEnv(t *testing.T) {
 	}
 }
 
-func TestBuildEnvOmitsConfigDirWhenEmpty(t *testing.T) {
+func TestBuildEnv_OmitsConfigDirWhenEmpty(t *testing.T) {
 	env := buildEnv(Config{OneMContext: true})
 	for _, e := range env {
 		if strings.HasPrefix(e, "CLAUDE_CONFIG_DIR=") {
@@ -82,14 +82,14 @@ func TestBuildEnvOmitsConfigDirWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestBuildEnvDisablesOneMWhenOff(t *testing.T) {
+func TestBuildEnv_DisablesOneMWhenOff(t *testing.T) {
 	env := buildEnv(Config{OneMContext: false})
 	if !envContains(env, "CLAUDE_CODE_DISABLE_1M_CONTEXT=1") {
 		t.Errorf("expected CLAUDE_CODE_DISABLE_1M_CONTEXT=1 when OneMContext is false")
 	}
 }
 
-func TestWriteUserMessageFraming(t *testing.T) {
+func TestWriteUserMessage_Framing(t *testing.T) {
 	var buf bytes.Buffer
 	if err := writeUserMessage(&buf, "hello"); err != nil {
 		t.Fatalf("writeUserMessage: %v", err)
@@ -112,7 +112,7 @@ func TestWriteUserMessageFraming(t *testing.T) {
 	}
 }
 
-func TestTranslateWaitErr(t *testing.T) {
+func TestTranslateWaitErr_AllBranches(t *testing.T) {
 	if err := translateWaitErr(nil); err != nil {
 		t.Errorf("nil wait err should translate to nil, got %v", err)
 	}
@@ -138,7 +138,7 @@ func TestTranslateWaitErr(t *testing.T) {
 	}
 }
 
-func TestExitErrorMessage(t *testing.T) {
+func TestExitError_Message(t *testing.T) {
 	err := &ExitError{Code: 42}
 	if !strings.Contains(err.Error(), "42") {
 		t.Errorf("ExitError message should include the code: %q", err.Error())

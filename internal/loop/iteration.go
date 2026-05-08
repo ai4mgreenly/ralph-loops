@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 	"github.com/ai4mgreenly/ralph-loops/internal/render"
@@ -28,15 +27,15 @@ var errBadStructuredOutput = errors.New("invalid structured output")
 var errStreamEnded = errors.New("claude stream ended without result")
 
 // runIteration drives a single agent invocation: it asks the spawner
-// for a fresh [agent.Session], sends the kickoff prompt, dispatches
-// events into the emitter, and applies the structured-output retry
-// policy. It returns the final status ("DONE" or "CONTINUE") on
-// success, or an error if the iteration could not complete.
+// for a fresh [Session], sends the kickoff prompt, dispatches events
+// into the emitter, and applies the structured-output retry policy.
+// It returns the final status ("DONE" or "CONTINUE") on success, or
+// an error if the iteration could not complete.
 //
 // Cancellation of ctx (timeout or SIGINT) propagates through the
 // spawner's exec.CommandContext wiring, which delivers SIGINT to the
 // child's process group before the grace period elapses.
-func runIteration(ctx context.Context, cfg Config, sp agent.Spawner, e *render.Emitter, s *stats) (string, error) {
+func runIteration(ctx context.Context, cfg Config, sp Spawner, e *render.Emitter, s *stats) (string, error) {
 	sess, err := sp.Spawn(ctx, agentConfig(cfg))
 	if err != nil {
 		return "", err
@@ -64,7 +63,7 @@ func runIteration(ctx context.Context, cfg Config, sp agent.Spawner, e *render.E
 			if (ee.Code == 0 || ee.Code == 1) && status != "" {
 				return status, nil
 			}
-			return "", fmt.Errorf("claude exited with status %d", ee.Code)
+			return "", fmt.Errorf("claude exited with status %d: %w", ee.Code, ee)
 		}
 		return "", fmt.Errorf("claude exited: %w", closeErr)
 	}
@@ -94,7 +93,7 @@ func agentConfig(cfg Config) agent.Config {
 // correction round.
 func pumpStream(
 	ctx context.Context,
-	sess agent.Session,
+	sess Session,
 	e *render.Emitter,
 	s *stats,
 	prompt string,
@@ -137,9 +136,9 @@ func pumpStream(
 // new event kind from claude does not abort the iteration.
 func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, error) {
 	for {
-		e.Spinner.Start()
+		e.Spinner().Start()
 		ev, err := r.Next()
-		e.Spinner.Stop()
+		e.Spinner().Stop()
 		if errors.Is(err, io.EOF) {
 			return "", errStreamEnded
 		}
@@ -148,7 +147,7 @@ func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, err
 			// the operator retains full visibility, then keep reading.
 			var de *stream.DecodeError
 			if errors.As(err, &de) {
-				fmt.Fprintf(os.Stdout, "%s\n\n", de.Bytes)
+				e.OnDecodeError(*de)
 				continue
 			}
 			return "", fmt.Errorf("read stream: %w", err)

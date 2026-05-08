@@ -3,6 +3,7 @@ package render
 import "testing"
 
 func TestDiffLines(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		old  string
@@ -66,7 +67,9 @@ func TestDiffLines(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := diffLines(tc.old, tc.new)
 			if len(got) != len(tc.want) {
 				t.Fatalf("len(got)=%d, len(want)=%d\ngot:  %v\nwant: %v", len(got), len(tc.want), got, tc.want)

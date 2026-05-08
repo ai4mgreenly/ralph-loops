@@ -18,7 +18,7 @@ func runCapture(args ...string) (int, string, string) {
 	return code, stdout.String(), stderr.String()
 }
 
-func TestRunNoArgsIsUsageError(t *testing.T) {
+func TestRun_NoArgs_IsUsageError(t *testing.T) {
 	code, stdout, stderr := runCapture()
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
@@ -31,7 +31,7 @@ func TestRunNoArgsIsUsageError(t *testing.T) {
 	}
 }
 
-func TestRunVersion(t *testing.T) {
+func TestRun_Version(t *testing.T) {
 	for _, arg := range []string{"version", "-v", "--version"} {
 		t.Run(arg, func(t *testing.T) {
 			code, stdout, _ := runCapture(arg)
@@ -46,7 +46,7 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
-func TestRunHelp(t *testing.T) {
+func TestRun_Help(t *testing.T) {
 	for _, arg := range []string{"help", "-h", "--help"} {
 		t.Run(arg, func(t *testing.T) {
 			code, stdout, stderr := runCapture(arg)
@@ -63,7 +63,7 @@ func TestRunHelp(t *testing.T) {
 	}
 }
 
-func TestRunNewID(t *testing.T) {
+func TestRun_NewID(t *testing.T) {
 	code, stdout, _ := runCapture("newid")
 	if code != exitSuccess {
 		t.Fatalf("exit code = %d, want %d", code, exitSuccess)
@@ -74,7 +74,7 @@ func TestRunNewID(t *testing.T) {
 	}
 }
 
-func TestRunNewIDRejectsExtraArgs(t *testing.T) {
+func TestRun_NewID_RejectsExtraArgs(t *testing.T) {
 	code, _, stderr := runCapture("newid", "extra")
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
@@ -84,7 +84,7 @@ func TestRunNewIDRejectsExtraArgs(t *testing.T) {
 	}
 }
 
-func TestRunTimeOfRoundTrip(t *testing.T) {
+func TestRun_TimeOf_RoundTrip(t *testing.T) {
 	id := idgen.New()
 	code, stdout, stderr := runCapture("time-of", id)
 	if code != exitSuccess {
@@ -97,7 +97,7 @@ func TestRunTimeOfRoundTrip(t *testing.T) {
 	}
 }
 
-func TestRunTimeOfRequiresExactlyOneArg(t *testing.T) {
+func TestRun_TimeOf_RequiresExactlyOneArg(t *testing.T) {
 	cases := [][]string{
 		{"time-of"},
 		{"time-of", "a", "b"},
@@ -113,7 +113,7 @@ func TestRunTimeOfRequiresExactlyOneArg(t *testing.T) {
 	}
 }
 
-func TestRunTimeOfInvalidID(t *testing.T) {
+func TestRun_TimeOf_InvalidID(t *testing.T) {
 	code, _, stderr := runCapture("time-of", "not-an-id")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
@@ -123,7 +123,7 @@ func TestRunTimeOfInvalidID(t *testing.T) {
 	}
 }
 
-func TestRunInitCreatesSkeleton(t *testing.T) {
+func TestRun_Init_CreatesSkeleton(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "newproj")
 
 	code, _, stderr := runCapture("init", tmp)
@@ -183,7 +183,7 @@ func TestRunInitCreatesSkeleton(t *testing.T) {
 	}
 }
 
-func TestRunInitRefusesExistingReqs(t *testing.T) {
+func TestRun_Init_RefusesExistingReqs(t *testing.T) {
 	tmp := t.TempDir()
 	reqsDir := filepath.Join(tmp, "reqs")
 	if err := os.MkdirAll(reqsDir, 0o755); err != nil {
@@ -218,7 +218,7 @@ func TestRunInitRefusesExistingReqs(t *testing.T) {
 	}
 }
 
-func TestRunInitRequiresExactlyOneArg(t *testing.T) {
+func TestRun_Init_RequiresExactlyOneArg(t *testing.T) {
 	cases := [][]string{
 		{"init"},
 		{"init", "a", "b"},
@@ -234,14 +234,14 @@ func TestRunInitRequiresExactlyOneArg(t *testing.T) {
 	}
 }
 
-func TestRunHelpListsInit(t *testing.T) {
+func TestRun_Help_ListsInit(t *testing.T) {
 	_, stdout, _ := runCapture("help")
 	if !strings.Contains(stdout, "ralph init PATH") {
 		t.Errorf("help output missing init subcommand: %q", stdout)
 	}
 }
 
-func TestRunLoopRequiresWorkdir(t *testing.T) {
+func TestRun_Loop_RequiresWorkdir(t *testing.T) {
 	// All flags consumed, no positional argument.
 	code, _, stderr := runCapture("--model=sonnet")
 	if code != exitUsage {
@@ -252,14 +252,14 @@ func TestRunLoopRequiresWorkdir(t *testing.T) {
 	}
 }
 
-func TestRunLoopRejectsUnknownFlag(t *testing.T) {
+func TestRun_Loop_RejectsUnknownFlag(t *testing.T) {
 	code, _, _ := runCapture("--definitely-not-a-flag", ".")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
 	}
 }
 
-func TestRunLoopRejectsExtraPositional(t *testing.T) {
+func TestRun_Loop_RejectsExtraPositional(t *testing.T) {
 	code, _, stderr := runCapture("workdir", "extra")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
@@ -274,7 +274,7 @@ func TestRunLoopRejectsExtraPositional(t *testing.T) {
 // driver because the dispatcher only inspected args[0]. After moving
 // --version onto the loop's FlagSet, the flag parser sees it
 // regardless of position.
-func TestRunVersionAfterOtherFlags(t *testing.T) {
+func TestRun_Version_AfterOtherFlags(t *testing.T) {
 	cases := [][]string{
 		{"--reqs=foo", "--version"},
 		{"--reqs=foo", "-v"},
@@ -295,7 +295,7 @@ func TestRunVersionAfterOtherFlags(t *testing.T) {
 }
 
 // TestRunHelpAfterOtherFlags is the --help twin of the --version test.
-func TestRunHelpAfterOtherFlags(t *testing.T) {
+func TestRun_Help_AfterOtherFlags(t *testing.T) {
 	cases := [][]string{
 		{"--reqs=foo", "--help"},
 		{"--reqs=foo", "-h"},
@@ -313,7 +313,7 @@ func TestRunHelpAfterOtherFlags(t *testing.T) {
 	}
 }
 
-func TestRunLoopRejectsInvalidModel(t *testing.T) {
+func TestRun_Loop_RejectsInvalidModel(t *testing.T) {
 	code, _, stderr := runCapture("--model=foo", ".")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
@@ -326,7 +326,7 @@ func TestRunLoopRejectsInvalidModel(t *testing.T) {
 	}
 }
 
-func TestRunLoopRejectsInvalidEffort(t *testing.T) {
+func TestRun_Loop_RejectsInvalidEffort(t *testing.T) {
 	code, _, stderr := runCapture("--effort=foo", ".")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)

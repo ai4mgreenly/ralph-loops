@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
+	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
 func TestStats_TrackUsageComputesCost(t *testing.T) {
-	s := newStats("opus")
+	s := newStats("opus", nil, "")
 	s.TrackUsage(&stream.Usage{
 		InputTokens:              1_000_000,
 		OutputTokens:             1_000_000,
@@ -28,8 +29,9 @@ func TestStats_TrackUsageComputesCost(t *testing.T) {
 	if got, want := s.cost, int64(36_750_000); got != want {
 		t.Errorf("cost = %d micro-USD, want %d", got, want)
 	}
-	if got, want := s.CostUSD(), 36.75; got != want {
-		t.Errorf("CostUSD() = %v, want %v", got, want)
+	// 36.75 USD == 36_750_000 micro-USD.
+	if got, want := float64(s.cost)/1_000_000, 36.75; got != want {
+		t.Errorf("cost in USD = %v, want %v", got, want)
 	}
 	if got, want := s.tokens.total(), 4_000_000; got != want {
 		t.Errorf("tokens.total = %d, want %d", got, want)
@@ -37,7 +39,7 @@ func TestStats_TrackUsageComputesCost(t *testing.T) {
 }
 
 func TestStats_TrackUsageUnknownModelStillTalliesTokens(t *testing.T) {
-	s := newStats("nonexistent")
+	s := newStats("nonexistent", nil, "")
 	s.TrackUsage(&stream.Usage{InputTokens: 100})
 	if s.cost != 0 {
 		t.Errorf("expected zero cost for unknown model, got %d", s.cost)
@@ -48,14 +50,14 @@ func TestStats_TrackUsageUnknownModelStillTalliesTokens(t *testing.T) {
 }
 
 func TestStats_CostJSONRoundTrips(t *testing.T) {
-	s := newStats("opus")
+	s := newStats("opus", nil, "")
 	s.TrackUsage(&stream.Usage{
 		InputTokens:              1_000_000,
 		OutputTokens:             1_000_000,
 		CacheReadInputTokens:     1_000_000,
 		CacheCreationInputTokens: 1_000_000,
 	})
-	sum := s.snapshot("/r", "done")
+	sum := s.snapshot("/r", exitDone)
 
 	enc, err := json.Marshal(sum)
 	if err != nil {
@@ -70,13 +72,13 @@ func TestStats_CostJSONRoundTrips(t *testing.T) {
 	if err := json.Unmarshal(enc, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.CostMicroUSD != sum.CostMicroUSD {
-		t.Errorf("round-trip CostMicroUSD = %d, want %d", got.CostMicroUSD, sum.CostMicroUSD)
+	if got.Cost != sum.Cost {
+		t.Errorf("round-trip Cost = %d, want %d", got.Cost, sum.Cost)
 	}
 }
 
 func TestStats_PanelLayout(t *testing.T) {
-	s := newStats("opus")
+	s := newStats("opus", nil, "")
 	s.iterations = 2
 	s.tallyEvent(stream.TypeAssistant)
 	s.tallyEvent(stream.TypeAssistant)
@@ -89,11 +91,11 @@ func TestStats_PanelLayout(t *testing.T) {
 	s.AddToolTime(time.Second)
 
 	var buf bytes.Buffer
-	s.writePanel(&buf, "/some/reqs", "done")
+	s.snapshot("/some/reqs", exitDone).writeText(&buf, 0)
 	out := buf.String()
 
 	wantSubstrings := []string{
-		statsRuleChar + statsRuleChar + statsRuleChar, // unicode rule appears
+		ui.RuleChar + ui.RuleChar + ui.RuleChar, // unicode rule appears
 		"reqs:        /some/reqs",
 		"exit:        done",
 		"iterations:  2",
@@ -121,9 +123,9 @@ func TestStats_PanelLayout(t *testing.T) {
 }
 
 func TestStats_PanelOmitsExitWhenEmpty(t *testing.T) {
-	s := newStats("opus")
+	s := newStats("opus", nil, "")
 	var buf bytes.Buffer
-	s.writePanel(&buf, "/some/reqs", "")
+	s.snapshot("/some/reqs", exitNone).writeText(&buf, 0)
 	if strings.Contains(buf.String(), "exit:") {
 		t.Errorf("expected no exit line, got panel:\n%s", buf.String())
 	}
@@ -132,14 +134,11 @@ func TestStats_PanelOmitsExitWhenEmpty(t *testing.T) {
 func TestAppendResultsJSONL_CreatesDirAndAppends(t *testing.T) {
 	tmp := t.TempDir()
 	dir := filepath.Join(tmp, ".ralph-loops")
-	prev := resultsHomePath
-	resultsHomePath = func() string { return dir }
-	defer func() { resultsHomePath = prev }()
 
 	first := summary{Reqs: "/r", Exit: "done", Iterations: 1}
 	second := summary{Reqs: "/r", Exit: "timeout", Iterations: 7}
-	appendResultsJSONL(first)
-	appendResultsJSONL(second)
+	appendResultsJSONL(dir, first)
+	appendResultsJSONL(dir, second)
 
 	logPath := filepath.Join(dir, "results.jsonl")
 	body, err := os.ReadFile(logPath)
@@ -161,12 +160,8 @@ func TestAppendResultsJSONL_CreatesDirAndAppends(t *testing.T) {
 }
 
 func TestAppendResultsJSONL_SilentWhenHomeUnknown(t *testing.T) {
-	prev := resultsHomePath
-	resultsHomePath = func() string { return "" }
-	defer func() { resultsHomePath = prev }()
-
 	// Should not panic or otherwise misbehave.
-	appendResultsJSONL(summary{Reqs: "/r"})
+	appendResultsJSONL("", summary{Reqs: "/r"})
 }
 
 func TestAppendResultsJSONL_SilentWhenMkdirFails(t *testing.T) {
@@ -178,11 +173,7 @@ func TestAppendResultsJSONL_SilentWhenMkdirFails(t *testing.T) {
 	if err := os.MkdirAll(parent, 0o500); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	prev := resultsHomePath
-	resultsHomePath = func() string { return filepath.Join(parent, "child") }
-	defer func() { resultsHomePath = prev }()
-
-	appendResultsJSONL(summary{Reqs: "/r"})
+	appendResultsJSONL(filepath.Join(parent, "child"), summary{Reqs: "/r"})
 
 	// The child directory must NOT have been created — our refusal to
 	// write means we also didn't fall back to creating it elsewhere.
@@ -192,7 +183,7 @@ func TestAppendResultsJSONL_SilentWhenMkdirFails(t *testing.T) {
 }
 
 func TestStats_SnapshotShape(t *testing.T) {
-	s := newStats("opus")
+	s := newStats("opus", nil, "")
 	s.iterations = 3
 	s.tallyEvent(stream.TypeAssistant)
 	s.TallyBlock(stream.BlockText)
@@ -200,7 +191,7 @@ func TestStats_SnapshotShape(t *testing.T) {
 	s.AddLLMTime(5 * time.Second)
 	s.AddToolTime(2 * time.Second)
 
-	sum := s.snapshot("/path/to/reqs", "done")
+	sum := s.snapshot("/path/to/reqs", exitDone)
 	if sum.Reqs != "/path/to/reqs" {
 		t.Errorf("Reqs = %q", sum.Reqs)
 	}
