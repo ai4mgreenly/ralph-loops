@@ -84,6 +84,12 @@ type Config struct {
 	// are echoed to the operator. Off by default; enabled via
 	// `--verbose` for debugging or detailed run inspection.
 	Verbose bool
+
+	// OutputLines is the maximum number of lines of tool output
+	// (Bash stdout/stderr, Read file contents, Edit/Write hunks)
+	// replayed in the activity log per result. Zero falls back to the
+	// emitter's built-in default.
+	OutputLines int
 }
 
 // ErrInvalidConfig is returned by [Run] when the supplied [Config]
@@ -144,6 +150,9 @@ func runWith(cfg Config, budget time.Duration, w io.Writer) error {
 	s := newStats(cfg.Model)
 	e := newEmitter(w, s)
 	e.verbose = cfg.Verbose
+	if cfg.OutputLines > 0 {
+		e.outputLines = cfg.OutputLines
+	}
 
 	exitReason, runErr := drive(ctx, cfg, e, s)
 	sum := s.snapshot(cfg.ReqsDir, exitReason)

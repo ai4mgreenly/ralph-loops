@@ -22,6 +22,59 @@ func fakeClock(base time.Time, step time.Duration) func() time.Time {
 	}
 }
 
+func TestReadTarget(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "no range",
+			input: `{"file_path":"foo.go"}`,
+			want:  "foo.go",
+		},
+		{
+			name:  "offset and limit",
+			input: `{"file_path":"foo.go","offset":200,"limit":50}`,
+			want:  "foo.go:200-249",
+		},
+		{
+			name:  "offset only",
+			input: `{"file_path":"foo.go","offset":200}`,
+			want:  "foo.go:200-",
+		},
+		{
+			name:  "limit only",
+			input: `{"file_path":"foo.go","limit":50}`,
+			want:  "foo.go:1-50",
+		},
+		{
+			name:  "limit one",
+			input: `{"file_path":"foo.go","limit":1}`,
+			want:  "foo.go:1-1",
+		},
+		{
+			name:  "missing file_path stays empty but range still renders",
+			input: `{"offset":10,"limit":5}`,
+			want:  ":10-14",
+		},
+		{
+			name:  "garbage input is fail-soft",
+			input: `not json`,
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := readTarget(json.RawMessage(tc.input))
+			if got != tc.want {
+				t.Errorf("readTarget(%s) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIterationBanner(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
 	e.iterationBanner(3)

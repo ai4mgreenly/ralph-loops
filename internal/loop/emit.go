@@ -20,13 +20,14 @@ import (
 // clears the pending-tool ledger and re-anchors the timer at the
 // start of each new iteration.
 type emitter struct {
-	out     io.Writer
-	stats   *stats
-	tools   map[string]toolRef
-	lastAt  time.Time
-	now     func() time.Time
-	verbose bool
-	spinner *ui.Spinner
+	out         io.Writer
+	stats       *stats
+	tools       map[string]toolRef
+	lastAt      time.Time
+	now         func() time.Time
+	verbose     bool
+	spinner     *ui.Spinner
+	outputLines int
 }
 
 // toolRef is the input to a not-yet-completed tool call, retained so
@@ -42,11 +43,12 @@ type toolRef struct {
 // tests can install a deterministic clock.
 func newEmitter(out io.Writer, s *stats) *emitter {
 	return &emitter{
-		out:     out,
-		stats:   s,
-		tools:   make(map[string]toolRef),
-		now:     time.Now,
-		spinner: ui.NewSpinner(out, "waiting for claude"),
+		out:         out,
+		stats:       s,
+		tools:       make(map[string]toolRef),
+		now:         time.Now,
+		spinner:     ui.NewSpinner(out, "waiting for claude"),
+		outputLines: defaultOutputLines,
 	}
 }
 
@@ -181,7 +183,10 @@ func (e *emitter) emitToolCall(b stream.Block) {
 	case "Bash":
 		ui.Tool(e.out, "←", bashCommand(b.Input), true)
 		return
-	case "Read", "Edit", "Write":
+	case "Read":
+		ui.Tool(e.out, "←", "Read  "+readTarget(b.Input), true)
+		return
+	case "Edit", "Write":
 		ui.Tool(e.out, "←", b.Name+"  "+filePathOf(b.Input), true)
 		return
 	}
@@ -192,11 +197,12 @@ func (e *emitter) emitToolCall(b stream.Block) {
 	ui.Tool(e.out, "←", content, true)
 }
 
-// outputLineCap bounds how many lines of tool output we replay in the
-// activity log. Bash, Read, and Edit output can be enormous; ten
-// lines covers the common case (a build's tail end, the top of a
-// file, a small edit hunk) without flooding the operator.
-const outputLineCap = 10
+// defaultOutputLines bounds how many lines of tool output we replay
+// in the activity log when [Config.OutputLines] is unset. Bash, Read,
+// and Edit output can be enormous; ten lines covers the common case
+// (a build's tail end, the top of a file, a small edit hunk) without
+// flooding the operator. Operators override via `--output-lines`.
+const defaultOutputLines = 10
 
 // emitOutputBlock renders the shared terminal-style result block used
 // by Bash, Read, Edit, Write, and any future tool that prefers raw
@@ -205,12 +211,16 @@ const outputLineCap = 10
 // continuations get [ui.Gutter] spaces, giving the whole block one
 // clean left edge. Per-line colour is applied after wrapping so ANSI
 // escapes do not count toward the wrap budget. When more than
-// [outputLineCap] input lines are supplied the overflow is dropped
-// and a `...` line is appended.
+// [emitter.outputLines] input lines are supplied the overflow is
+// dropped and a `...` line is appended.
 func (e *emitter) emitOutputBlock(marker string, lines []ui.Line) {
+	cap := e.outputLines
+	if cap <= 0 {
+		cap = defaultOutputLines
+	}
 	truncated := false
-	if len(lines) > outputLineCap {
-		lines = lines[:outputLineCap]
+	if len(lines) > cap {
+		lines = lines[:cap]
 		truncated = true
 	}
 	if truncated {
@@ -221,8 +231,8 @@ func (e *emitter) emitOutputBlock(marker string, lines []ui.Line) {
 
 // emitBashResult renders the result of a Bash tool call as a tight
 // terminal-style block: stdout lines first, stderr lines after in dim
-// red, capped at [outputLineCap] with a trailing `...` when more were
-// available.
+// red, capped at [emitter.outputLines] with a trailing `...` when
+// more were available.
 func (e *emitter) emitBashResult(b stream.Block, structured json.RawMessage) {
 	var s struct {
 		Stdout string `json:"stdout"`
@@ -489,10 +499,42 @@ func filePathOf(input json.RawMessage) string {
 	return s.FilePath
 }
 
+// readTarget renders a Read tool_use input as a `file_path` plus an
+// optional `:start-end` line-range suffix when the agent narrowed the
+// read via `offset` and/or `limit`. The suffix mirrors grep -n's
+// `file:line` convention so the operator can see at a glance what
+// slice the agent asked for.
+//
+//	Read(foo.go)                       → "foo.go"
+//	Read(foo.go, offset=200, limit=50) → "foo.go:200-249"
+//	Read(foo.go, offset=200)           → "foo.go:200-"
+//	Read(foo.go, limit=50)             → "foo.go:1-50"
+//
+// Same fail-soft semantics as [filePathOf].
+func readTarget(input json.RawMessage) string {
+	var s struct {
+		FilePath string `json:"file_path"`
+		Offset   int    `json:"offset"`
+		Limit    int    `json:"limit"`
+	}
+	_ = json.Unmarshal(input, &s)
+	if s.Offset == 0 && s.Limit == 0 {
+		return s.FilePath
+	}
+	start := s.Offset
+	if start == 0 {
+		start = 1
+	}
+	if s.Limit > 0 {
+		return fmt.Sprintf("%s:%d-%d", s.FilePath, start, start+s.Limit-1)
+	}
+	return fmt.Sprintf("%s:%d-", s.FilePath, start)
+}
+
 // emitUserText renders a replayed user-text block (typically the
 // iteration's kickoff prompt) as a tucked-under output block — same
 // shape a Read tool response uses. Content is split on `\n`, capped
-// at [outputLineCap] visible lines with a `...` truncation marker
+// at [emitter.outputLines] visible lines with a `...` truncation marker
 // when the body runs longer, and shares the same gutter/wrap rules
 // as every other block.
 func (e *emitter) emitUserText(text string) {

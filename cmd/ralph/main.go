@@ -47,6 +47,7 @@ const (
 	defaultOneMContext     = true
 	defaultClaudeAIMCP     = false
 	defaultSkipPermissions = true
+	defaultOutputLines     = 10
 )
 
 // Exit codes follow the convention used by Unix CLIs: 0 success, 1
@@ -126,8 +127,9 @@ func runLoop(args []string, stderr io.Writer) int {
 		oneM      = fs.Bool("1m-context", defaultOneMContext, "enable 1M-token context window")
 		mcp       = fs.Bool("enable-claudeai-mcp-servers", defaultClaudeAIMCP, "enable Claude.ai-managed MCP servers")
 		skipPerm  = fs.Bool("dangerously-skip-permissions", defaultSkipPermissions, "pass --dangerously-skip-permissions to claude")
-		tools     = fs.String("tools", defaultTools, "comma-separated tool list; empty means all built-ins")
-		verbose   = fs.Bool("verbose", false, "echo low-signal stream events (system init, rate_limit)")
+		tools       = fs.String("tools", defaultTools, "comma-separated tool list; empty means all built-ins")
+		verbose     = fs.Bool("verbose", false, "echo low-signal stream events (system init, rate_limit)")
+		outputLines = fs.Int("output-lines", defaultOutputLines, "max lines of tool output to replay per result before truncating with `...`")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -159,6 +161,7 @@ func runLoop(args []string, stderr io.Writer) int {
 		Prompt:          prompt,
 		Version:         version,
 		Verbose:         *verbose,
+		OutputLines:     *outputLines,
 	}
 
 	if err := loop.Run(cfg); err != nil {
@@ -296,6 +299,11 @@ FLAGS (loop subcommand)
                                        Empty = all built-ins (default).
   --verbose[=BOOL]                     echo low-signal stream events
                                        (system init, rate_limit) (default: false)
+  --output-lines=N                     max lines of tool output (Bash
+                                       stdout/stderr, Read contents,
+                                       Edit/Write hunks) replayed per
+                                       result before a '...' truncation
+                                       marker (default: %d)
 
   Boolean flags accept --flag, --flag=true, --flag=false. To turn off a
   default-true flag, write e.g. --1m-context=false.
@@ -337,5 +345,6 @@ REQUIREMENT IDS
 		defaultOneMContext,
 		defaultSkipPermissions,
 		defaultClaudeAIMCP,
+		defaultOutputLines,
 	)
 }
