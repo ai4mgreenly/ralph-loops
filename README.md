@@ -136,3 +136,7 @@ minted from. The build agent references these IDs in code
 comments and test names so the spec stays traceable to the
 implementation, and changing an ID is the signal to re-evaluate a
 requirement from scratch on the next iteration.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
