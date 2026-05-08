@@ -1,16 +1,18 @@
-// Package loop drives the ralph iteration loop: it spawns the claude
-// CLI as a child process, feeds it the operator prompt, parses the
-// stream-json event flow, and repeats until the agent reports DONE,
-// the wall-clock budget is exhausted, or the operator presses Ctrl-C.
+// Package loop drives the ralph iteration loop: it asks an
+// [agent.Spawner] for a fresh agent session per iteration, feeds it
+// the operator prompt, parses the stream-json event flow, and repeats
+// until the agent reports DONE, the wall-clock budget is exhausted,
+// or the operator presses Ctrl-C.
 //
-// The package is split across several files:
+// The package is split across three files:
 //
 //   - loop.go      Config, Run, the outer loop and signal plumbing.
-//   - iteration.go One claude invocation: spawn, kickoff, retry.
+//   - iteration.go One agent invocation: kickoff, event pump, retry.
 //   - stats.go     Run-wide counters, token/cost tallies, panel renderer.
 //
-// Per-event rendering (the [render.Emitter]) lives in the sibling
-// `internal/render` package; loop owns lifecycle, render owns output.
+// Subprocess mechanics (os/exec, the user-message envelope, process
+// groups) live in the sibling [internal/agent] package; per-event
+// rendering lives in [internal/render]. loop owns lifecycle.
 package loop
 
 import (
@@ -23,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 	"github.com/ai4mgreenly/ralph-loops/internal/render"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
@@ -134,12 +137,13 @@ func Run(cfg Config) error {
 	if err := os.MkdirAll(cfg.WorkDir, 0o755); err != nil {
 		return fmt.Errorf("create workdir %q: %w", cfg.WorkDir, err)
 	}
-	return runWith(cfg, dur, os.Stdout)
+	return runWith(cfg, dur, os.Stdout, agent.NewClaude())
 }
 
 // runWith is the testable kernel of [Run]. It assumes inputs are
-// already validated and writes the banner and stats panel to w.
-func runWith(cfg Config, budget time.Duration, w io.Writer) error {
+// already validated and writes the banner and stats panel to w. The
+// spawner seam lets tests drive a full run with no subprocess.
+func runWith(cfg Config, budget time.Duration, w io.Writer, sp agent.Spawner) error {
 	ui.Header(w, cfg.Version, cfg.Model, cfg.Effort, formatBudget(budget))
 	fmt.Fprintf(w, "reqs=%s\nworkdir=%s\n\n", cfg.ReqsDir, cfg.WorkDir)
 
@@ -169,7 +173,7 @@ func runWith(cfg Config, budget time.Duration, w io.Writer) error {
 		e.OutputLines = cfg.OutputLines
 	}
 
-	exitReason, runErr := drive(ctx, cfg, e, s)
+	exitReason, runErr := drive(ctx, cfg, sp, e, s)
 	sum := s.snapshot(cfg.ReqsDir, exitReason)
 	sum.writeText(w)
 	appendResultsJSONL(sum)
@@ -181,7 +185,7 @@ func runWith(cfg Config, budget time.Duration, w io.Writer) error {
 // returns DONE. It returns a short exit reason for the panel and
 // either nil, [ErrInterrupted], [ErrTimedOut], or a wrapped
 // runtime error.
-func drive(ctx context.Context, cfg Config, e *render.Emitter, s *stats) (string, error) {
+func drive(ctx context.Context, cfg Config, sp agent.Spawner, e *render.Emitter, s *stats) (string, error) {
 	for {
 		// Check for cancellation between iterations as well as during
 		// them; an iteration that finishes the same instant as a
@@ -192,7 +196,7 @@ func drive(ctx context.Context, cfg Config, e *render.Emitter, s *stats) (string
 
 		s.incrementIteration()
 		e.IterationBanner(s.iterations)
-		status, err := runIteration(ctx, cfg, e, s)
+		status, err := runIteration(ctx, cfg, sp, e, s)
 		if err != nil {
 			if cErr := ctx.Err(); cErr != nil {
 				return ctxExit(cErr)

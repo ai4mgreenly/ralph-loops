@@ -2,22 +2,15 @@ package loop
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"syscall"
-	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 	"github.com/ai4mgreenly/ralph-loops/internal/render"
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
-
-// claudeBinary is the executable name spawned for each iteration.
-// Made a var so tests can substitute a fake.
-var claudeBinary = "claude"
 
 // maxRetriesPerIteration bounds the number of correction round-trips
 // before ralph gives up on the current iteration. Matches the Ruby
@@ -34,77 +27,64 @@ var errBadStructuredOutput = errors.New("invalid structured output")
 // can recover it.
 var errStreamEnded = errors.New("claude stream ended without result")
 
-// runIteration drives a single claude invocation: it spawns the
-// child, sends the kickoff prompt, dispatches events into the
-// emitter, and applies the structured-output retry policy. It
-// returns the final status ("DONE" or "CONTINUE") on success, or an
-// error if the iteration could not complete.
+// runIteration drives a single agent invocation: it asks the spawner
+// for a fresh [agent.Session], sends the kickoff prompt, dispatches
+// events into the emitter, and applies the structured-output retry
+// policy. It returns the final status ("DONE" or "CONTINUE") on
+// success, or an error if the iteration could not complete.
 //
-// Cancellation of ctx (timeout or SIGINT) sends SIGINT to claude and
-// waits for it to wind down before returning ctx.Err().
-func runIteration(ctx context.Context, cfg Config, e *render.Emitter, s *stats) (string, error) {
-	cmd := exec.CommandContext(ctx, claudeBinary, buildArgs(cfg)...)
-	cmd.Env = buildEnv(cfg)
-	cmd.Dir = cfg.WorkDir
-	cmd.Stderr = os.Stderr
-	// Put claude into its own process group so we can signal the entire
-	// subtree (claude plus any tool grandchildren). cmd.Cancel sends
-	// SIGINT to -pgid, the canonical "kill the whole pipeline" target;
-	// WaitDelay then escalates to SIGKILL if the group hasn't exited.
-	setProcessGroup(cmd)
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return signalProcessGroup(cmd.Process.Pid, syscall.SIGINT)
-	}
-	cmd.WaitDelay = 10 * time.Second
-
-	stdin, err := cmd.StdinPipe()
+// Cancellation of ctx (timeout or SIGINT) propagates through the
+// spawner's exec.CommandContext wiring, which delivers SIGINT to the
+// child's process group before the grace period elapses.
+func runIteration(ctx context.Context, cfg Config, sp agent.Spawner, e *render.Emitter, s *stats) (string, error) {
+	sess, err := sp.Spawn(ctx, agentConfig(cfg))
 	if err != nil {
-		return "", fmt.Errorf("open claude stdin: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("open claude stdout: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start %s: %w", claudeBinary, err)
+		return "", err
 	}
 
-	r := stream.NewReader(stdout)
 	e.ResetIteration()
+	status, runErr := pumpStream(ctx, sess, e, s, cfg.Prompt)
+	closeErr := sess.Close()
 
-	status, runErr := pumpStream(ctx, r, stdin, e, s, cfg.Prompt)
-
-	// Always close stdin so claude can exit cleanly, then wait. We
-	// surface ctx errors first because they tell the operator whether
-	// the run was interrupted vs. naturally completed.
-	_ = stdin.Close()
-	waitErr := cmd.Wait()
-
+	// We surface ctx errors first because they tell the operator
+	// whether the run was interrupted vs. naturally completed.
 	if cErr := ctx.Err(); cErr != nil {
 		return "", cErr
 	}
 	if runErr != nil {
 		return "", runErr
 	}
-	if waitErr != nil {
-		// Narrow the failure-tolerance window to documented cases: claude
-		// is known to exit 0 or 1 even when the iteration produced a
-		// well-formed result. Anything else (signal death, exit codes
-		// >1) bubbles up.
-		var ee *exec.ExitError
-		if errors.As(waitErr, &ee) {
-			code := ee.ExitCode()
-			if (code == 0 || code == 1) && status != "" {
+	if closeErr != nil {
+		// Narrow the failure-tolerance window to documented cases:
+		// claude is known to exit 0 or 1 even when the iteration
+		// produced a well-formed result. Anything else (signal death,
+		// exit codes >1) bubbles up.
+		var ee *agent.ExitError
+		if errors.As(closeErr, &ee) {
+			if (ee.Code == 0 || ee.Code == 1) && status != "" {
 				return status, nil
 			}
-			return "", fmt.Errorf("claude exited with status %d: %w", code, waitErr)
+			return "", fmt.Errorf("claude exited with status %d", ee.Code)
 		}
-		return "", fmt.Errorf("claude exited: %w", waitErr)
+		return "", fmt.Errorf("claude exited: %w", closeErr)
 	}
 	return status, nil
+}
+
+// agentConfig projects the full loop Config down to the subset the
+// agent package consumes. Loop-level concerns (Prompt, Duration,
+// Verbose, Version) intentionally do not cross the boundary.
+func agentConfig(cfg Config) agent.Config {
+	return agent.Config{
+		Model:           cfg.Model,
+		Effort:          cfg.Effort,
+		Tools:           cfg.Tools,
+		SkipPermissions: cfg.SkipPermissions,
+		ConfigDir:       cfg.ConfigDir,
+		OneMContext:     cfg.OneMContext,
+		ClaudeAIMCP:     cfg.ClaudeAIMCP,
+		WorkDir:         cfg.WorkDir,
+	}
 }
 
 // pumpStream sends the kickoff message, then alternates between
@@ -114,16 +94,16 @@ func runIteration(ctx context.Context, cfg Config, e *render.Emitter, s *stats) 
 // correction round.
 func pumpStream(
 	ctx context.Context,
-	r *stream.Reader,
-	stdin io.Writer,
+	sess agent.Session,
 	e *render.Emitter,
 	s *stats,
 	prompt string,
 ) (string, error) {
-	if err := writeUserMessage(stdin, prompt); err != nil {
+	if err := sess.Send(prompt); err != nil {
 		return "", fmt.Errorf("send kickoff: %w", err)
 	}
 
+	r := sess.Events()
 	for retry := 0; ; retry++ {
 		status, err := readUntilResult(r, e, s)
 		if err == nil {
@@ -143,7 +123,7 @@ func pumpStream(
 			return "", ctx.Err()
 		default:
 		}
-		if cErr := writeUserMessage(stdin, correctionMessage(err)); cErr != nil {
+		if cErr := sess.Send(correctionMessage(err)); cErr != nil {
 			return "", fmt.Errorf("send correction: %w", cErr)
 		}
 	}
@@ -197,98 +177,6 @@ func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, err
 			// here because Reader.Next pairs unknowns with an error.
 		}
 	}
-}
-
-// buildArgs constructs the command-line for a single claude
-// invocation.
-func buildArgs(cfg Config) []string {
-	args := []string{"-p"}
-	if cfg.SkipPermissions {
-		args = append(args, "--dangerously-skip-permissions")
-	}
-	args = append(args, "--model", cfg.Model, "--effort", cfg.Effort)
-	if cfg.Tools != "" {
-		args = append(args, "--tools", cfg.Tools)
-	}
-	args = append(args,
-		"--verbose",
-		"--input-format", "stream-json",
-		"--output-format", "stream-json",
-		"--replay-user-messages",
-		"--json-schema", stream.SchemaJSON,
-	)
-	return args
-}
-
-// buildEnv constructs the environment for the child process. The
-// parent's environment is inherited so claude can find PATH, HOME,
-// etc.; we layer ralph-specific switches on top.
-func buildEnv(cfg Config) []string {
-	env := os.Environ()
-	if cfg.ConfigDir != "" {
-		env = append(env, "CLAUDE_CONFIG_DIR="+cfg.ConfigDir)
-	}
-	if cfg.OneMContext {
-		env = append(env, "CLAUDE_CODE_DISABLE_1M_CONTEXT=0")
-	} else {
-		env = append(env, "CLAUDE_CODE_DISABLE_1M_CONTEXT=1")
-	}
-	if cfg.ClaudeAIMCP {
-		env = append(env, "ENABLE_CLAUDEAI_MCP_SERVERS=true")
-	} else {
-		env = append(env, "ENABLE_CLAUDEAI_MCP_SERVERS=false")
-	}
-	return env
-}
-
-// userMessage is the wire-format envelope for a single stream-json
-// user message line written to claude's stdin.
-type userMessage struct {
-	Type    string `json:"type"`
-	Message struct {
-		Role    string `json:"role"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	} `json:"message"`
-}
-
-// writeUserMessage writes a single stream-json user message line to
-// w, terminated with a newline as required by the protocol.
-func writeUserMessage(w io.Writer, text string) error {
-	var msg userMessage
-	msg.Type = "user"
-	msg.Message.Role = "user"
-	msg.Message.Content = []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}{{Type: "text", Text: text}}
-
-	encoded, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal user message: %w", err)
-	}
-	encoded = append(encoded, '\n')
-	if _, err := w.Write(encoded); err != nil {
-		return fmt.Errorf("write user message: %w", err)
-	}
-	return nil
-}
-
-// setProcessGroup arranges for cmd to run in its own process group so
-// signals delivered to -pgid reach the entire subtree (claude plus any
-// tool grandchildren). Unix-only; the syscall.SysProcAttr.Setpgid
-// field is not portable to Windows, but ralph is Unix-only.
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
-// signalProcessGroup sends sig to the process group whose leader has
-// the given pid. Negating the pid is the syscall.Kill convention for
-// "deliver to every member of the group."
-func signalProcessGroup(pid int, sig syscall.Signal) error {
-	return syscall.Kill(-pid, sig)
 }
 
 // correctionMessage produces the natural-language nudge sent to

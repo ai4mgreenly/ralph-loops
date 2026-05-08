@@ -16,10 +16,16 @@ cmd/ralph/         Entry point and embedded prompt.md. Thin: parses flags,
                    constructs loop.Config, calls loop.Run.
 internal/loop/     The driver. Split by concern:
                      loop.go       Config, Run, signal plumbing
-                     iteration.go  One claude invocation (spawn/kickoff/retry)
-                     emit.go       Per-event pretty printing
-                     format.go     Tool-specific param/result formatters
+                     iteration.go  One iteration: kickoff, event pump, retry
                      stats.go      Token/cost tallies and panel rendering
+                   Subprocess mechanics live in internal/agent; output
+                   rendering lives in internal/render. loop owns lifecycle.
+internal/agent/    Wraps the claude CLI behind Spawner/Session interfaces.
+                   Owns os/exec, the user-message envelope, process-group
+                   plumbing, and a typed ExitError. Production code uses
+                   agent.NewClaude(); tests inject fakes.
+internal/render/   Output layer: emit/format/diff/highlight. Couples to
+                   stats via a 4-method Recorder interface.
 internal/stream/   Typed model of the claude stream-json event flow.
                    Two-pass decode: RawEvent for routing, then concrete type.
 internal/idgen/    Mints/inverts R-XXXX-XXXX requirement IDs from wall-clock
