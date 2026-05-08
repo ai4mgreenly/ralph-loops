@@ -146,17 +146,20 @@ type summaryTokens struct {
 }
 
 type summaryTime struct {
-	LLMSeconds   int `json:"llm_seconds"`
-	ToolsSeconds int `json:"tools_seconds"`
-	OtherSeconds int `json:"other_seconds"`
-	TotalSeconds int `json:"total_seconds"`
+	Start        time.Time `json:"start"`
+	End          time.Time `json:"end"`
+	LLMSeconds   int       `json:"llm_seconds"`
+	ToolsSeconds int       `json:"tools_seconds"`
+	OtherSeconds int       `json:"other_seconds"`
+	TotalSeconds int       `json:"total_seconds"`
 }
 
 // snapshot freezes the current accumulator state into a [summary]. It
 // reads the wall clock to compute elapsed time, so callers should
 // invoke it once at the end of the run.
 func (s *stats) snapshot(reqs, exitReason string) summary {
-	elapsed := time.Since(s.startTime)
+	end := time.Now()
+	elapsed := end.Sub(s.startTime)
 	other := elapsed - s.llmTime - s.toolTime
 	if other < 0 {
 		other = 0
@@ -176,6 +179,8 @@ func (s *stats) snapshot(reqs, exitReason string) summary {
 		},
 		Cost: s.cost,
 		Time: summaryTime{
+			Start:        s.startTime,
+			End:          end,
 			LLMSeconds:   int(s.llmTime.Seconds()),
 			ToolsSeconds: int(s.toolTime.Seconds()),
 			OtherSeconds: int(other.Seconds()),
@@ -223,6 +228,8 @@ func (sum summary) writeText(w io.Writer) {
 	fmt.Fprintf(w, "cost:        $%.4f\n\n", sum.Cost)
 
 	fmt.Fprintln(w, "time:")
+	fmt.Fprintf(w, "  start:  %s\n", sum.Time.Start.Format(time.RFC3339))
+	fmt.Fprintf(w, "  end:    %s\n", sum.Time.End.Format(time.RFC3339))
 	fmt.Fprintf(w, "  llm:    %s\n", ui.FormatElapsed(sum.Time.LLMSeconds))
 	fmt.Fprintf(w, "  tools:  %s\n", ui.FormatElapsed(sum.Time.ToolsSeconds))
 	fmt.Fprintf(w, "  other:  %s\n", ui.FormatElapsed(sum.Time.OtherSeconds))

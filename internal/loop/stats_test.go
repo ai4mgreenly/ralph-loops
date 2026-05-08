@@ -73,6 +73,8 @@ func TestStats_PanelLayout(t *testing.T) {
 		"cost:        $",
 		"  llm:    2s",
 		"  tools:  1s",
+		"  start:  ",
+		"  end:    ",
 	}
 	for _, sub := range wantSubstrings {
 		if !strings.Contains(out, sub) {
@@ -180,6 +182,12 @@ func TestStats_SnapshotShape(t *testing.T) {
 	}
 	if sum.Time.LLMSeconds != 5 || sum.Time.ToolsSeconds != 2 {
 		t.Errorf("Time = %+v", sum.Time)
+	}
+	if sum.Time.Start.IsZero() {
+		t.Error("Time.Start should be populated from stats.startTime")
+	}
+	if sum.Time.End.Before(sum.Time.Start) {
+		t.Errorf("Time.End (%v) should not precede Time.Start (%v)", sum.Time.End, sum.Time.Start)
 	}
 	// Snapshot must clone the maps so later tallies don't mutate the
 	// frozen record.
