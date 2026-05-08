@@ -22,6 +22,30 @@ func fakeClock(base time.Time, step time.Duration) func() time.Time {
 	}
 }
 
+func TestIterationBanner(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+	e.iterationBanner(3)
+
+	out := buf.String()
+	if !strings.Contains(out, "iteration: 3") {
+		t.Errorf("banner missing iteration line: %q", out)
+	}
+	if !strings.Contains(out, statsRuleChar+statsRuleChar+statsRuleChar) {
+		t.Errorf("banner missing horizontal rule: %q", out)
+	}
+	// Banner must have the rule both before and after the iteration line.
+	idx := strings.Index(out, "iteration: 3")
+	if idx < 0 {
+		t.Fatal("iteration line missing")
+	}
+	if !strings.Contains(out[:idx], statsRuleChar) {
+		t.Errorf("rule should appear above the iteration line, got %q", out[:idx])
+	}
+	if !strings.Contains(out[idx:], statsRuleChar) {
+		t.Errorf("rule should appear below the iteration line, got %q", out[idx:])
+	}
+}
+
 // newTestEmitter builds an emitter writing into a fresh buffer with a
 // deterministic clock advancing by 1ms per call. Tests should call
 // resetIteration() before invoking the on* methods.

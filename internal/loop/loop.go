@@ -146,7 +146,9 @@ func runWith(cfg Config, budget time.Duration, w io.Writer) error {
 	e.verbose = cfg.Verbose
 
 	exitReason, runErr := drive(ctx, cfg, e, s)
-	s.writePanel(w, exitReason)
+	sum := s.snapshot(cfg.ReqsDir, exitReason)
+	sum.writeText(w)
+	appendResultsJSONL(sum)
 
 	return runErr
 }
@@ -165,6 +167,7 @@ func drive(ctx context.Context, cfg Config, e *emitter, s *stats) (string, error
 		}
 
 		s.incrementIteration()
+		e.iterationBanner(s.iterations)
 		status, err := runIteration(ctx, cfg, e, s)
 		if err != nil {
 			if cErr := ctx.Err(); cErr != nil {

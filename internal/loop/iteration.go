@@ -134,7 +134,13 @@ func pumpStream(
 // missing or malformed structured_output returns
 // [errBadStructuredOutput] so the caller can retry.
 func readUntilResult(scanner *bufio.Scanner, e *emitter, s *stats) (string, error) {
-	for scanner.Scan() {
+	for {
+		e.spinner.Start()
+		ok := scanner.Scan()
+		e.spinner.Stop()
+		if !ok {
+			break
+		}
 		line := scanner.Bytes()
 		var raw stream.RawEvent
 		if err := json.Unmarshal(line, &raw); err != nil {

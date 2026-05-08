@@ -26,6 +26,7 @@ type emitter struct {
 	lastAt  time.Time
 	now     func() time.Time
 	verbose bool
+	spinner *ui.Spinner
 }
 
 // toolRef is the input to a not-yet-completed tool call, retained so
@@ -41,10 +42,11 @@ type toolRef struct {
 // tests can install a deterministic clock.
 func newEmitter(out io.Writer, s *stats) *emitter {
 	return &emitter{
-		out:   out,
-		stats: s,
-		tools: make(map[string]toolRef),
-		now:   time.Now,
+		out:     out,
+		stats:   s,
+		tools:   make(map[string]toolRef),
+		now:     time.Now,
+		spinner: ui.NewSpinner(out, "waiting for claude"),
 	}
 }
 
@@ -54,6 +56,18 @@ func newEmitter(out io.Writer, s *stats) *emitter {
 func (e *emitter) resetIteration() {
 	clear(e.tools)
 	e.lastAt = e.now()
+}
+
+// iterationBanner prints a rule-bracketed "iteration: N" header to
+// mark the start of a new claude invocation. The rule spans the
+// terminal width (or the panel fallback width when stdout is not a
+// terminal).
+func (e *emitter) iterationBanner(n int) {
+	rule := buildRule()
+	fmt.Fprintln(e.out)
+	fmt.Fprintln(e.out, rule)
+	fmt.Fprintf(e.out, "iteration: %d\n", n)
+	fmt.Fprintln(e.out, rule)
 }
 
 // onAssistant handles the "assistant" event: indented plain text for
