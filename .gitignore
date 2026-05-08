@@ -1,0 +1,28 @@
+# Build artifacts
+/bin/
+*.test
+*.out
+
+# Coverage
+coverage.html
+coverage.txt
+
+# Go workspace files (local-only by convention)
+go.work
+go.work.sum
+
+# Local scratch trees (used for ad-hoc agent runs)
+/tmp/
+
+# Example workdirs are not part of the repo
+/examples/*/build/
+/examples/*/workdir/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
