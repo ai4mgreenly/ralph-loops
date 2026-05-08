@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -118,6 +120,124 @@ func TestRunTimeOfInvalidID(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "ralph:") {
 		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+func TestRunInitCreatesSkeleton(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "newproj")
+
+	code, _, stderr := runCapture("init", tmp)
+	if code != exitSuccess {
+		t.Fatalf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
+	}
+
+	reqsDir := filepath.Join(tmp, "reqs")
+	entries, err := os.ReadDir(reqsDir)
+	if err != nil {
+		t.Fatalf("read reqs dir: %v", err)
+	}
+	got := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		got[e.Name()] = true
+	}
+	for _, want := range []string{"OVERVIEW.md", "INTERACTIVE.md"} {
+		if !got[want] {
+			t.Errorf("missing %s in %s", want, reqsDir)
+		}
+	}
+	if len(entries) != 2 {
+		t.Errorf("reqs/ has %d entries, want 2: %v", len(entries), entries)
+	}
+
+	overview, err := os.ReadFile(filepath.Join(reqsDir, "OVERVIEW.md"))
+	if err != nil {
+		t.Fatalf("read OVERVIEW.md: %v", err)
+	}
+	overviewLower := strings.ToLower(string(overview))
+	for _, banned := range []string{"ralph", "orchestrator"} {
+		if strings.Contains(overviewLower, banned) {
+			t.Errorf("OVERVIEW.md must stay generic; found %q", banned)
+		}
+	}
+
+	interactive, err := os.ReadFile(filepath.Join(reqsDir, "INTERACTIVE.md"))
+	if err != nil {
+		t.Fatalf("read INTERACTIVE.md: %v", err)
+	}
+	body := string(interactive)
+	for _, want := range []string{"R-XXXX-XXXX", "ralph newid", "ralph time-of"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("INTERACTIVE.md missing %q", want)
+		}
+	}
+	if !strings.Contains(body, "never creates, modifies") {
+		t.Error("INTERACTIVE.md missing the orchestrator-never-edits statement")
+	}
+	// WHAT/WHY-not-HOW heading should be prominent — within the first
+	// quarter of the file.
+	idx := strings.Index(body, "WHAT and WHY, never HOW")
+	if idx < 0 {
+		t.Error("INTERACTIVE.md missing WHAT/WHY-not-HOW heading")
+	} else if idx > len(body)/4 {
+		t.Errorf("WHAT/WHY-not-HOW heading at offset %d; expected within first quarter (%d)", idx, len(body)/4)
+	}
+}
+
+func TestRunInitRefusesExistingReqs(t *testing.T) {
+	tmp := t.TempDir()
+	reqsDir := filepath.Join(tmp, "reqs")
+	if err := os.MkdirAll(reqsDir, 0o755); err != nil {
+		t.Fatalf("seed reqs dir: %v", err)
+	}
+	sentinel := filepath.Join(reqsDir, "preexisting.md")
+	if err := os.WriteFile(sentinel, []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	code, _, stderr := runCapture("init", tmp)
+	if code != exitRuntime {
+		t.Errorf("exit = %d, want %d (stderr=%q)", code, exitRuntime, stderr)
+	}
+	if !strings.Contains(stderr, "already exists") {
+		t.Errorf("stderr = %q, want a clear refusal message", stderr)
+	}
+
+	got, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("sentinel disappeared: %v", err)
+	}
+	if string(got) != "keep me\n" {
+		t.Errorf("sentinel modified: %q", got)
+	}
+	entries, err := os.ReadDir(reqsDir)
+	if err != nil {
+		t.Fatalf("read reqs dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("reqs/ now has %d entries, expected the original 1", len(entries))
+	}
+}
+
+func TestRunInitRequiresExactlyOneArg(t *testing.T) {
+	cases := [][]string{
+		{"init"},
+		{"init", "a", "b"},
+	}
+	for _, args := range cases {
+		code, _, stderr := runCapture(args...)
+		if code != exitUsage {
+			t.Errorf("%v: exit = %d, want %d", args, code, exitUsage)
+		}
+		if !strings.Contains(stderr, "PATH") {
+			t.Errorf("%v: stderr = %q", args, stderr)
+		}
+	}
+}
+
+func TestRunHelpListsInit(t *testing.T) {
+	_, stdout, _ := runCapture("help")
+	if !strings.Contains(stdout, "ralph init PATH") {
+		t.Errorf("help output missing init subcommand: %q", stdout)
 	}
 }
 

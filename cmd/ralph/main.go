@@ -7,10 +7,13 @@ package main
 
 import (
 	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
@@ -23,6 +26,12 @@ const version = "0.1.0"
 
 //go:embed prompt.md
 var promptTemplate string
+
+//go:embed skel/OVERVIEW.md
+var skelOverview string
+
+//go:embed skel/INTERACTIVE.md
+var skelInteractive string
 
 // Default values for every flag the loop subcommand accepts. Centralised
 // here so the help text and the FlagSet stay in sync.
@@ -59,6 +68,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	switch args[0] {
+	case "init":
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "ralph init: requires exactly one PATH argument")
+			return exitUsage
+		}
+		if err := initSkeleton(args[1]); err != nil {
+			fmt.Fprintf(stderr, "ralph: %s\n", err)
+			return exitRuntime
+		}
+		return exitSuccess
 	case "newid":
 		if len(args) > 1 {
 			fmt.Fprintln(stderr, "ralph newid: takes no arguments")
@@ -147,6 +166,34 @@ func runLoop(args []string, stderr io.Writer) int {
 	return exitSuccess
 }
 
+// initSkeleton scaffolds PATH/reqs/ with the OVERVIEW.md and
+// INTERACTIVE.md templates. PATH is created if missing; if PATH/reqs/
+// already exists, the call refuses without modifying anything.
+func initSkeleton(path string) error {
+	reqsDir := filepath.Join(path, "reqs")
+	if _, err := os.Stat(reqsDir); err == nil {
+		return fmt.Errorf("%s already exists; refusing to overwrite", reqsDir)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(reqsDir, 0o755); err != nil {
+		return err
+	}
+	files := []struct {
+		name    string
+		content string
+	}{
+		{"OVERVIEW.md", skelOverview},
+		{"INTERACTIVE.md", skelInteractive},
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(reqsDir, f.name), []byte(f.content), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // writeUsage emits the operator manual. It is intentionally
 // self-contained — ralph carries no separate config file and no man
 // page, so this text is the canonical reference.
@@ -155,6 +202,8 @@ func writeUsage(w io.Writer) {
 
 USAGE
   ralph [flags] WORKDIR        Run the iteration loop against WORKDIR.
+  ralph init PATH              Scaffold PATH/reqs/ with a starter spec
+                               and a brief for an interactive helper agent.
   ralph newid                  Print a fresh requirement ID (R-XXXX-XXXX).
   ralph time-of ID             Print the UTC instant from which ID was minted.
   ralph version                Print version.
