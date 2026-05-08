@@ -13,11 +13,13 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
 	"github.com/ai4mgreenly/ralph-loops/internal/loop"
+	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
 // version is the build identifier reported by `ralph version` and
@@ -101,7 +103,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "ralph %s\n", version)
 		return exitSuccess
 	case "help", "-h", "--help":
-		writeUsage(stdout)
+		writeUsagePaged(stdout)
 		return exitSuccess
 	default:
 		return runLoop(args, stderr)
@@ -164,6 +166,47 @@ func runLoop(args []string, stderr io.Writer) int {
 		return exitRuntime
 	}
 	return exitSuccess
+}
+
+// writeUsagePaged writes the manual to stdout, routing through a
+// pager when stdout is a terminal. The pager honors $PAGER if set
+// (e.g. PAGER=cat short-circuits paging entirely); otherwise it
+// falls back to `less -FRX`, whose -F flag means "quit if the
+// content fits on one screen", so short manuals stay inline. Any
+// pre-spawn failure (no pager binary, blocked StdinPipe) drops back
+// to writing directly to stdout.
+func writeUsagePaged(stdout io.Writer) {
+	if !ui.IsTTY(stdout) {
+		writeUsage(stdout)
+		return
+	}
+
+	var argv []string
+	if pager := os.Getenv("PAGER"); pager != "" {
+		argv = strings.Fields(pager)
+	} else {
+		argv = []string{"less", "-FRX"}
+	}
+	if len(argv) == 0 {
+		writeUsage(stdout)
+		return
+	}
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdout = stdout
+	cmd.Stderr = os.Stderr
+	pipe, err := cmd.StdinPipe()
+	if err != nil {
+		writeUsage(stdout)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		writeUsage(stdout)
+		return
+	}
+	writeUsage(pipe)
+	_ = pipe.Close()
+	_ = cmd.Wait()
 }
 
 // initSkeleton scaffolds PATH/reqs/ with the OVERVIEW.md and
