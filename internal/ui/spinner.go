@@ -167,14 +167,14 @@ func IsTTY(w io.Writer) bool {
 }
 
 func dimIfColor() string {
-	if useColor {
+	if useColor.Load() {
 		return dimEscape
 	}
 	return ""
 }
 
 func resetIfColor() string {
-	if useColor {
+	if useColor.Load() {
 		return resetEscape
 	}
 	return ""

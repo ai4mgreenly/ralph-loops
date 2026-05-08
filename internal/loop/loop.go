@@ -7,9 +7,10 @@
 //
 //   - loop.go      Config, Run, the outer loop and signal plumbing.
 //   - iteration.go One claude invocation: spawn, kickoff, retry.
-//   - emit.go      Per-event-type pretty printing and timing accounting.
-//   - format.go    Tool-specific parameter and result formatters.
 //   - stats.go     Run-wide counters, token/cost tallies, panel renderer.
+//
+// Per-event rendering (the [render.Emitter]) lives in the sibling
+// `internal/render` package; loop owns lifecycle, render owns output.
 package loop
 
 import (
@@ -22,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/render"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
@@ -141,17 +143,30 @@ func runWith(cfg Config, budget time.Duration, w io.Writer) error {
 	ui.Header(w, cfg.Version, cfg.Model, cfg.Effort, formatBudget(budget))
 	fmt.Fprintf(w, "reqs=%s\nworkdir=%s\n\n", cfg.ReqsDir, cfg.WorkDir)
 
-	ctx, cancel := withBudget(context.Background(), budget)
-	defer cancel()
-
-	stopSig := installSignalHandler(cancel)
+	// First SIGINT/SIGTERM cancels the context, giving the run a chance
+	// to wind down gracefully. signal.NotifyContext (Go 1.16+) replaces
+	// the hand-rolled goroutine that used to live here.
+	sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSig()
 
+	ctx, cancel := withBudget(sigCtx, budget)
+	defer cancel()
+
+	// A second SIGINT after the context is already canceled is the
+	// operator telling us "I'm done waiting." Translate it into a
+	// hard exit. We register a separate channel because NotifyContext
+	// stops listening once it has fired.
+	stopForce := installForceQuit(sigCtx, w)
+	defer stopForce()
+
+	stopResize := ui.WatchResize()
+	defer stopResize()
+
 	s := newStats(cfg.Model)
-	e := newEmitter(w, s)
-	e.verbose = cfg.Verbose
+	e := render.NewEmitter(w, s)
+	e.Verbose = cfg.Verbose
 	if cfg.OutputLines > 0 {
-		e.outputLines = cfg.OutputLines
+		e.OutputLines = cfg.OutputLines
 	}
 
 	exitReason, runErr := drive(ctx, cfg, e, s)
@@ -166,7 +181,7 @@ func runWith(cfg Config, budget time.Duration, w io.Writer) error {
 // returns DONE. It returns a short exit reason for the panel and
 // either nil, [ErrInterrupted], [ErrTimedOut], or a wrapped
 // runtime error.
-func drive(ctx context.Context, cfg Config, e *emitter, s *stats) (string, error) {
+func drive(ctx context.Context, cfg Config, e *render.Emitter, s *stats) (string, error) {
 	for {
 		// Check for cancellation between iterations as well as during
 		// them; an iteration that finishes the same instant as a
@@ -176,7 +191,7 @@ func drive(ctx context.Context, cfg Config, e *emitter, s *stats) (string, error
 		}
 
 		s.incrementIteration()
-		e.iterationBanner(s.iterations)
+		e.IterationBanner(s.iterations)
 		status, err := runIteration(ctx, cfg, e, s)
 		if err != nil {
 			if cErr := ctx.Err(); cErr != nil {
@@ -212,18 +227,38 @@ func withBudget(parent context.Context, budget time.Duration) (context.Context, 
 	return context.WithTimeout(parent, budget)
 }
 
-// installSignalHandler arranges for the first SIGINT or SIGTERM to
-// invoke cancel exactly once. The returned function uninstalls the
-// handler and should be deferred by the caller.
-func installSignalHandler(cancel context.CancelFunc) func() {
+// installForceQuit watches for a second SIGINT arriving after sigCtx
+// has already been canceled by the first one. When that happens the
+// operator has signalled they are unwilling to wait for graceful
+// shutdown, so we log to w (or stderr if w is nil) and exit 130 —
+// the conventional "terminated by SIGINT" status. The returned
+// function uninstalls the handler and should be deferred.
+//
+// Unit tests cannot exercise the os.Exit path; this function is
+// wired into Run so that a real double-Ctrl-C in production drives
+// the desired behaviour. The wiring is what we cover, not the exit.
+func installForceQuit(sigCtx context.Context, w io.Writer) func() {
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt)
 
 	done := make(chan struct{})
 	go func() {
+		// Wait for the graceful-cancel context to fire before we start
+		// listening for a "second" signal — otherwise we'd race with
+		// NotifyContext and could turn a single Ctrl-C into a hard exit.
+		select {
+		case <-sigCtx.Done():
+		case <-done:
+			return
+		}
 		select {
 		case <-sigCh:
-			cancel()
+			out := w
+			if out == nil {
+				out = os.Stderr
+			}
+			fmt.Fprintln(out, "ralph: received second interrupt; force-quitting")
+			os.Exit(130)
 		case <-done:
 		}
 	}()

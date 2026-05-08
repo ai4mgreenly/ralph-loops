@@ -12,8 +12,8 @@ import (
 // raw strings without ANSI escapes.
 func withTerminalWidth(t *testing.T, width int) {
 	t.Helper()
-	prevW := terminalWidth
-	prevC := useColor
+	prevW := TerminalWidth()
+	prevC := useColor.Load()
 	SetTerminalWidth(width)
 	SetColor(false)
 	t.Cleanup(func() {
@@ -103,7 +103,7 @@ func TestWriteBlock_EmptyLinesProducesBareMarker(t *testing.T) {
 
 func TestWriteBlock_PerLineColorAfterWrap(t *testing.T) {
 	withTerminalWidth(t, 8) // 8 - 3 = 5 visible per line
-	prevC := useColor
+	prevC := useColor.Load()
 	SetColor(true)
 	t.Cleanup(func() { SetColor(prevC) })
 
@@ -171,7 +171,7 @@ func TestWrapVisible_EmptyAndNoWrap(t *testing.T) {
 }
 
 func TestPaint_BgRestoresAfterInteriorReset(t *testing.T) {
-	prev := useColor
+	prev := useColor.Load()
 	SetColor(true)
 	t.Cleanup(func() { SetColor(prev) })
 
@@ -185,7 +185,7 @@ func TestPaint_BgRestoresAfterInteriorReset(t *testing.T) {
 }
 
 func TestPaint_DiffRemoveBg_NoInteriorReset(t *testing.T) {
-	prev := useColor
+	prev := useColor.Load()
 	SetColor(true)
 	t.Cleanup(func() { SetColor(prev) })
 
@@ -198,7 +198,7 @@ func TestPaint_DiffRemoveBg_NoInteriorReset(t *testing.T) {
 
 func TestTool_BackgroundFillsToEdge(t *testing.T) {
 	withTerminalWidth(t, 13) // 10 visible runes per line
-	prevC := useColor
+	prevC := useColor.Load()
 	SetColor(true)
 	t.Cleanup(func() { SetColor(prevC) })
 
@@ -216,7 +216,7 @@ func TestTool_BackgroundFillsToEdge(t *testing.T) {
 
 func TestTool_BackgroundOnEveryWrappedLine(t *testing.T) {
 	withTerminalWidth(t, 13) // 10 visible runes per line
-	prevC := useColor
+	prevC := useColor.Load()
 	SetColor(true)
 	t.Cleanup(func() { SetColor(prevC) })
 
@@ -274,7 +274,7 @@ func TestLead_TrailingBlank(t *testing.T) {
 
 func TestLead_PaintsLightBlue(t *testing.T) {
 	withTerminalWidth(t, 0)
-	prevC := useColor
+	prevC := useColor.Load()
 	SetColor(true)
 	t.Cleanup(func() { SetColor(prevC) })
 

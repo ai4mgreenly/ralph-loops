@@ -268,3 +268,70 @@ func TestRunLoopRejectsExtraPositional(t *testing.T) {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
+
+// TestRunVersionAfterOtherFlags pins the bug fix where
+// `ralph --reqs=foo --version` was previously misrouted into the loop
+// driver because the dispatcher only inspected args[0]. After moving
+// --version onto the loop's FlagSet, the flag parser sees it
+// regardless of position.
+func TestRunVersionAfterOtherFlags(t *testing.T) {
+	cases := [][]string{
+		{"--reqs=foo", "--version"},
+		{"--reqs=foo", "-v"},
+		{"--model=sonnet", "--effort=high", "--version"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			code, stdout, stderr := runCapture(args...)
+			if code != exitSuccess {
+				t.Errorf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
+			}
+			want := "ralph " + version + "\n"
+			if stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+		})
+	}
+}
+
+// TestRunHelpAfterOtherFlags is the --help twin of the --version test.
+func TestRunHelpAfterOtherFlags(t *testing.T) {
+	cases := [][]string{
+		{"--reqs=foo", "--help"},
+		{"--reqs=foo", "-h"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			code, stdout, _ := runCapture(args...)
+			if code != exitSuccess {
+				t.Errorf("exit = %d, want %d", code, exitSuccess)
+			}
+			if !strings.Contains(stdout, "USAGE") {
+				t.Errorf("help output missing USAGE section: %q", stdout)
+			}
+		})
+	}
+}
+
+func TestRunLoopRejectsInvalidModel(t *testing.T) {
+	code, _, stderr := runCapture("--model=foo", ".")
+	if code != exitUsage {
+		t.Errorf("exit = %d, want %d", code, exitUsage)
+	}
+	// enumFlag.Set surfaces the allowed alternatives in its error;
+	// the flag package then echoes that back through the FlagSet's
+	// configured output (stderr).
+	if !strings.Contains(stderr, "haiku") || !strings.Contains(stderr, "sonnet") || !strings.Contains(stderr, "opus") {
+		t.Errorf("stderr should list allowed models, got: %q", stderr)
+	}
+}
+
+func TestRunLoopRejectsInvalidEffort(t *testing.T) {
+	code, _, stderr := runCapture("--effort=foo", ".")
+	if code != exitUsage {
+		t.Errorf("exit = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "low") || !strings.Contains(stderr, "max") {
+		t.Errorf("stderr should list allowed effort levels, got: %q", stderr)
+	}
+}

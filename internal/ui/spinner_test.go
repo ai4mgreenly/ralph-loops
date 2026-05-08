@@ -63,7 +63,7 @@ func TestSpinnerSilentBeforeDelay(t *testing.T) {
 }
 
 func TestSpinnerPaintsAfterDelay(t *testing.T) {
-	prev := useColor
+	prev := useColor.Load()
 	SetColor(false)
 	defer SetColor(prev)
 
@@ -94,7 +94,7 @@ func TestSpinnerPaintsAfterDelay(t *testing.T) {
 }
 
 func TestSpinnerFirstPaintShowsDelayAsElapsed(t *testing.T) {
-	prev := useColor
+	prev := useColor.Load()
 	SetColor(false)
 	defer SetColor(prev)
 
@@ -134,7 +134,7 @@ func TestSpinnerStopBeforeFirstPaint(t *testing.T) {
 }
 
 func TestSpinnerStartStopReusable(t *testing.T) {
-	prev := useColor
+	prev := useColor.Load()
 	SetColor(false)
 	defer SetColor(prev)
 

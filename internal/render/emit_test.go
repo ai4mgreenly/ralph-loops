@@ -1,4 +1,4 @@
-package loop
+package render
 
 import (
 	"bytes"
@@ -11,7 +11,39 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
-// fakeClock returns a closure suitable for emitter.now that advances
+// fakeRecorder is a minimal in-memory [Recorder] used by the emit
+// tests. It mirrors just enough of the loop's stats type to assert on
+// timing attribution and token tallies.
+type fakeRecorder struct {
+	blocks   map[string]int
+	llmTime  time.Duration
+	toolTime time.Duration
+	tokens   struct {
+		input       int
+		output      int
+		cacheRead   int
+		cacheCreate int
+	}
+}
+
+func newFakeRecorder() *fakeRecorder {
+	return &fakeRecorder{blocks: make(map[string]int)}
+}
+
+func (f *fakeRecorder) TallyBlock(t string)         { f.blocks[t]++ }
+func (f *fakeRecorder) AddLLMTime(d time.Duration)  { f.llmTime += d }
+func (f *fakeRecorder) AddToolTime(d time.Duration) { f.toolTime += d }
+func (f *fakeRecorder) TrackUsage(u *stream.Usage) {
+	if u == nil {
+		return
+	}
+	f.tokens.input += u.InputTokens
+	f.tokens.output += u.OutputTokens
+	f.tokens.cacheRead += u.CacheReadInputTokens
+	f.tokens.cacheCreate += u.CacheCreationInputTokens
+}
+
+// fakeClock returns a closure suitable for Emitter.now that advances
 // by step on every call, starting at base.
 func fakeClock(base time.Time, step time.Duration) func() time.Time {
 	t := base
@@ -77,13 +109,13 @@ func TestReadTarget(t *testing.T) {
 
 func TestIterationBanner(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	e.iterationBanner(3)
+	e.IterationBanner(3)
 
 	out := buf.String()
 	if !strings.Contains(out, "iteration: 3") {
 		t.Errorf("banner missing iteration line: %q", out)
 	}
-	if !strings.Contains(out, statsRuleChar+statsRuleChar+statsRuleChar) {
+	if !strings.Contains(out, ruleChar+ruleChar+ruleChar) {
 		t.Errorf("banner missing horizontal rule: %q", out)
 	}
 	// Banner must have the rule both before and after the iteration line.
@@ -91,33 +123,33 @@ func TestIterationBanner(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("iteration line missing")
 	}
-	if !strings.Contains(out[:idx], statsRuleChar) {
+	if !strings.Contains(out[:idx], ruleChar) {
 		t.Errorf("rule should appear above the iteration line, got %q", out[:idx])
 	}
-	if !strings.Contains(out[idx:], statsRuleChar) {
+	if !strings.Contains(out[idx:], ruleChar) {
 		t.Errorf("rule should appear below the iteration line, got %q", out[idx:])
 	}
 }
 
-// newTestEmitter builds an emitter writing into a fresh buffer with a
+// newTestEmitter builds an Emitter writing into a fresh buffer with a
 // deterministic clock advancing by 1ms per call. Tests should call
-// resetIteration() before invoking the on* methods.
-func newTestEmitter(t *testing.T) (*emitter, *bytes.Buffer, *stats) {
+// ResetIteration() before invoking the On* methods.
+func newTestEmitter(t *testing.T) (*Emitter, *bytes.Buffer, *fakeRecorder) {
 	t.Helper()
 	ui.SetColor(false)
 	t.Cleanup(func() { ui.SetColor(false) })
 
 	var buf bytes.Buffer
-	s := newStats("opus")
-	e := newEmitter(&buf, s)
+	rec := newFakeRecorder()
+	e := NewEmitter(&buf, rec)
 	e.now = fakeClock(time.Unix(0, 0).UTC(), time.Millisecond)
-	e.resetIteration()
-	return e, &buf, s
+	e.ResetIteration()
+	return e, &buf, rec
 }
 
 func TestEmitter_AssistantTextLeadsWithMarker(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	e.onAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{Type: stream.BlockText, Text: "hello\nworld"},
 	}}})
 	got := buf.String()
@@ -128,7 +160,7 @@ func TestEmitter_AssistantTextLeadsWithMarker(t *testing.T) {
 
 func TestEmitter_ToolUseRecordsRefAndPrintsCall(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	e.onAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
 			Type:  stream.BlockToolUse,
 			ID:    "tool_1",
@@ -147,7 +179,7 @@ func TestEmitter_ToolUseRecordsRefAndPrintsCall(t *testing.T) {
 
 func TestEmitter_ToolResultPairsWithCall(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	e.onAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
 			Type:  stream.BlockToolUse,
 			ID:    "tool_1",
@@ -157,7 +189,7 @@ func TestEmitter_ToolResultPairsWithCall(t *testing.T) {
 	}}})
 	buf.Reset()
 
-	e.onUser(stream.User{
+	e.OnUser(stream.User{
 		Message: stream.Message{Content: []stream.Block{
 			{Type: stream.BlockToolResult, ToolUseID: "tool_1"},
 		}},
@@ -178,7 +210,7 @@ func TestEmitter_EditRendersDiff(t *testing.T) {
 	ui.SetTerminalWidth(0)
 	t.Cleanup(func() { ui.SetTerminalWidth(0) })
 
-	e.onAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
 			Type:  stream.BlockToolUse,
 			ID:    "tool_1",
@@ -191,7 +223,7 @@ func TestEmitter_EditRendersDiff(t *testing.T) {
 	}
 	buf.Reset()
 
-	e.onUser(stream.User{Message: stream.Message{Content: []stream.Block{
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
 		{Type: stream.BlockToolResult, ToolUseID: "tool_1"},
 	}}})
 	got := buf.String()
@@ -207,7 +239,7 @@ func TestEmitter_WriteRendersContent(t *testing.T) {
 	ui.SetTerminalWidth(0)
 	t.Cleanup(func() { ui.SetTerminalWidth(0) })
 
-	e.onAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{
 			Type:  stream.BlockToolUse,
 			ID:    "tool_1",
@@ -220,7 +252,7 @@ func TestEmitter_WriteRendersContent(t *testing.T) {
 	}
 	buf.Reset()
 
-	e.onUser(stream.User{Message: stream.Message{Content: []stream.Block{
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
 		{Type: stream.BlockToolResult, ToolUseID: "tool_1"},
 	}}})
 	got := buf.String()
@@ -232,8 +264,8 @@ func TestEmitter_WriteRendersContent(t *testing.T) {
 }
 
 func TestEmitter_ResultExtractsStatusAndTracksTokens(t *testing.T) {
-	e, buf, s := newTestEmitter(t)
-	e.onResult(stream.Result{
+	e, buf, rec := newTestEmitter(t)
+	e.OnResult(stream.Result{
 		NumTurns:         3,
 		DurationMS:       2500,
 		TotalCostUSD:     0.0234,
@@ -246,8 +278,8 @@ func TestEmitter_ResultExtractsStatusAndTracksTokens(t *testing.T) {
 			t.Errorf("missing %q in result line:\n%s", want, got)
 		}
 	}
-	if s.tokens.input != 100 || s.tokens.output != 50 {
-		t.Errorf("tokens not tracked: %+v", s.tokens)
+	if rec.tokens.input != 100 || rec.tokens.output != 50 {
+		t.Errorf("tokens not tracked: %+v", rec.tokens)
 	}
 }
 
@@ -256,38 +288,38 @@ func TestEmitter_TimingAttribution(t *testing.T) {
 	t.Cleanup(func() { ui.SetColor(false) })
 
 	var buf bytes.Buffer
-	s := newStats("opus")
-	e := newEmitter(&buf, s)
+	rec := newFakeRecorder()
+	e := NewEmitter(&buf, rec)
 
 	now := time.Unix(0, 0).UTC()
 	clock := func(advance time.Duration) {
 		now = now.Add(advance)
 	}
 	e.now = func() time.Time { return now }
-	e.resetIteration()
+	e.ResetIteration()
 
 	clock(2 * time.Second) // 2s of LLM work before assistant arrives
-	e.onAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
 		{Type: stream.BlockText, Text: "thinking done"},
 	}}})
 
 	clock(time.Second) // 1s of tool work before user arrives
-	e.onUser(stream.User{Message: stream.Message{Content: []stream.Block{
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
 		{Type: stream.BlockToolResult, ToolUseID: "x"},
 	}}})
 
-	if s.llmTime != 2*time.Second {
-		t.Errorf("llmTime = %v, want 2s", s.llmTime)
+	if rec.llmTime != 2*time.Second {
+		t.Errorf("llmTime = %v, want 2s", rec.llmTime)
 	}
-	if s.toolTime != time.Second {
-		t.Errorf("toolTime = %v, want 1s", s.toolTime)
+	if rec.toolTime != time.Second {
+		t.Errorf("toolTime = %v, want 1s", rec.toolTime)
 	}
 }
 
 func TestEmitter_SystemAndRateLimit(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	e.verbose = true
-	e.onSystem(stream.System{
+	e.Verbose = true
+	e.OnSystem(stream.System{
 		Subtype: "init", Model: "opus", PermissionMode: "default",
 		Tools: []string{"Bash", "Read"},
 	})
@@ -296,7 +328,7 @@ func TestEmitter_SystemAndRateLimit(t *testing.T) {
 	}
 	buf.Reset()
 
-	e.onRateLimit(stream.RateLimit{Info: &stream.RateLimitInfo{
+	e.OnRateLimit(stream.RateLimit{Info: &stream.RateLimitInfo{
 		RateLimitType:  "weekly",
 		Status:         "warning",
 		Utilization:    0.85,
@@ -312,10 +344,74 @@ func TestEmitter_SystemAndRateLimit(t *testing.T) {
 
 func TestEmitter_NonVerboseSuppressesSystemAndRateLimit(t *testing.T) {
 	e, buf, _ := newTestEmitter(t)
-	// verbose defaults to false.
-	e.onSystem(stream.System{Subtype: "init", Model: "opus"})
-	e.onRateLimit(stream.RateLimit{Info: &stream.RateLimitInfo{RateLimitType: "weekly"}})
+	// Verbose defaults to false.
+	e.OnSystem(stream.System{Subtype: "init", Model: "opus"})
+	e.OnRateLimit(stream.RateLimit{Info: &stream.RateLimitInfo{RateLimitType: "weekly"}})
 	if got := buf.String(); got != "" {
 		t.Errorf("non-verbose run leaked low-signal events:\n%s", got)
+	}
+}
+
+// TestEmitter_BashErrorUsesErrorMarker pins the visual distinction
+// between a successful tool result and a failed one: a bash result
+// flagged IsError must lead with [markerError], not [markerResult].
+func TestEmitter_BashErrorUsesErrorMarker(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+	ui.SetTerminalWidth(0)
+	t.Cleanup(func() { ui.SetTerminalWidth(0) })
+
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+		{
+			Type:  stream.BlockToolUse,
+			ID:    "tool_1",
+			Name:  "Bash",
+			Input: json.RawMessage(`{"command":"false"}`),
+		},
+	}}})
+	buf.Reset()
+
+	e.OnUser(stream.User{
+		Message: stream.Message{Content: []stream.Block{
+			{Type: stream.BlockToolResult, ToolUseID: "tool_1", IsError: true},
+		}},
+		ToolUseResult: json.RawMessage(`{"stdout":"","stderr":"boom\n"}`),
+	})
+
+	got := buf.String()
+	if !strings.Contains(got, markerError) {
+		t.Errorf("error result missing markerError %q:\n%s", markerError, got)
+	}
+	// Make sure the success marker is not what's leading the result line.
+	// markerResult is also used elsewhere; this checks the gutter.
+	if strings.Contains(got, markerResult+"  boom") {
+		t.Errorf("error result should not lead stderr line with markerResult %q:\n%s", markerResult, got)
+	}
+}
+
+// TestEmitter_UnknownToolErrorUsesErrorMarker pins the same behaviour
+// for the generic emitToolResult path used by tools without a
+// dedicated renderer.
+func TestEmitter_UnknownToolErrorUsesErrorMarker(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+		{
+			Type:  stream.BlockToolUse,
+			ID:    "tool_1",
+			Name:  "Grep",
+			Input: json.RawMessage(`{"pattern":"x"}`),
+		},
+	}}})
+	buf.Reset()
+
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
+		{Type: stream.BlockToolResult, ToolUseID: "tool_1", IsError: true},
+	}}})
+
+	got := buf.String()
+	if !strings.Contains(got, markerError) {
+		t.Errorf("error result missing markerError %q:\n%s", markerError, got)
+	}
+	if strings.Contains(got, "ERR") == false {
+		t.Errorf("expected ERR status in output:\n%s", got)
 	}
 }

@@ -1,8 +1,9 @@
-package loop
+package render
 
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -32,9 +33,10 @@ func formatToolCallParam(name string, rawInput json.RawMessage) string {
 	val, ok := input[key]
 	if !ok {
 		// The selected key isn't present (e.g. a Bash call with no
-		// command field). Surface the first key with a placeholder so
-		// the operator at least sees something was passed.
-		for k := range input {
+		// command field). Surface the first key (in sorted order, so
+		// output stays deterministic) with a placeholder so the
+		// operator at least sees something was passed.
+		if k := firstSortedKey(input); k != "" {
 			return fmt.Sprintf("%s=…", k)
 		}
 		return ""
@@ -44,8 +46,8 @@ func formatToolCallParam(name string, rawInput json.RawMessage) string {
 }
 
 // primaryParamKey returns the input field worth showing in line for
-// tool name. Falls back to the first key in input if the tool is
-// unknown.
+// tool name. Falls back to the first key in input (sorted, so the
+// fallback is deterministic) if the tool is unknown.
 func primaryParamKey(name string, input map[string]any) string {
 	switch name {
 	case "Bash":
@@ -55,10 +57,24 @@ func primaryParamKey(name string, input map[string]any) string {
 	case "Glob", "Grep":
 		return "pattern"
 	}
-	for k := range input {
-		return k
+	return firstSortedKey(input)
+}
+
+// firstSortedKey returns the lexicographically smallest key of m, or
+// "" when m is empty. Used by the formatter to make "first key" fallbacks
+// deterministic — Go's map iteration order is randomized, so a naïve
+// `for k := range m { return k }` made formatter output flap between
+// equivalent inputs.
+func firstSortedKey(m map[string]any) string {
+	if len(m) == 0 {
+		return ""
 	}
-	return ""
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys[0]
 }
 
 // formatToolResult summarises a tool result. For Bash calls the

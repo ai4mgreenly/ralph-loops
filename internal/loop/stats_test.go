@@ -16,15 +16,20 @@ import (
 
 func TestStats_TrackUsageComputesCost(t *testing.T) {
 	s := newStats("opus")
-	s.trackUsage(&stream.Usage{
+	s.TrackUsage(&stream.Usage{
 		InputTokens:              1_000_000,
 		OutputTokens:             1_000_000,
 		CacheReadInputTokens:     1_000_000,
 		CacheCreationInputTokens: 1_000_000,
 	})
-	// Opus: 5 + 25 + 0.5 + 6.25 = 36.75 USD per million of each.
-	if s.cost < 36.749 || s.cost > 36.751 {
-		t.Errorf("cost = %.4f, want ~36.75", s.cost)
+	// Opus: 5 + 25 + 0.5 + 6.25 = 36.75 USD per million of each, so
+	// 36_750_000 micro-USD for one million of each token type. With
+	// integer arithmetic we expect the exact value, no epsilon.
+	if got, want := s.cost, int64(36_750_000); got != want {
+		t.Errorf("cost = %d micro-USD, want %d", got, want)
+	}
+	if got, want := s.CostUSD(), 36.75; got != want {
+		t.Errorf("CostUSD() = %v, want %v", got, want)
 	}
 	if got, want := s.tokens.total(), 4_000_000; got != want {
 		t.Errorf("tokens.total = %d, want %d", got, want)
@@ -33,12 +38,40 @@ func TestStats_TrackUsageComputesCost(t *testing.T) {
 
 func TestStats_TrackUsageUnknownModelStillTalliesTokens(t *testing.T) {
 	s := newStats("nonexistent")
-	s.trackUsage(&stream.Usage{InputTokens: 100})
+	s.TrackUsage(&stream.Usage{InputTokens: 100})
 	if s.cost != 0 {
-		t.Errorf("expected zero cost for unknown model, got %f", s.cost)
+		t.Errorf("expected zero cost for unknown model, got %d", s.cost)
 	}
 	if s.tokens.input != 100 {
 		t.Errorf("expected token count to be tallied even without pricing")
+	}
+}
+
+func TestStats_CostJSONRoundTrips(t *testing.T) {
+	s := newStats("opus")
+	s.TrackUsage(&stream.Usage{
+		InputTokens:              1_000_000,
+		OutputTokens:             1_000_000,
+		CacheReadInputTokens:     1_000_000,
+		CacheCreationInputTokens: 1_000_000,
+	})
+	sum := s.snapshot("/r", "done")
+
+	enc, err := json.Marshal(sum)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Wire schema must remain a JSON number under the "cost" key.
+	if !strings.Contains(string(enc), `"cost":36.75`) {
+		t.Errorf("expected cost field to render as 36.75, got: %s", enc)
+	}
+
+	var got summary
+	if err := json.Unmarshal(enc, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.CostMicroUSD != sum.CostMicroUSD {
+		t.Errorf("round-trip CostMicroUSD = %d, want %d", got.CostMicroUSD, sum.CostMicroUSD)
 	}
 }
 
@@ -49,11 +82,11 @@ func TestStats_PanelLayout(t *testing.T) {
 	s.tallyEvent(stream.TypeAssistant)
 	s.tallyEvent(stream.TypeResult)
 	s.tallyEvent("custom_kind") // unknown -> appears below the known set
-	s.tallyBlock(stream.BlockText)
-	s.tallyBlock(stream.BlockToolUse)
-	s.trackUsage(&stream.Usage{InputTokens: 12_345})
-	s.addLLMTime(2 * time.Second)
-	s.addToolTime(time.Second)
+	s.TallyBlock(stream.BlockText)
+	s.TallyBlock(stream.BlockToolUse)
+	s.TrackUsage(&stream.Usage{InputTokens: 12_345})
+	s.AddLLMTime(2 * time.Second)
+	s.AddToolTime(time.Second)
 
 	var buf bytes.Buffer
 	s.writePanel(&buf, "/some/reqs", "done")
@@ -162,10 +195,10 @@ func TestStats_SnapshotShape(t *testing.T) {
 	s := newStats("opus")
 	s.iterations = 3
 	s.tallyEvent(stream.TypeAssistant)
-	s.tallyBlock(stream.BlockText)
-	s.trackUsage(&stream.Usage{InputTokens: 100, OutputTokens: 50})
-	s.addLLMTime(5 * time.Second)
-	s.addToolTime(2 * time.Second)
+	s.TallyBlock(stream.BlockText)
+	s.TrackUsage(&stream.Usage{InputTokens: 100, OutputTokens: 50})
+	s.AddLLMTime(5 * time.Second)
+	s.AddToolTime(2 * time.Second)
 
 	sum := s.snapshot("/path/to/reqs", "done")
 	if sum.Reqs != "/path/to/reqs" {

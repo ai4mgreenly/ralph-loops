@@ -14,12 +14,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"unicode/utf8"
-	"unsafe"
 
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
 )
 
 // tabWidth is the number of spaces used to expand a `\t` character
@@ -74,8 +76,11 @@ const (
 )
 
 // useColor decides at startup whether the ui helpers emit ANSI escapes.
-// Tests can flip it via [SetColor].
-var useColor = detectColor(os.Stdout)
+// Tests can flip it via [SetColor]. Stored as an [atomic.Bool] because
+// it is read concurrently from the spinner goroutine and any goroutine
+// that calls [Color.Paint], while [SetColor] may be called from another
+// goroutine (notably tests running in parallel).
+var useColor atomic.Bool
 
 // detectColor returns true when ANSI colour output is appropriate. It
 // suppresses colour when NO_COLOR is set (per no-color.org) and when w
@@ -94,47 +99,77 @@ func detectColor(w *os.File) bool {
 
 // SetColor overrides the auto-detected colour setting. Intended for
 // tests; production code never needs it.
-func SetColor(on bool) { useColor = on }
+func SetColor(on bool) { useColor.Store(on) }
 
 // UseColor reports whether the package will emit ANSI escapes. Callers
 // that produce their own escape sequences (e.g. a syntax highlighter)
 // gate their output on this so NO_COLOR and non-TTY runs still come
 // out clean.
-func UseColor() bool { return useColor }
+func UseColor() bool { return useColor.Load() }
 
 // terminalWidth is the detected stdout column count, or 0 when stdout
 // is not a TTY (in which case callers should leave output untruncated
-// — they're probably writing to a log).
-var terminalWidth = detectWidth(os.Stdout)
+// — they're probably writing to a log). It is updated on SIGWINCH by
+// the goroutine [WatchResize] starts, so reads and writes are
+// synchronised through atomic ops.
+var terminalWidth atomic.Int32
 
-// detectWidth queries the controlling terminal's column count via the
-// TIOCGWINSZ ioctl. Returns 0 when w is not a character device or the
-// ioctl fails, signalling "do not truncate".
+func init() {
+	useColor.Store(detectColor(os.Stdout))
+	terminalWidth.Store(int32(detectWidth(os.Stdout)))
+}
+
+// detectWidth queries the controlling terminal's column count via
+// [golang.org/x/term.GetSize]. Returns 0 when w is not a character
+// device or the query fails, signalling "do not truncate".
 func detectWidth(w *os.File) int {
 	fi, err := w.Stat()
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return 0
 	}
-	var ws struct {
-		Row, Col, Xpixel, Ypixel uint16
-	}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
-		w.Fd(), uintptr(syscall.TIOCGWINSZ),
-		uintptr(unsafe.Pointer(&ws)))
-	if errno != 0 || ws.Col == 0 {
+	cols, _, err := term.GetSize(int(w.Fd()))
+	if err != nil || cols <= 0 {
 		return 0
 	}
-	return int(ws.Col)
+	return cols
 }
 
 // TerminalWidth returns the detected terminal column count, or 0 when
 // stdout is not a TTY. Callers truncating output should treat 0 as
 // "leave the line alone".
-func TerminalWidth() int { return terminalWidth }
+func TerminalWidth() int { return int(terminalWidth.Load()) }
 
 // SetTerminalWidth overrides the detected width. Intended for tests
 // that exercise truncation behaviour.
-func SetTerminalWidth(n int) { terminalWidth = n }
+func SetTerminalWidth(n int) { terminalWidth.Store(int32(n)) }
+
+// WatchResize installs a SIGWINCH handler that re-detects the
+// terminal width whenever the controlling terminal is resized.
+// Subsequent calls to [TerminalWidth] (and the wrap math driven from
+// it) observe the new value, so output rendered after the resize
+// honours the new width. Output already on screen is not redrawn.
+//
+// The returned function uninstalls the handler and stops the
+// background goroutine; callers should defer it.
+func WatchResize() func() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGWINCH)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-sigCh:
+				terminalWidth.Store(int32(detectWidth(os.Stdout)))
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(sigCh)
+		close(done)
+	}
+}
 
 // Truncate shortens s to at most max runes, replacing the final rune
 // with a horizontal ellipsis when truncation occurs. max <= 0 returns
@@ -186,7 +221,7 @@ const (
 // so a foreground highlighter (e.g. chroma) whose token resets clear
 // the background still keeps the bg fill solid across the full line.
 func (c Color) Paint(s string) string {
-	if !useColor || s == "" {
+	if !useColor.Load() || s == "" {
 		return s
 	}
 	switch c {
@@ -302,8 +337,8 @@ func wrapVisible(s string, max int) []string {
 // helper never emits an empty block.
 func WriteBlock(w io.Writer, marker string, lines []Line, trailingBlank bool) {
 	avail := 0
-	if terminalWidth > 0 {
-		avail = terminalWidth - Gutter
+	if w := TerminalWidth(); w > 0 {
+		avail = w - Gutter
 	}
 	cont := gutterSpaces()
 	first := markerPrefix(marker)

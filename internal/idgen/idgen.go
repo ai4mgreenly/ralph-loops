@@ -91,7 +91,27 @@ var idPattern = regexp.MustCompile(`^R-([0-9A-Z]{4})-([0-9A-Z]{4})$`)
 // well-formed identifier.
 var ErrInvalidID = errors.New("invalid requirement ID")
 
-// New returns a fresh ID derived from the current wall-clock time.
+// Generator mints IDs with a configurable clock. The zero value uses
+// [time.Now]; tests inject a deterministic clock by setting [Generator.Now].
+//
+// Most callers use the package-level [New]; reach for Generator when a
+// caller needs to control time (typically tests).
+type Generator struct {
+	// Now returns the instant to mint from. Nil falls back to time.Now.
+	Now func() time.Time
+}
+
+// New mints a fresh ID using the generator's clock.
+func (g *Generator) New() string {
+	now := g.Now
+	if now == nil {
+		now = time.Now
+	}
+	return NewAt(now())
+}
+
+// New returns a fresh ID derived from the current wall-clock time. It
+// is shorthand for (&Generator{}).New().
 func New() string {
 	return NewAt(time.Now())
 }

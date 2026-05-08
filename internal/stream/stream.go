@@ -1,14 +1,38 @@
 // Package stream models the JSON event stream emitted by
 // `claude -p --output-format stream-json`.
 //
-// Only the fields ralph actually consumes are typed. Each line on the
-// stream is first decoded into a [RawEvent] for type-routing, then
-// re-decoded into the matching concrete type. This two-pass approach
-// keeps the type discriminator separate from the payload while still
-// letting Go's encoding/json validate field shapes.
+// The wire format is newline-delimited JSON: each line is a single
+// event object whose "type" field discriminates the payload. [Reader]
+// drives a producer of [Event] values from an [io.Reader]:
+//
+//	r := stream.NewReader(stdout)
+//	for {
+//	    ev, err := r.Next()
+//	    if errors.Is(err, io.EOF) {
+//	        break
+//	    }
+//	    switch ev := ev.(type) {
+//	    case stream.Assistant: // ...
+//	    case stream.Result:    // ...
+//	    case stream.UnknownEvent:
+//	        // forward-compat: log and continue
+//	    }
+//	}
+//
+// Decoding is two-pass internally: a small head struct extracts the
+// discriminator, then the full line is decoded into the matching
+// concrete type. Unrecognized "type" values surface as [UnknownEvent]
+// (paired with [ErrUnknownType]) rather than being silently dropped,
+// so the system stays safe when claude introduces a new event kind.
 package stream
 
-import "encoding/json"
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+)
 
 // Event types produced by the claude CLI on its JSON-line output.
 const (
@@ -39,29 +63,140 @@ const (
 // {"status":"CONTINUE"} as its structured output.
 const SchemaJSON = `{"type":"object","properties":{"status":{"type":"string","enum":["DONE","CONTINUE"]}},"required":["status"]}`
 
-// RawEvent captures the discriminator fields needed to dispatch a stream
-// line to its concrete type. The rest of the payload is preserved in
-// [RawEvent.Payload] for a second decode pass.
-type RawEvent struct {
-	Type    string
-	Subtype string
-	Payload json.RawMessage
+// Buffer bounds for the internal line scanner. The upper bound is
+// generous because individual events (notably tool_use_result for a
+// large Read) can be quite long; the lower bound is the bufio default.
+const (
+	scannerInitialBuffer = 64 * 1024
+	scannerMaxBuffer     = 16 * 1024 * 1024
+)
+
+// Event is the sealed interface satisfied by every value [Reader.Next]
+// can return. Callers should type-switch on Event; the closed set is:
+// [Assistant], [User], [Result], [System], [RateLimit], [UnknownEvent].
+type Event interface {
+	// Kind returns the wire-format discriminator (one of TypeXxx).
+	Kind() string
+	isStreamEvent()
 }
 
-// UnmarshalJSON decodes the discriminator while keeping the original
-// bytes around for follow-up decoding.
-func (e *RawEvent) UnmarshalJSON(data []byte) error {
+// Sentinel errors returned by [Reader.Next], wrapped in [DecodeError].
+var (
+	// ErrUnknownType is wrapped when a line's "type" field does not
+	// match a known constant. Reader returns the [UnknownEvent] carrier
+	// alongside this error so callers may surface or skip the line at
+	// their discretion.
+	ErrUnknownType = errors.New("stream: unknown event type")
+	// ErrMalformed is wrapped when a line cannot be parsed as JSON or
+	// its payload does not match the expected shape for its type.
+	ErrMalformed = errors.New("stream: malformed event")
+)
+
+// DecodeError reports a per-line decoding failure with enough context
+// (line number, raw bytes) for callers to surface or recover from it.
+// Wrapped errors include [ErrUnknownType] or [ErrMalformed].
+type DecodeError struct {
+	// Line is the 1-based index of the offending line in the stream.
+	Line int
+	// Bytes is the raw line that failed to decode. Owned by the
+	// scanner; copy if retained beyond the next call to [Reader.Next].
+	Bytes []byte
+	// Err is the underlying cause, wrappable with errors.Is/As.
+	Err error
+}
+
+func (e *DecodeError) Error() string {
+	return fmt.Sprintf("stream: line %d: %v", e.Line, e.Err)
+}
+
+func (e *DecodeError) Unwrap() error { return e.Err }
+
+// Reader decodes the claude stream-json line-oriented event stream.
+// Reader is not safe for concurrent use.
+type Reader struct {
+	sc   *bufio.Scanner
+	line int
+}
+
+// NewReader returns a [Reader] that decodes events from r. The
+// provided reader is consumed lazily, one line per call to
+// [Reader.Next].
+func NewReader(r io.Reader) *Reader {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, scannerInitialBuffer), scannerMaxBuffer)
+	return &Reader{sc: sc}
+}
+
+// Line returns the 1-based line number of the most recently returned
+// event or error. Useful for log messages and diagnostic output.
+func (r *Reader) Line() int { return r.line }
+
+// Next returns the next decoded event from the stream. At end of
+// stream Next returns ([io.EOF]).
+//
+// On malformed JSON or unexpected payload shape Next returns a wrapped
+// [*DecodeError] (matching [ErrMalformed] via errors.Is). On a known
+// JSON object whose "type" is unrecognized Next returns the carrier
+// [UnknownEvent] alongside a [*DecodeError] wrapping [ErrUnknownType];
+// callers may inspect or ignore both. In every case the underlying
+// stream remains positioned on the next line, so callers can resume.
+func (r *Reader) Next() (Event, error) {
+	if !r.sc.Scan() {
+		if err := r.sc.Err(); err != nil {
+			return nil, fmt.Errorf("stream: read: %w", err)
+		}
+		return nil, io.EOF
+	}
+	r.line++
+	line := r.sc.Bytes()
+
 	var head struct {
 		Type    string `json:"type"`
 		Subtype string `json:"subtype"`
 	}
-	if err := json.Unmarshal(data, &head); err != nil {
-		return err
+	if err := json.Unmarshal(line, &head); err != nil {
+		return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: %v", ErrMalformed, err)}
 	}
-	e.Type = head.Type
-	e.Subtype = head.Subtype
-	e.Payload = append(e.Payload[:0], data...)
-	return nil
+
+	switch head.Type {
+	case TypeAssistant:
+		var ev Assistant
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: assistant: %v", ErrMalformed, err)}
+		}
+		return ev, nil
+	case TypeUser:
+		var ev User
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: user: %v", ErrMalformed, err)}
+		}
+		return ev, nil
+	case TypeResult:
+		var ev Result
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: result: %v", ErrMalformed, err)}
+		}
+		return ev, nil
+	case TypeSystem:
+		var ev System
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: system: %v", ErrMalformed, err)}
+		}
+		return ev, nil
+	case TypeRateLimit:
+		var ev RateLimit
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: rate_limit: %v", ErrMalformed, err)}
+		}
+		return ev, nil
+	default:
+		// Preserve the raw payload so callers can log or forward it.
+		// Copy the line bytes; the scanner's slice is overwritten on
+		// the next Scan.
+		payload := append(json.RawMessage(nil), line...)
+		ev := UnknownEvent{Type: head.Type, Subtype: head.Subtype, Payload: payload}
+		return ev, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: %q", ErrUnknownType, head.Type)}
+	}
 }
 
 // Assistant is the payload of an assistant event.
@@ -69,11 +204,17 @@ type Assistant struct {
 	Message Message `json:"message"`
 }
 
+func (Assistant) Kind() string   { return TypeAssistant }
+func (Assistant) isStreamEvent() {}
+
 // User is the payload of a user (tool result or replayed input) event.
 type User struct {
 	Message       Message         `json:"message"`
 	ToolUseResult json.RawMessage `json:"tool_use_result,omitempty"`
 }
+
+func (User) Kind() string   { return TypeUser }
+func (User) isStreamEvent() {}
 
 // Result is the payload of the terminal result event for an iteration.
 type Result struct {
@@ -85,6 +226,9 @@ type Result struct {
 	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
 }
 
+func (Result) Kind() string   { return TypeResult }
+func (Result) isStreamEvent() {}
+
 // System is the payload of a system event (session start, tool list,
 // permission mode, etc.).
 type System struct {
@@ -95,13 +239,32 @@ type System struct {
 	Tools          []string `json:"tools,omitempty"`
 }
 
+func (System) Kind() string   { return TypeSystem }
+func (System) isStreamEvent() {}
+
 // RateLimit is the payload of a rate_limit_event.
 type RateLimit struct {
 	Info *RateLimitInfo `json:"rate_limit_info,omitempty"`
 }
 
+func (RateLimit) Kind() string   { return TypeRateLimit }
+func (RateLimit) isStreamEvent() {}
+
+// UnknownEvent carries any line whose "type" field does not match a
+// known event kind, allowing callers to log or forward without
+// crashing. The Type field tracks the wire discriminator.
+type UnknownEvent struct {
+	Type    string
+	Subtype string
+	Payload json.RawMessage
+}
+
+func (e UnknownEvent) Kind() string { return e.Type }
+func (UnknownEvent) isStreamEvent() {}
+
 // RateLimitInfo describes the rate-limit state at the moment the event
-// was produced.
+// was produced. Field names use camelCase to match claude's wire
+// format (the rest of the schema is snake_case).
 type RateLimitInfo struct {
 	RateLimitType  string  `json:"rateLimitType,omitempty"`
 	Status         string  `json:"status,omitempty"`

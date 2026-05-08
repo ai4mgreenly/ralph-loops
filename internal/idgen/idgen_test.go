@@ -16,6 +16,44 @@ var idShape = regexp.MustCompile(`^R-[0-9A-Z]{4}-[0-9A-Z]{4}$`)
 // many milliseconds since [Epoch], IDs start repeating.
 const cycleMs int64 = 2_821_109_907_456
 
+// TestGenerator_UsesInjectedClock verifies that the Generator mints
+// IDs from its injected clock rather than the wall clock. This is the
+// idiomatic Go pattern for testable time-dependent code: a function-
+// valued field that defaults to time.Now when unset.
+func TestGenerator_UsesInjectedClock(t *testing.T) {
+	t.Parallel()
+
+	fixed := Epoch.Add(42 * time.Millisecond)
+	g := Generator{Now: func() time.Time { return fixed }}
+
+	got := g.New()
+	want := NewAt(fixed)
+	if got != want {
+		t.Errorf("g.New() = %q, want %q (NewAt(fixed))", got, want)
+	}
+
+	// Round-tripping through TimeOf must recover the injected instant.
+	roundTripped, err := TimeOf(got)
+	if err != nil {
+		t.Fatalf("TimeOf: %v", err)
+	}
+	if !roundTripped.Equal(fixed) {
+		t.Errorf("round-trip = %v, want %v", roundTripped, fixed)
+	}
+}
+
+// TestGenerator_ZeroValueFallsBackToTimeNow asserts that a zero-value
+// Generator still mints valid IDs without panicking — the convenience
+// path that lets package-level New be implemented as a one-liner.
+func TestGenerator_ZeroValueFallsBackToTimeNow(t *testing.T) {
+	t.Parallel()
+	var g Generator
+	id := g.New()
+	if !idShape.MatchString(id) {
+		t.Errorf("zero-value Generator produced malformed ID: %q", id)
+	}
+}
+
 // TestNewAt_PinnedValues anchors the ID generator against hand-computed
 // expected outputs at the extreme points of the cycle. If any of these
 // drift the bijection constants have been altered and any IDs minted

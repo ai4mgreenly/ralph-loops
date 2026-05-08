@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
 	"github.com/ai4mgreenly/ralph-loops/internal/loop"
@@ -23,8 +24,10 @@ import (
 )
 
 // version is the build identifier reported by `ralph version` and
-// stamped into the run banner.
-const version = "0.1.0"
+// stamped into the run banner. It is overridden at link time via
+// `-ldflags "-X main.version=..."` (see the Makefile); the default
+// value here is what unstamped builds (e.g. `go run`) report.
+var version = "dev"
 
 //go:embed prompt.md
 var promptTemplate string
@@ -41,7 +44,6 @@ const (
 	defaultReqs            = "reqs"
 	defaultModel           = "opus"
 	defaultEffort          = "medium"
-	defaultDuration        = ""
 	defaultConfigDir       = ""
 	defaultTools           = ""
 	defaultOneMContext     = true
@@ -49,6 +51,55 @@ const (
 	defaultSkipPermissions = true
 	defaultOutputLines     = 10
 )
+
+// defaultDuration is the wall-clock cap when --duration is not given.
+// Zero means unlimited.
+const defaultDuration time.Duration = 0
+
+// allowedModels and allowedEfforts are the permitted values for their
+// respective enumFlag-typed CLI flags.
+var (
+	allowedModels  = []string{"haiku", "sonnet", "opus"}
+	allowedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+)
+
+// enumFlag is a flag.Value implementation that constrains a string flag
+// to a fixed set of allowed values. The default value is supplied by
+// the caller and considered valid even if it is not in allowed (so we
+// can construct an enumFlag without forcing every default into the
+// allowed set).
+type enumFlag struct {
+	value   string
+	allowed []string
+	name    string
+}
+
+// newEnumFlag constructs an enumFlag with the given default and
+// allowed-set. name is used in error messages.
+func newEnumFlag(name, def string, allowed []string) *enumFlag {
+	return &enumFlag{value: def, allowed: allowed, name: name}
+}
+
+// String reports the current value. It is also used by the flag
+// package to render defaults in usage strings, so it must tolerate
+// being called on the zero value.
+func (e *enumFlag) String() string {
+	if e == nil {
+		return ""
+	}
+	return e.value
+}
+
+// Set validates v against the allowed set and stores it on success.
+func (e *enumFlag) Set(v string) error {
+	for _, ok := range e.allowed {
+		if v == ok {
+			e.value = v
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid %s %q: must be one of %s", e.name, v, strings.Join(e.allowed, "|"))
+}
 
 // Exit codes follow the convention used by Unix CLIs: 0 success, 1
 // runtime error, 2 usage error.
@@ -70,6 +121,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		writeUsage(stderr)
 		return exitUsage
 	}
+	// Real subcommands take precedence over the loop's flag parser so
+	// that e.g. `ralph init --version` doesn't get hijacked into a
+	// version print. The bare-word `version`/`help` shortcuts also live
+	// here; the matching --version/--help flags are handled inside
+	// runLoop after flag parsing so they work regardless of position.
 	switch args[0] {
 	case "init":
 		if len(args) != 2 {
@@ -100,41 +156,67 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stdout, t.UTC().Format("2006-01-02T15:04:05.000Z"))
 		return exitSuccess
-	case "version", "-v", "--version":
+	case "version":
 		fmt.Fprintf(stdout, "ralph %s\n", version)
 		return exitSuccess
-	case "help", "-h", "--help":
+	case "help":
 		writeUsagePaged(stdout)
 		return exitSuccess
 	default:
-		return runLoop(args, stderr)
+		return runLoop(args, stdout, stderr)
 	}
 }
 
 // runLoop parses the loop subcommand's flags, materialises a
-// [loop.Config], and hands off to [loop.Run].
-func runLoop(args []string, stderr io.Writer) int {
+// [loop.Config], and hands off to [loop.Run]. It also services
+// `--version`/`-v` and `--help`/`-h`, which the flag package allows in
+// any position — fixing the longstanding bug where
+// `ralph --reqs=foo --version` fell through to the loop driver.
+func runLoop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ralph", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { writeUsage(stderr) }
 
 	var (
-		reqs      = fs.String("reqs", defaultReqs, "path to requirements directory")
-		model     = fs.String("model", defaultModel, "haiku|sonnet|opus")
-		effort    = fs.String("effort", defaultEffort, "low|medium|high|xhigh|max")
-		duration  = fs.String("duration", defaultDuration, "wall-clock budget (e.g. 4h, 90m); empty means unlimited")
-		configDir = fs.String("config-dir", defaultConfigDir, "value exported as CLAUDE_CONFIG_DIR; empty inherits claude's default (~/.claude)")
-		oneM      = fs.Bool("1m-context", defaultOneMContext, "enable 1M-token context window")
-		mcp       = fs.Bool("enable-claudeai-mcp-servers", defaultClaudeAIMCP, "enable Claude.ai-managed MCP servers")
-		skipPerm  = fs.Bool("dangerously-skip-permissions", defaultSkipPermissions, "pass --dangerously-skip-permissions to claude")
+		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory")
+		model       = newEnumFlag("--model", defaultModel, allowedModels)
+		effort      = newEnumFlag("--effort", defaultEffort, allowedEfforts)
+		duration    time.Duration
+		configDir   = fs.String("config-dir", defaultConfigDir, "value exported as CLAUDE_CONFIG_DIR; empty inherits claude's default (~/.claude)")
+		oneM        = fs.Bool("1m-context", defaultOneMContext, "enable 1M-token context window")
+		mcp         = fs.Bool("enable-claudeai-mcp-servers", defaultClaudeAIMCP, "enable Claude.ai-managed MCP servers")
+		skipPerm    = fs.Bool("dangerously-skip-permissions", defaultSkipPermissions, "pass --dangerously-skip-permissions to claude")
 		tools       = fs.String("tools", defaultTools, "comma-separated tool list; empty means all built-ins")
 		verbose     = fs.Bool("verbose", false, "echo low-signal stream events (system init, rate_limit)")
 		outputLines = fs.Int("output-lines", defaultOutputLines, "max lines of tool output to replay per result before truncating with `...`")
+
+		showVersion bool
+		showHelp    bool
 	)
+	fs.Var(model, "model", "haiku|sonnet|opus")
+	fs.Var(effort, "effort", "low|medium|high|xhigh|max")
+	fs.DurationVar(&duration, "duration", defaultDuration, "wall-clock budget (e.g. 4h, 90m); 0 means unlimited")
+	fs.BoolVar(&showVersion, "version", false, "print version and exit")
+	fs.BoolVar(&showVersion, "v", false, "print version and exit (shorthand)")
+	fs.BoolVar(&showHelp, "help", false, "print the operator manual and exit")
+	fs.BoolVar(&showHelp, "h", false, "print the operator manual and exit (shorthand)")
 
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+
+	// --version / --help are honored regardless of where they appear
+	// among other flags. They beat WORKDIR validation so that
+	// `ralph --reqs=foo --version` prints the version cleanly.
+	if showVersion {
+		fmt.Fprintf(stdout, "ralph %s\n", version)
+		return exitSuccess
+	}
+	if showHelp {
+		writeUsagePaged(stdout)
+		return exitSuccess
+	}
+
 	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "ralph: WORKDIR positional argument is required")
 		writeUsage(stderr)
@@ -147,12 +229,21 @@ func runLoop(args []string, stderr io.Writer) int {
 		"{{WORKDIR}}", workdir,
 	).Replace(promptTemplate)
 
+	// loop.Config.Duration is presently a string ("4h", "", ...);
+	// re-stringify the parsed time.Duration at the boundary so the
+	// loop package's parser keeps owning interpretation. An empty
+	// string preserves the existing "unlimited" sentinel.
+	durationStr := ""
+	if duration > 0 {
+		durationStr = duration.String()
+	}
+
 	cfg := loop.Config{
 		ReqsDir:         *reqs,
 		WorkDir:         workdir,
-		Model:           *model,
-		Effort:          *effort,
-		Duration:        *duration,
+		Model:           model.String(),
+		Effort:          effort.String(),
+		Duration:        durationStr,
 		ConfigDir:       *configDir,
 		OneMContext:     *oneM,
 		ClaudeAIMCP:     *mcp,

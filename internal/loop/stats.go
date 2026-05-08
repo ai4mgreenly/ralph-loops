@@ -44,7 +44,10 @@ type stats struct {
 	blocks map[string]int
 
 	tokens tokens
-	cost   float64
+	// cost is the running total in integer micro-USD (millionths of
+	// a USD). Money is never represented as float64 here; conversion
+	// to a float happens only at JSON-marshal and panel-render time.
+	cost int64
 
 	llmTime  time.Duration
 	toolTime time.Duration
@@ -95,15 +98,21 @@ func newStats(model string) *stats {
 	}
 }
 
+// TallyBlock, AddLLMTime, AddToolTime, and TrackUsage are the
+// [render.Recorder]-shaped methods the per-event renderer calls while
+// pretty-printing the stream. They are exported solely so a sibling
+// package (render) can satisfy that interface against the loop's
+// unexported stats type. tallyEvent and incrementIteration stay
+// unexported because they are driven by the loop itself, not render.
 func (s *stats) tallyEvent(t string)         { s.events[t]++ }
-func (s *stats) tallyBlock(t string)         { s.blocks[t]++ }
+func (s *stats) TallyBlock(t string)         { s.blocks[t]++ }
 func (s *stats) incrementIteration()         { s.iterations++ }
-func (s *stats) addLLMTime(d time.Duration)  { s.llmTime += d }
-func (s *stats) addToolTime(d time.Duration) { s.toolTime += d }
+func (s *stats) AddLLMTime(d time.Duration)  { s.llmTime += d }
+func (s *stats) AddToolTime(d time.Duration) { s.toolTime += d }
 
-// trackUsage rolls a single result event's usage into the running
+// TrackUsage rolls a single result event's usage into the running
 // totals and updates the cost estimate using the pricing table.
-func (s *stats) trackUsage(u *stream.Usage) {
+func (s *stats) TrackUsage(u *stream.Usage) {
 	if u == nil {
 		return
 	}
@@ -112,14 +121,30 @@ func (s *stats) trackUsage(u *stream.Usage) {
 	s.tokens.cacheRead += u.CacheReadInputTokens
 	s.tokens.cacheCreate += u.CacheCreationInputTokens
 
-	rate, ok := pricing.Models[s.model]
+	rate, ok := pricing.Lookup(s.model)
 	if !ok {
 		return
 	}
-	s.cost += float64(u.InputTokens)*rate.Input/1_000_000 +
-		float64(u.OutputTokens)*rate.Output/1_000_000 +
-		float64(u.CacheReadInputTokens)*rate.CacheRead/1_000_000 +
-		float64(u.CacheCreationInputTokens)*rate.CacheCreate/1_000_000
+	// Rates are micro-USD per million tokens. tokens * rate yields
+	// micro-USD per million tokens-of-tokens, so we divide by one
+	// million to land back in micro-USD. int64 throughout.
+	s.cost += int64(u.InputTokens)*rate.Input/1_000_000 +
+		int64(u.OutputTokens)*rate.Output/1_000_000 +
+		int64(u.CacheReadInputTokens)*rate.CacheRead/1_000_000 +
+		int64(u.CacheCreationInputTokens)*rate.CacheCreate/1_000_000
+}
+
+// CostUSD returns the running cost in dollars as a float64. It is the
+// only sanctioned way to read the cost from outside the accumulator;
+// internal arithmetic stays in micro-USD.
+func (s *stats) CostUSD() float64 {
+	return float64(s.cost) / float64(pricing.MicroUSDPerUSD)
+}
+
+// formatUSD renders an integer micro-USD amount as "$X.YYYY" — four
+// decimal places to match the existing on-screen panel format.
+func formatUSD(microUSD int64) string {
+	return fmt.Sprintf("$%.4f", float64(microUSD)/float64(pricing.MicroUSDPerUSD))
 }
 
 // summary is the per-run record rendered both as the operator-facing
@@ -133,8 +158,60 @@ type summary struct {
 	Events     map[string]int `json:"events"`
 	Blocks     map[string]int `json:"blocks"`
 	Tokens     summaryTokens  `json:"tokens"`
+	// CostMicroUSD is the run cost in integer micro-USD. The JSON
+	// representation is a float dollar amount under the "cost" key —
+	// see [summary.MarshalJSON] — so external consumers of
+	// results.jsonl continue to see a number-shaped field.
+	CostMicroUSD int64       `json:"-"`
+	Time         summaryTime `json:"time"`
+}
+
+// summaryJSON mirrors [summary] but with cost expressed as a float
+// dollar amount. It exists only to drive (un)marshaling and preserve
+// the public results.jsonl schema.
+type summaryJSON struct {
+	Reqs       string         `json:"reqs"`
+	Exit       string         `json:"exit,omitempty"`
+	Iterations int            `json:"iterations"`
+	Events     map[string]int `json:"events"`
+	Blocks     map[string]int `json:"blocks"`
+	Tokens     summaryTokens  `json:"tokens"`
 	Cost       float64        `json:"cost"`
 	Time       summaryTime    `json:"time"`
+}
+
+// MarshalJSON renders sum with cost as a USD float, preserving the
+// existing results.jsonl schema.
+func (sum summary) MarshalJSON() ([]byte, error) {
+	return json.Marshal(summaryJSON{
+		Reqs:       sum.Reqs,
+		Exit:       sum.Exit,
+		Iterations: sum.Iterations,
+		Events:     sum.Events,
+		Blocks:     sum.Blocks,
+		Tokens:     sum.Tokens,
+		Cost:       float64(sum.CostMicroUSD) / float64(pricing.MicroUSDPerUSD),
+		Time:       sum.Time,
+	})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON: it accepts the float
+// "cost" field from the wire and converts it back into integer
+// micro-USD on the in-memory record.
+func (sum *summary) UnmarshalJSON(data []byte) error {
+	var aux summaryJSON
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	sum.Reqs = aux.Reqs
+	sum.Exit = aux.Exit
+	sum.Iterations = aux.Iterations
+	sum.Events = aux.Events
+	sum.Blocks = aux.Blocks
+	sum.Tokens = aux.Tokens
+	sum.CostMicroUSD = int64(aux.Cost * float64(pricing.MicroUSDPerUSD))
+	sum.Time = aux.Time
+	return nil
 }
 
 type summaryTokens struct {
@@ -177,7 +254,7 @@ func (s *stats) snapshot(reqs, exitReason string) summary {
 			Output:      s.tokens.output,
 			Total:       s.tokens.total(),
 		},
-		Cost: s.cost,
+		CostMicroUSD: s.cost,
 		Time: summaryTime{
 			Start:        s.startTime,
 			End:          end,
@@ -225,7 +302,7 @@ func (sum summary) writeText(w io.Writer) {
 	fmt.Fprintf(w, "  output:       %s\n", ui.FormatNumber(sum.Tokens.Output))
 	fmt.Fprintf(w, "  total:        %s\n\n", ui.FormatNumber(sum.Tokens.Total))
 
-	fmt.Fprintf(w, "cost:        $%.4f\n\n", sum.Cost)
+	fmt.Fprintf(w, "cost:        %s\n\n", formatUSD(sum.CostMicroUSD))
 
 	fmt.Fprintln(w, "time:")
 	fmt.Fprintf(w, "  start:  %s\n", sum.Time.Start.Format(time.RFC3339))

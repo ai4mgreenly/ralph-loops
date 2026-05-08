@@ -1,4 +1,4 @@
-package loop
+package render
 
 import (
 	"encoding/json"
@@ -11,23 +11,37 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
-// emitter renders one stream of claude events. It owns the
+// Markers used by the activity log. Held as named constants so the
+// success/error variants stay visually distinct and consistent across
+// every emit path. Tool calls (assistant → operator) lead with
+// [markerCall]; tool results (operator → assistant) lead with
+// [markerResult] on success or [markerError] on failure. The terminal
+// "result" event uses [markerSummary] / [markerSummaryError].
+const (
+	markerCall         = "←"
+	markerResult       = "→"
+	markerError        = "✗"
+	markerSummary      = "←"
+	markerSummaryError = "✗"
+)
+
+// Emitter renders one stream of claude events. It owns the
 // per-iteration ledger of pending tool calls (so a tool_result block
 // can be printed alongside the call that produced it) and the
 // per-event timer that splits wall time into LLM / tool / other.
 //
-// One emitter instance is reused across iterations: [resetIteration]
+// One Emitter instance is reused across iterations: [Emitter.ResetIteration]
 // clears the pending-tool ledger and re-anchors the timer at the
 // start of each new iteration.
-type emitter struct {
+type Emitter struct {
 	out         io.Writer
-	stats       *stats
+	rec         Recorder
 	tools       map[string]toolRef
 	lastAt      time.Time
 	now         func() time.Time
-	verbose     bool
-	spinner     *ui.Spinner
-	outputLines int
+	Verbose     bool
+	Spinner     *ui.Spinner
+	OutputLines int
 }
 
 // toolRef is the input to a not-yet-completed tool call, retained so
@@ -38,33 +52,33 @@ type toolRef struct {
 	input json.RawMessage
 }
 
-// newEmitter constructs an emitter writing to out and updating s.
+// NewEmitter constructs an Emitter writing to out and updating rec.
 // The wall-clock source is taken indirectly through `time.Now` so
 // tests can install a deterministic clock.
-func newEmitter(out io.Writer, s *stats) *emitter {
-	return &emitter{
+func NewEmitter(out io.Writer, rec Recorder) *Emitter {
+	return &Emitter{
 		out:         out,
-		stats:       s,
+		rec:         rec,
 		tools:       make(map[string]toolRef),
 		now:         time.Now,
-		spinner:     ui.NewSpinner(out, "waiting for claude"),
-		outputLines: defaultOutputLines,
+		Spinner:     ui.NewSpinner(out, "waiting for claude"),
+		OutputLines: defaultOutputLines,
 	}
 }
 
-// resetIteration prepares the emitter for a fresh iteration: drop any
+// ResetIteration prepares the Emitter for a fresh iteration: drop any
 // in-flight tool-call references (they cannot survive a new claude
 // invocation) and re-anchor the per-event timer.
-func (e *emitter) resetIteration() {
+func (e *Emitter) ResetIteration() {
 	clear(e.tools)
 	e.lastAt = e.now()
 }
 
-// iterationBanner prints a rule-bracketed "iteration: N" header to
+// IterationBanner prints a rule-bracketed "iteration: N" header to
 // mark the start of a new claude invocation. The rule spans the
 // terminal width (or the panel fallback width when stdout is not a
 // terminal).
-func (e *emitter) iterationBanner(n int) {
+func (e *Emitter) IterationBanner(n int) {
 	rule := buildRule()
 	fmt.Fprintln(e.out)
 	fmt.Fprintln(e.out, rule)
@@ -72,25 +86,25 @@ func (e *emitter) iterationBanner(n int) {
 	fmt.Fprintln(e.out, rule)
 }
 
-// onAssistant handles the "assistant" event: indented plain text for
+// OnAssistant handles the "assistant" event: indented plain text for
 // model output, decorated lines for tool_use and thinking blocks.
 // The wall-clock gap since the last event is attributed to LLM time.
-func (e *emitter) onAssistant(a stream.Assistant) {
+func (e *Emitter) OnAssistant(a stream.Assistant) {
 	now := e.now()
-	e.stats.addLLMTime(now.Sub(e.lastAt))
+	e.rec.AddLLMTime(now.Sub(e.lastAt))
 	e.lastAt = now
 
 	blocks := a.Message.Content
 	if len(blocks) == 0 {
-		ui.Decorate(e.out, "←", "assistant (empty)") // was: ↑
+		ui.Decorate(e.out, markerCall, "assistant (empty)")
 		return
 	}
 
 	for _, b := range blocks {
-		e.stats.tallyBlock(b.Type)
+		e.rec.TallyBlock(b.Type)
 		switch b.Type {
 		case stream.BlockText:
-			ui.Lead(e.out, "←", strings.TrimRight(b.Text, " \t\r\n")) // was: *
+			ui.Lead(e.out, markerCall, strings.TrimRight(b.Text, " \t\r\n"))
 		case stream.BlockToolUse:
 			e.tools[b.ID] = toolRef{name: b.Name, input: b.Input}
 			e.emitToolCall(b)
@@ -98,43 +112,43 @@ func (e *emitter) onAssistant(a stream.Assistant) {
 			// Skip the noise from "… thinking (0 chars)" preludes that
 			// claude emits before some tool calls; they carry no signal.
 			if n := len(b.Thinking); n > 0 {
-				ui.Decorate(e.out, "←", fmt.Sprintf("thinking (%d chars)", n)) // was: …
+				ui.Decorate(e.out, markerCall, fmt.Sprintf("thinking (%d chars)", n))
 			}
 		default:
-			ui.Decorate(e.out, "←", "assistant ["+b.Type+"]") // was: ↑
+			ui.Decorate(e.out, markerCall, "assistant ["+b.Type+"]")
 		}
 	}
 }
 
-// onUser handles the "user" event: typically a tool_result block
-// matched against the call recorded in [emitter.tools], or a replayed
+// OnUser handles the "user" event: typically a tool_result block
+// matched against the call recorded in [Emitter.tools], or a replayed
 // kickoff text. The wall-clock gap since the last event is attributed
 // to tool time.
-func (e *emitter) onUser(u stream.User) {
+func (e *Emitter) OnUser(u stream.User) {
 	now := e.now()
-	e.stats.addToolTime(now.Sub(e.lastAt))
+	e.rec.AddToolTime(now.Sub(e.lastAt))
 	e.lastAt = now
 
 	blocks := u.Message.Content
 	if len(blocks) == 0 {
-		ui.Decorate(e.out, "→", "user (empty)")
+		ui.Decorate(e.out, markerResult, "user (empty)")
 		return
 	}
 
 	for _, b := range blocks {
-		e.stats.tallyBlock(b.Type)
+		e.rec.TallyBlock(b.Type)
 		switch b.Type {
 		case stream.BlockToolResult:
 			e.emitToolResult(b, u.ToolUseResult)
 		case stream.BlockText:
 			e.emitUserText(b.Text)
 		default:
-			ui.Decorate(e.out, "→", "user ["+b.Type+"]")
+			ui.Decorate(e.out, markerResult, "user ["+b.Type+"]")
 		}
 	}
 }
 
-func (e *emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
+func (e *Emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 	ref, ok := e.tools[b.ToolUseID]
 	delete(e.tools, b.ToolUseID)
 	if !ok {
@@ -169,7 +183,11 @@ func (e *emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 	if summary := formatToolResult(ref.name, b, structured); summary != "" {
 		parts = append(parts, summary)
 	}
-	ui.Decorate(e.out, "→", strings.Join(parts, "  "))
+	marker := markerResult
+	if b.IsError {
+		marker = markerError
+	}
+	ui.Decorate(e.out, marker, strings.Join(parts, "  "))
 }
 
 // emitToolCall renders one assistant tool_use block. Every tool call
@@ -178,23 +196,23 @@ func (e *emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 // fill on the call line, makes call/response pairs easy to scan. All
 // shapes flow through [ui.Tool] so the gutter and soft-wrap behaviour
 // stay consistent across every tool-call line in the UI.
-func (e *emitter) emitToolCall(b stream.Block) {
+func (e *Emitter) emitToolCall(b stream.Block) {
 	switch b.Name {
 	case "Bash":
-		ui.Tool(e.out, "←", bashCommand(b.Input), true)
+		ui.Tool(e.out, markerCall, bashCommand(b.Input), true)
 		return
 	case "Read":
-		ui.Tool(e.out, "←", "Read  "+readTarget(b.Input), true)
+		ui.Tool(e.out, markerCall, "Read  "+readTarget(b.Input), true)
 		return
 	case "Edit", "Write":
-		ui.Tool(e.out, "←", b.Name+"  "+filePathOf(b.Input), true)
+		ui.Tool(e.out, markerCall, b.Name+"  "+filePathOf(b.Input), true)
 		return
 	}
 	content := b.Name
 	if param := formatToolCallParam(b.Name, b.Input); param != "" {
 		content += "  " + param
 	}
-	ui.Tool(e.out, "←", content, true)
+	ui.Tool(e.out, markerCall, content, true)
 }
 
 // defaultOutputLines bounds how many lines of tool output we replay
@@ -211,16 +229,16 @@ const defaultOutputLines = 10
 // continuations get [ui.Gutter] spaces, giving the whole block one
 // clean left edge. Per-line colour is applied after wrapping so ANSI
 // escapes do not count toward the wrap budget. When more than
-// [emitter.outputLines] input lines are supplied the overflow is
+// [Emitter.OutputLines] input lines are supplied the overflow is
 // dropped and a `...` line is appended.
-func (e *emitter) emitOutputBlock(marker string, lines []ui.Line) {
-	cap := e.outputLines
-	if cap <= 0 {
-		cap = defaultOutputLines
+func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
+	maxLines := e.OutputLines
+	if maxLines <= 0 {
+		maxLines = defaultOutputLines
 	}
 	truncated := false
-	if len(lines) > cap {
-		lines = lines[:cap]
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
 		truncated = true
 	}
 	if truncated {
@@ -231,9 +249,9 @@ func (e *emitter) emitOutputBlock(marker string, lines []ui.Line) {
 
 // emitBashResult renders the result of a Bash tool call as a tight
 // terminal-style block: stdout lines first, stderr lines after in dim
-// red, capped at [emitter.outputLines] with a trailing `...` when
+// red, capped at [Emitter.OutputLines] with a trailing `...` when
 // more were available.
-func (e *emitter) emitBashResult(b stream.Block, structured json.RawMessage) {
+func (e *Emitter) emitBashResult(b stream.Block, structured json.RawMessage) {
 	var s struct {
 		Stdout string `json:"stdout"`
 		Stderr string `json:"stderr"`
@@ -242,9 +260,9 @@ func (e *emitter) emitBashResult(b stream.Block, structured json.RawMessage) {
 		_ = json.Unmarshal(structured, &s)
 	}
 
-	marker := "→" // error variant was: ✗
+	marker := markerResult
 	if b.IsError {
-		marker = "→"
+		marker = markerError
 	}
 
 	var lines []ui.Line
@@ -270,10 +288,10 @@ func (e *emitter) emitBashResult(b stream.Block, structured json.RawMessage) {
 // so what the operator sees matches what the agent saw, then the
 // stripped body is run through the syntax highlighter using the
 // original Read call's `file_path` to pick a lexer.
-func (e *emitter) emitReadResult(b stream.Block, ref toolRef) {
-	marker := "→" // error variant was: ✗
+func (e *Emitter) emitReadResult(b stream.Block, ref toolRef) {
+	marker := markerResult
 	if b.IsError {
-		marker = "→"
+		marker = markerError
 	}
 
 	content := strings.TrimRight(extractContentText(b), "\n")
@@ -319,10 +337,10 @@ func (e *emitter) emitReadResult(b stream.Block, ref toolRef) {
 // per-token resets. The diff is computed from the saved tool-call
 // input rather than the result block, so the diff reflects what the
 // agent intended to change even when the edit failed.
-func (e *emitter) emitEditResult(b stream.Block, ref toolRef) {
-	marker := "→" // error variant was: ✗
+func (e *Emitter) emitEditResult(b stream.Block, ref toolRef) {
+	marker := markerResult
 	if b.IsError {
-		marker = "→"
+		marker = markerError
 	}
 
 	var input struct {
@@ -399,10 +417,10 @@ func pickHighlighted(lines []string, i int, fallback string) string {
 // new-file writes (the common case) and a stylised view for
 // overwrites — the `←  Write  <path>` header is the operator's cue
 // that something pre-existing may have been replaced.
-func (e *emitter) emitWriteResult(b stream.Block, ref toolRef) {
-	marker := "→" // error variant was: ✗
+func (e *Emitter) emitWriteResult(b stream.Block, ref toolRef) {
+	marker := markerResult
 	if b.IsError {
-		marker = "→"
+		marker = markerError
 	}
 
 	content := strings.TrimRight(writeContent(ref.input), "\n")
@@ -534,10 +552,10 @@ func readTarget(input json.RawMessage) string {
 // emitUserText renders a replayed user-text block (typically the
 // iteration's kickoff prompt) as a tucked-under output block — same
 // shape a Read tool response uses. Content is split on `\n`, capped
-// at [emitter.outputLines] visible lines with a `...` truncation marker
+// at [Emitter.OutputLines] visible lines with a `...` truncation marker
 // when the body runs longer, and shares the same gutter/wrap rules
 // as every other block.
-func (e *emitter) emitUserText(text string) {
+func (e *Emitter) emitUserText(text string) {
 	body := strings.TrimRight(text, "\n")
 	var lines []ui.Line
 	if body != "" {
@@ -545,17 +563,17 @@ func (e *emitter) emitUserText(text string) {
 			lines = append(lines, ui.Line{Text: strings.TrimRight(l, " \t\r"), Color: ui.Orange})
 		}
 	}
-	e.emitOutputBlock("→", lines)
+	e.emitOutputBlock(markerResult, lines)
 }
 
-// onResult handles the iteration's terminal "result" event: it
+// OnResult handles the iteration's terminal "result" event: it
 // records token usage and prints the result line with status, turn
 // count, claude's own duration estimate and self-reported cost.
-func (e *emitter) onResult(r stream.Result) {
-	e.stats.trackUsage(r.Usage)
+func (e *Emitter) OnResult(r stream.Result) {
+	e.rec.TrackUsage(r.Usage)
 
 	bits := []string{}
-	if status := decodeStatus(r.StructuredOutput); status != "" {
+	if status := DecodeStatus(r.StructuredOutput); status != "" {
 		bits = append(bits, "status="+status)
 	}
 	if r.NumTurns > 0 {
@@ -568,9 +586,9 @@ func (e *emitter) onResult(r stream.Result) {
 		bits = append(bits, fmt.Sprintf("cost=$%.4f", r.TotalCostUSD))
 	}
 
-	marker := "←" // success/error variants were: ✓ / ✗
+	marker := markerSummary
 	if r.IsError {
-		marker = "←"
+		marker = markerSummaryError
 	}
 	content := "result"
 	if len(bits) > 0 {
@@ -579,10 +597,10 @@ func (e *emitter) onResult(r stream.Result) {
 	ui.Decorate(e.out, marker, content)
 }
 
-// onSystem handles "system" events: session boot, model selection,
+// OnSystem handles "system" events: session boot, model selection,
 // permission mode, tool list, etc.
-func (e *emitter) onSystem(s stream.System) {
-	if !e.verbose {
+func (e *Emitter) OnSystem(s stream.System) {
+	if !e.Verbose {
 		return
 	}
 	subtype := s.Subtype
@@ -608,13 +626,13 @@ func (e *emitter) onSystem(s stream.System) {
 	if len(bits) > 0 {
 		content += "  " + strings.Join(bits, "  ")
 	}
-	ui.Decorate(e.out, "←", content) // was: #
+	ui.Decorate(e.out, markerCall, content)
 }
 
-// onRateLimit reports the rate-limit envelope claude attaches to some
+// OnRateLimit reports the rate-limit envelope claude attaches to some
 // events. The fields surfaced match the Ruby driver's set.
-func (e *emitter) onRateLimit(r stream.RateLimit) {
-	if !e.verbose {
+func (e *Emitter) OnRateLimit(r stream.RateLimit) {
+	if !e.Verbose {
 		return
 	}
 	info := r.Info
@@ -643,13 +661,13 @@ func (e *emitter) onRateLimit(r stream.RateLimit) {
 	if len(bits) > 0 {
 		content += "  " + strings.Join(bits, "  ")
 	}
-	ui.Decorate(e.out, "←", content) // was: ⚠
+	ui.Decorate(e.out, markerCall, content)
 }
 
-// decodeStatus extracts the schema-constrained status field from a
+// DecodeStatus extracts the schema-constrained status field from a
 // raw structured-output payload. Returns an empty string for any
 // shape that doesn't match the expected envelope.
-func decodeStatus(raw json.RawMessage) string {
+func DecodeStatus(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}

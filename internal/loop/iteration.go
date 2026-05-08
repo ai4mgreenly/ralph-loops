@@ -1,7 +1,6 @@
 package loop
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,8 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/render"
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
@@ -22,15 +23,6 @@ var claudeBinary = "claude"
 // before ralph gives up on the current iteration. Matches the Ruby
 // driver.
 const maxRetriesPerIteration = 3
-
-// scannerInitialBuffer / scannerMaxBuffer size the bufio.Scanner used
-// to read claude's stream-json output. Individual events can be quite
-// large (a tool result with a long Read or Bash payload), so the
-// upper bound is generous.
-const (
-	scannerInitialBuffer = 64 * 1024
-	scannerMaxBuffer     = 16 * 1024 * 1024
-)
 
 // errBadStructuredOutput is returned when a result event's
 // structured_output is missing or fails the schema. The outer retry
@@ -50,12 +42,22 @@ var errStreamEnded = errors.New("claude stream ended without result")
 //
 // Cancellation of ctx (timeout or SIGINT) sends SIGINT to claude and
 // waits for it to wind down before returning ctx.Err().
-func runIteration(ctx context.Context, cfg Config, e *emitter, s *stats) (string, error) {
+func runIteration(ctx context.Context, cfg Config, e *render.Emitter, s *stats) (string, error) {
 	cmd := exec.CommandContext(ctx, claudeBinary, buildArgs(cfg)...)
 	cmd.Env = buildEnv(cfg)
 	cmd.Dir = cfg.WorkDir
 	cmd.Stderr = os.Stderr
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	// Put claude into its own process group so we can signal the entire
+	// subtree (claude plus any tool grandchildren). cmd.Cancel sends
+	// SIGINT to -pgid, the canonical "kill the whole pipeline" target;
+	// WaitDelay then escalates to SIGKILL if the group hasn't exited.
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return signalProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+	}
 	cmd.WaitDelay = 10 * time.Second
 
 	stdin, err := cmd.StdinPipe()
@@ -70,11 +72,10 @@ func runIteration(ctx context.Context, cfg Config, e *emitter, s *stats) (string
 		return "", fmt.Errorf("start %s: %w", claudeBinary, err)
 	}
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, scannerInitialBuffer), scannerMaxBuffer)
-	e.resetIteration()
+	r := stream.NewReader(stdout)
+	e.ResetIteration()
 
-	status, runErr := pumpStream(scanner, stdin, e, s, cfg.Prompt)
+	status, runErr := pumpStream(ctx, r, stdin, e, s, cfg.Prompt)
 
 	// Always close stdin so claude can exit cleanly, then wait. We
 	// surface ctx errors first because they tell the operator whether
@@ -89,22 +90,33 @@ func runIteration(ctx context.Context, cfg Config, e *emitter, s *stats) (string
 		return "", runErr
 	}
 	if waitErr != nil {
-		// Non-zero exits after a clean status are tolerated; claude
-		// sometimes exits 1 even when the iteration succeeded.
-		if status == "" {
-			return "", fmt.Errorf("claude exited: %w", waitErr)
+		// Narrow the failure-tolerance window to documented cases: claude
+		// is known to exit 0 or 1 even when the iteration produced a
+		// well-formed result. Anything else (signal death, exit codes
+		// >1) bubbles up.
+		var ee *exec.ExitError
+		if errors.As(waitErr, &ee) {
+			code := ee.ExitCode()
+			if (code == 0 || code == 1) && status != "" {
+				return status, nil
+			}
+			return "", fmt.Errorf("claude exited with status %d: %w", code, waitErr)
 		}
+		return "", fmt.Errorf("claude exited: %w", waitErr)
 	}
 	return status, nil
 }
 
 // pumpStream sends the kickoff message, then alternates between
 // reading events and (on a malformed result) sending corrections, up
-// to [maxRetriesPerIteration] times.
+// to [maxRetriesPerIteration] times. ctx is honored between retry
+// attempts so an operator interrupt isn't held up by a queued
+// correction round.
 func pumpStream(
-	scanner *bufio.Scanner,
+	ctx context.Context,
+	r *stream.Reader,
 	stdin io.Writer,
-	e *emitter,
+	e *render.Emitter,
 	s *stats,
 	prompt string,
 ) (string, error) {
@@ -113,7 +125,7 @@ func pumpStream(
 	}
 
 	for retry := 0; ; retry++ {
-		status, err := readUntilResult(scanner, e, s)
+		status, err := readUntilResult(r, e, s)
 		if err == nil {
 			return status, nil
 		}
@@ -123,73 +135,68 @@ func pumpStream(
 		if retry >= maxRetriesPerIteration {
 			return "", fmt.Errorf("%w after %d retries", err, retry)
 		}
+		// Respect cancellation between attempts. The scanner itself
+		// isn't context-aware, but at least the retry loop won't queue
+		// another correction once the operator has hit Ctrl-C.
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
 		if cErr := writeUserMessage(stdin, correctionMessage(err)); cErr != nil {
 			return "", fmt.Errorf("send correction: %w", cErr)
 		}
 	}
 }
 
-// readUntilResult drains the scanner until a result event arrives.
-// Each event is dispatched into the emitter and tallied in stats. A
-// missing or malformed structured_output returns
-// [errBadStructuredOutput] so the caller can retry.
-func readUntilResult(scanner *bufio.Scanner, e *emitter, s *stats) (string, error) {
+// readUntilResult drains r until a result event arrives. Each event
+// is dispatched into the emitter and tallied in stats. A missing or
+// malformed structured_output returns [errBadStructuredOutput] so the
+// caller can retry. Unrecognised event types and unparseable lines
+// are surfaced verbatim and decoding resumes on the next line, so a
+// new event kind from claude does not abort the iteration.
+func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, error) {
 	for {
-		e.spinner.Start()
-		ok := scanner.Scan()
-		e.spinner.Stop()
-		if !ok {
-			break
+		e.Spinner.Start()
+		ev, err := r.Next()
+		e.Spinner.Stop()
+		if errors.Is(err, io.EOF) {
+			return "", errStreamEnded
 		}
-		line := scanner.Bytes()
-		var raw stream.RawEvent
-		if err := json.Unmarshal(line, &raw); err != nil {
-			// Pass unparseable lines through verbatim so the operator
-			// retains full visibility into what claude is emitting.
-			fmt.Fprintf(os.Stdout, "%s\n\n", line)
-			continue
+		if err != nil {
+			// Forward-compat and resilience: log the offending line so
+			// the operator retains full visibility, then keep reading.
+			var de *stream.DecodeError
+			if errors.As(err, &de) {
+				fmt.Fprintf(os.Stdout, "%s\n\n", de.Bytes)
+				continue
+			}
+			return "", fmt.Errorf("read stream: %w", err)
 		}
 
-		s.tallyEvent(raw.Type)
+		s.tallyEvent(ev.Kind())
 
-		switch raw.Type {
-		case stream.TypeAssistant:
-			var ev stream.Assistant
-			if err := json.Unmarshal(raw.Payload, &ev); err == nil {
-				e.onAssistant(ev)
-			}
-		case stream.TypeUser:
-			var ev stream.User
-			if err := json.Unmarshal(raw.Payload, &ev); err == nil {
-				e.onUser(ev)
-			}
-		case stream.TypeResult:
-			var ev stream.Result
-			if err := json.Unmarshal(raw.Payload, &ev); err != nil {
-				return "", fmt.Errorf("decode result event: %w", err)
-			}
-			e.onResult(ev)
-			status := decodeStatus(ev.StructuredOutput)
+		switch ev := ev.(type) {
+		case stream.Assistant:
+			e.OnAssistant(ev)
+		case stream.User:
+			e.OnUser(ev)
+		case stream.Result:
+			e.OnResult(ev)
+			status := render.DecodeStatus(ev.StructuredOutput)
 			if status != stream.StatusDone && status != stream.StatusContinue {
 				return "", errBadStructuredOutput
 			}
 			return status, nil
-		case stream.TypeSystem:
-			var ev stream.System
-			if err := json.Unmarshal(raw.Payload, &ev); err == nil {
-				e.onSystem(ev)
-			}
-		case stream.TypeRateLimit:
-			var ev stream.RateLimit
-			if err := json.Unmarshal(raw.Payload, &ev); err == nil {
-				e.onRateLimit(ev)
-			}
+		case stream.System:
+			e.OnSystem(ev)
+		case stream.RateLimit:
+			e.OnRateLimit(ev)
+		case stream.UnknownEvent:
+			// Already tallied; the bad-type error path can't reach
+			// here because Reader.Next pairs unknowns with an error.
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("read stream: %w", err)
-	}
-	return "", errStreamEnded
 }
 
 // buildArgs constructs the command-line for a single claude
@@ -267,6 +274,21 @@ func writeUserMessage(w io.Writer, text string) error {
 		return fmt.Errorf("write user message: %w", err)
 	}
 	return nil
+}
+
+// setProcessGroup arranges for cmd to run in its own process group so
+// signals delivered to -pgid reach the entire subtree (claude plus any
+// tool grandchildren). Unix-only; the syscall.SysProcAttr.Setpgid
+// field is not portable to Windows, but ralph is Unix-only.
+func setProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+// signalProcessGroup sends sig to the process group whose leader has
+// the given pid. Negating the pid is the syscall.Kill convention for
+// "deliver to every member of the group."
+func signalProcessGroup(pid int, sig syscall.Signal) error {
+	return syscall.Kill(-pid, sig)
 }
 
 // correctionMessage produces the natural-language nudge sent to

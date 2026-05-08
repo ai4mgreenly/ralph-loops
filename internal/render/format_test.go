@@ -1,4 +1,4 @@
-package loop
+package render
 
 import (
 	"encoding/json"
@@ -69,6 +69,47 @@ func TestFormatToolCallParam(t *testing.T) {
 			got := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
 			if got != tc.want {
 				t.Errorf("formatToolCallParam(%q, %s) = %q, want %q", tc.tool, tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatToolCallParam_DeterministicFallback exercises the
+// "missing primary key" and "unknown tool" branches that fall back to
+// "first key in input". Go's map iteration order is randomized, so a
+// naïve `for k := range m { return k }` made the formatter's output
+// non-deterministic across runs. Run the formatter many times against
+// the same multi-key input and assert every call returns the same
+// string.
+func TestFormatToolCallParam_DeterministicFallback(t *testing.T) {
+	cases := []struct {
+		name  string
+		tool  string
+		input string
+	}{
+		{
+			name:  "missing primary key chooses sorted-first",
+			tool:  "Bash",
+			input: `{"timeout":5000,"shell":"zsh","quiet":true,"abort":false}`,
+		},
+		{
+			name:  "unknown tool falls back to sorted-first key",
+			tool:  "WeirdTool",
+			input: `{"zeta":1,"alpha":2,"middle":3,"yankee":4}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			first := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
+			if first == "" {
+				t.Fatalf("expected non-empty result, got empty for input %s", tc.input)
+			}
+			for i := 0; i < 200; i++ {
+				got := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
+				if got != first {
+					t.Fatalf("nondeterministic output: iteration %d returned %q, first call returned %q (input %s)", i, got, first, tc.input)
+				}
 			}
 		})
 	}
