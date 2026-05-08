@@ -48,6 +48,26 @@ That means:
   no required filenames. `OVERVIEW.md` is a useful entry point by
   convention, nothing more.
 
+## The spec can be as big as it needs to be
+
+Don't shrink the spec to "fit" in a build iteration. Ralph re-reads
+the entire `reqs/` tree on every iteration of its loop and works on
+exactly one requirement — one ID — per iteration: the smallest
+unverified slice it can find. A 5-requirement spec runs for roughly 5
+iterations; a 500-requirement spec runs for roughly 500. Spec size
+doesn't strain any single iteration. **Ralph is responsible for
+slicing the work into iteration-sized pieces, not you.**
+
+So: if the user wants 200 requirements, write 200 requirements. Don't
+truncate, don't summarize, don't refuse on grounds of scope. The
+build agent will pick them off one at a time across many iterations.
+
+The one thing that *does* matter for sizing is the granularity of an
+individual requirement. If a single requirement feels too big to
+verify in one iteration ("the system is fast", "the UI is good"),
+that's a sign the *requirement* should be split into finer testable
+claims — not that the spec overall should be trimmed.
+
 ## Requirement IDs
 
 Concrete requirements are tagged with IDs of the form `R-XXXX-XXXX` —
