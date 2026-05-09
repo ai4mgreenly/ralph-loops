@@ -28,9 +28,17 @@ import (
 var version = "dev"
 
 // promptTemplate is the operator prompt sent to claude at the start of
-// every iteration. It is embedded from prompt.md at build time; see that
-// file's header for the supported `{{REQS}}` and `{{WORKDIR}}` template
-// substitutions and instructions for testing prompt changes.
+// every iteration. It is embedded from prompt.md at build time, then
+// passed through literal string substitution before being sent as the
+// kickoff message. Supported placeholders:
+//
+//	{{REQS}}     replaced with the value of --reqs (default "reqs")
+//	{{WORKDIR}}  replaced with the WORKDIR positional argument
+//
+// Any other `{{...}}` token is sent through verbatim. To test changes,
+// edit prompt.md, run `make build`, and invoke `bin/ralph` against a
+// scratch directory; unit tests for the substitution logic live in
+// cmd/ralph.
 //
 //go:embed prompt.md
 var promptTemplate string
