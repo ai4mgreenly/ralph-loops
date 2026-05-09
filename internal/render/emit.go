@@ -273,8 +273,12 @@ func (e *Emitter) emitToolCall(b stream.Block) {
 // clean left edge. Per-line colour is applied after wrapping so ANSI
 // escapes do not count toward the wrap budget. When more than
 // [Emitter.OutputLines] input lines are supplied the overflow is
-// dropped and a `...` line is appended.
+// dropped and a `...` line is appended. An empty lines slice emits
+// nothing — a bare marker line carries no signal for the operator.
 func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
+	if len(lines) == 0 {
+		return
+	}
 	maxLines := e.outputLines
 	if maxLines <= 0 {
 		maxLines = defaultOutputLines

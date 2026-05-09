@@ -378,6 +378,36 @@ func TestEmitter_BashErrorUsesErrorMarker(t *testing.T) {
 	}
 }
 
+// TestEmitter_BashEmptyResultRendersNothing pins the regression where
+// a bash result with no captured stdout/stderr (common when the
+// command fails before any output reaches the tool result envelope)
+// was rendering as a bare error marker on its own line. Empty content
+// must produce no output at all.
+func TestEmitter_BashEmptyResultRendersNothing(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+		{
+			Type:  stream.BlockToolUse,
+			ID:    "tool_1",
+			Name:  "Bash",
+			Input: json.RawMessage(`{"command":"ls /does/not/exist"}`),
+		},
+	}}})
+	buf.Reset()
+
+	e.OnUser(stream.User{
+		Message: stream.Message{Content: []stream.Block{
+			{Type: stream.BlockToolResult, ToolUseID: "tool_1", IsError: true},
+		}},
+		ToolUseResult: json.RawMessage(`{"stdout":"","stderr":""}`),
+	})
+
+	if got := buf.String(); got != "" {
+		t.Errorf("empty bash result should render nothing, got:\n%s", got)
+	}
+}
+
 // TestEmitter_ReadResultStripsLineNumbers exercises emitReadResult by
 // pairing a Read tool_use with a tool_result whose `content` is the
 // agent's `cat -n`-style line-numbered text. The result block must
