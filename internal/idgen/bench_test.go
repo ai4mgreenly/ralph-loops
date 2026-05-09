@@ -15,7 +15,7 @@ import (
 func BenchmarkNewAt(b *testing.B) {
 	t := time.Date(2025, time.June, 1, 12, 0, 0, 0, time.UTC)
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = idgen.NewAt(t)
 	}
 }

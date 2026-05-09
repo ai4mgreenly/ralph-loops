@@ -5,17 +5,20 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/agent"
+	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
 func TestRun_RejectsEmptyConfig(t *testing.T) {
-	err := Run(Config{})
+	err := Run(context.Background(), Config{})
 	if err == nil {
 		t.Fatal("expected error from empty Config, got nil")
 	}
@@ -29,8 +32,7 @@ func TestRun_RejectsEmptyConfig(t *testing.T) {
 
 func TestRun_RejectsNegativeDuration(t *testing.T) {
 	cfg := minimalValidConfig()
-	cfg.Duration = -1 * time.Second
-	err := Run(cfg)
+	err := Run(context.Background(), cfg, WithDuration(-1*time.Second))
 	if err == nil {
 		t.Fatal("expected error for negative duration")
 	}
@@ -78,7 +80,6 @@ func TestCtxExit_TranslatesContextErrors(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			gotReason, gotErr := ctxExit(tc.err)
@@ -142,15 +143,96 @@ func TestInstallForceQuit_SecondSIGINTCallsQuit(t *testing.T) {
 	}
 }
 
+// blockingSpawner returns a [Session] whose Events reader blocks
+// until the spawn-context fires; the reader then returns EOF and
+// the loop observes the parent ctx.Err to classify the exit.
+// Used to drive Run's timeout / interrupt paths without busy-waiting.
+type blockingSpawner struct{}
+
+func (blockingSpawner) Spawn(ctx context.Context, _ agent.Config) (Session, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		<-ctx.Done()
+		_ = pw.Close()
+	}()
+	return &fakeSession{
+		spawner: &fakeSpawner{},
+		reader:  stream.NewReader(pr),
+	}, nil
+}
+
+func TestRun_TimeoutReturnsErrTimedOut(t *testing.T) {
+	cfg := minimalValidConfig()
+	tmp := t.TempDir()
+	err := Run(context.Background(), cfg,
+		WithDuration(50*time.Millisecond),
+		WithSpawner(blockingSpawner{}),
+		WithResultsHome(tmp),
+	)
+	if !errors.Is(err, ErrTimedOut) {
+		t.Fatalf("expected ErrTimedOut, got %v", err)
+	}
+
+	body, ferr := os.ReadFile(filepath.Join(tmp, "results.jsonl"))
+	if ferr != nil {
+		t.Fatalf("read jsonl: %v", ferr)
+	}
+	if !strings.Contains(string(body), `"exit":"timeout"`) {
+		t.Errorf("expected exit=timeout in jsonl, got: %s", body)
+	}
+}
+
+func TestRun_CancelReturnsErrInterrupted(t *testing.T) {
+	cfg := minimalValidConfig()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel before Run begins
+	err := Run(ctx, cfg,
+		WithSpawner(blockingSpawner{}),
+		WithResultsHome(t.TempDir()),
+	)
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("expected ErrInterrupted, got %v", err)
+	}
+}
+
+func TestRun_WritesResultsJSONL(t *testing.T) {
+	cfg := minimalValidConfig()
+	tmp := t.TempDir()
+	sp := &fakeSpawner{scripts: [][]byte{[]byte(doneScript)}}
+	err := Run(context.Background(), cfg,
+		WithSpawner(sp),
+		WithResultsHome(tmp),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	body, ferr := os.ReadFile(filepath.Join(tmp, "results.jsonl"))
+	if ferr != nil {
+		t.Fatalf("read jsonl: %v", ferr)
+	}
+	if !strings.Contains(string(body), `"exit":"done"`) {
+		t.Errorf("expected exit=done, got: %s", body)
+	}
+	if n := strings.Count(strings.TrimRight(string(body), "\n"), "\n"); n != 0 {
+		t.Errorf("expected exactly one record line, found %d extras", n)
+	}
+}
+
 func minimalValidConfig() Config {
 	return Config{
-		ReqsDir:  "reqs",
-		WorkDir:  ".",
-		Model:    "opus",
-		Effort:   "medium",
-		Duration: time.Hour,
-		Prompt:   "operator prompt",
-		Version:  "test",
-		Theme:    ui.NewThemeWith(false, 0),
+		ReqsDir: "reqs",
+		WorkDir: ".",
+		Prompt:  "operator prompt",
+		Theme:   ui.NewThemeWith(false, 0),
 	}
+}
+
+// withDuration is a test helper that produces an [options] value with
+// [defaultOptions] plus a wall-clock budget. The runWith kernel takes
+// resolved options as a struct (not as []Option), so tests build the
+// struct directly rather than going through the public Option API.
+func withDuration(d time.Duration) options {
+	o := defaultOptions()
+	o.duration = d
+	return o
 }

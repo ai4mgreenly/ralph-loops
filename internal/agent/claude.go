@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +15,8 @@ import (
 )
 
 // claudeBinary is the executable name the production spawner runs.
-// Tests substitute by constructing claudeSpawner directly.
+// Tests can construct a Spawner with a different binary to exercise
+// process plumbing without invoking the real CLI.
 const claudeBinary = "claude"
 
 // waitDelay caps how long [exec.Cmd.Wait] will block after the
@@ -24,29 +24,59 @@ const claudeBinary = "claude"
 // the runtime escalates to SIGKILL on the process group.
 const waitDelay = 10 * time.Second
 
-// NewClaude returns the production [*Claude] that runs the `claude`
+// closeGrace is the upper bound [Session.Close] waits for the
+// stdout-drain goroutine to reach EOF before escalating to SIGKILL on
+// the process. It exists so a child stuck mid-write cannot wedge the
+// loop forever; five seconds is comfortably longer than any tool
+// response observed in practice.
+const closeGrace = 5 * time.Second
+
+// NewSpawner returns the production [*Spawner] that runs the `claude`
 // CLI from $PATH. Each Spawn invokes the binary anew; nothing is
-// cached between iterations. Callers in the loop package wrap the
-// return value in their own Spawner adapter.
-func NewClaude() *Claude {
-	return &Claude{binary: claudeBinary}
+// cached between iterations.
+func NewSpawner() *Spawner {
+	return &Spawner{binary: claudeBinary, Stderr: os.Stderr}
 }
 
-// Claude is the production agent: its Spawn method launches the real
-// `claude` CLI as a child process. Construct via [NewClaude].
-type Claude struct {
+// newSpawnerWithBinary is the test seam used by integration tests in
+// this package: it returns a [*Spawner] that runs the named binary
+// (typically the test binary itself in re-exec mode) instead of the
+// production claude CLI. Production code constructs spawners via
+// [NewSpawner] and never sees this constructor.
+func newSpawnerWithBinary(path string, args ...string) *Spawner {
+	return &Spawner{binary: path, extraArgs: args, Stderr: os.Stderr}
+}
+
+// Spawner launches one claude process per Spawn call and returns a
+// [Session] that owns its stdin pipe, stream.Reader, and lifecycle.
+// Construct via [NewSpawner].
+type Spawner struct {
 	binary string
+	// extraArgs is prepended to the per-spawn argument list and is only
+	// populated by the test-only [newSpawnerWithBinary]: it lets tests
+	// thread re-exec sentinels (e.g. -test.run=TestHelperProcess) into
+	// the child without disturbing the [buildArgs] shape.
+	extraArgs []string
+
+	// Stderr is the writer the spawned process's stderr is connected to.
+	// A nil value defaults to [os.Stderr] at Spawn time so callers can
+	// leave it unset; tests typically redirect to a [bytes.Buffer].
+	Stderr io.Writer
 }
 
-// Spawn launches one claude process and returns a session that owns
-// its stdin pipe, stream.Reader, and lifecycle. ctx is wired through
-// [exec.CommandContext]: cancelling it triggers SIGINT to the whole
-// process group.
-func (s *Claude) Spawn(ctx context.Context, cfg Config) (*ClaudeSession, error) {
-	cmd := exec.CommandContext(ctx, s.binary, buildArgs(cfg)...)
+// Spawn launches one claude process and returns a [Session]. ctx is
+// wired through [exec.CommandContext]: cancelling it triggers SIGINT
+// to the whole process group, with SIGKILL escalation after [waitDelay].
+func (c *Spawner) Spawn(ctx context.Context, cfg Config) (Session, error) {
+	args := append(append([]string(nil), c.extraArgs...), buildArgs(cfg)...)
+	cmd := exec.CommandContext(ctx, c.binary, args...)
 	cmd.Env = buildEnv(cfg)
 	cmd.Dir = cfg.WorkDir
-	cmd.Stderr = os.Stderr
+	if c.Stderr != nil {
+		cmd.Stderr = c.Stderr
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 
 	// Put claude into its own process group so we can signal the entire
 	// subtree (claude plus any tool grandchildren). cmd.Cancel sends
@@ -72,10 +102,11 @@ func (s *Claude) Spawn(ctx context.Context, cfg Config) (*ClaudeSession, error) 
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
-		return nil, fmt.Errorf("start %s: %w", s.binary, err)
+		_ = stdout.Close()
+		return nil, fmt.Errorf("start %s: %w", c.binary, err)
 	}
 
-	return &ClaudeSession{
+	return &claudeSession{
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: stdout,
@@ -83,7 +114,9 @@ func (s *Claude) Spawn(ctx context.Context, cfg Config) (*ClaudeSession, error) 
 	}, nil
 }
 
-type ClaudeSession struct {
+// claudeSession is the production [Session] implementation; it wraps
+// one running claude subprocess.
+type claudeSession struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
@@ -93,24 +126,44 @@ type ClaudeSession struct {
 	closeErr  error
 }
 
-func (s *ClaudeSession) Events() *stream.Reader { return s.reader }
+func (s *claudeSession) Events() *stream.Reader { return s.reader }
 
-func (s *ClaudeSession) Send(text string) error {
-	return writeUserMessage(s.stdin, text)
+func (s *claudeSession) Send(text string) error {
+	return stream.WriteUserMessage(s.stdin, text)
 }
 
 // Close closes stdin (so claude can exit cleanly), waits for the
 // process to reap, and translates the wait outcome into the package's
 // public error contract. Subsequent calls return the original result.
-func (s *ClaudeSession) Close() error {
+//
+// To bound the wait, Close drains any remaining stdout in a goroutine
+// and arms a [time.AfterFunc] that escalates to a hard kill of the
+// process if EOF has not arrived after [closeGrace]. exec.Cmd.Wait
+// requires StdoutPipe readers to reach EOF before it can reap the
+// child, so a stuck producer would otherwise wedge here forever.
+func (s *claudeSession) Close() error {
 	s.closeOnce.Do(func() {
 		_ = s.stdin.Close()
-		// exec.Cmd documents that Wait must not be called until all
-		// reads from a StdoutPipe have completed; otherwise the pipe's
-		// reader can deadlock against Wait closing it. Drain to EOF
-		// before reaping so cancellation paths (where the iteration
-		// stopped reading mid-stream) cannot wedge here.
-		_, _ = io.Copy(io.Discard, s.stdout)
+
+		// Drain stdout to EOF in a goroutine. exec.Cmd.Wait will not
+		// return until every reader of a StdoutPipe has reached EOF, so
+		// we must consume whatever the child still has buffered before
+		// reaping. A misbehaving child could keep us here indefinitely;
+		// the AfterFunc below is the escalation backstop.
+		drainDone := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, s.stdout)
+			close(drainDone)
+		}()
+
+		killer := time.AfterFunc(closeGrace, func() {
+			if s.cmd.Process != nil {
+				_ = s.cmd.Process.Kill()
+			}
+		})
+		<-drainDone
+		killer.Stop()
+
 		s.closeErr = translateWaitErr(s.cmd.Wait())
 	})
 	return s.closeErr
@@ -118,59 +171,22 @@ func (s *ClaudeSession) Close() error {
 
 // translateWaitErr maps an [exec.Cmd.Wait] error into the agent
 // package's public error vocabulary: nil for a clean exit, *[ExitError]
-// for a non-zero exit, the original error wrapped otherwise (signal
-// death, runtime issues).
+// for a non-zero exit (or signal death), the original error wrapped
+// otherwise.
 func translateWaitErr(err error) error {
 	if err == nil {
 		return nil
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		return &ExitError{Code: ee.ExitCode()}
+		out := &ExitError{Code: ee.ExitCode()}
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			out.Signaled = true
+			out.Signal = ws.Signal()
+		}
+		return out
 	}
 	return err
-}
-
-// messageContent is one content block inside a user message. The only
-// kind ralph emits is "text".
-type messageContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-// messagePayload is the inner Message field of a user-message envelope.
-type messagePayload struct {
-	Role    string           `json:"role"`
-	Content []messageContent `json:"content"`
-}
-
-// userMessage is the wire-format envelope for a single stream-json
-// user message line written to claude's stdin.
-type userMessage struct {
-	Type    string         `json:"type"`
-	Message messagePayload `json:"message"`
-}
-
-// writeUserMessage writes a single stream-json user message line to
-// w, terminated with a newline as required by the protocol.
-func writeUserMessage(w io.Writer, text string) error {
-	msg := userMessage{
-		Type: "user",
-		Message: messagePayload{
-			Role:    "user",
-			Content: []messageContent{{Type: "text", Text: text}},
-		},
-	}
-
-	encoded, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal user message: %w", err)
-	}
-	encoded = append(encoded, '\n')
-	if _, err := w.Write(encoded); err != nil {
-		return fmt.Errorf("write user message: %w", err)
-	}
-	return nil
 }
 
 // buildArgs constructs the command-line for a single claude

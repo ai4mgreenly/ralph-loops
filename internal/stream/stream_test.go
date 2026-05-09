@@ -102,7 +102,7 @@ func TestReader_DispatchesAllKnownTypes(t *testing.T) {
 		t.Errorf("result payload wrong: %+v", res)
 	}
 	var so stream.StatusOutput
-	if err := json.Unmarshal(res.StructuredOutput, &so); err != nil || so.Status != stream.StatusDone {
+	if err := json.Unmarshal(res.StructuredOutput, &so); err != nil || so.Status != stream.StatusDone.String() {
 		t.Errorf("structured_output decode wrong: %v %q", err, so.Status)
 	}
 
@@ -230,8 +230,8 @@ func TestReader_ResultStructuredOutput(t *testing.T) {
 	if err := json.Unmarshal(res.StructuredOutput, &so); err != nil {
 		t.Fatal(err)
 	}
-	if so.Status != stream.StatusContinue {
-		t.Errorf("Status = %q, want %q", so.Status, stream.StatusContinue)
+	if so.Status != stream.StatusContinue.String() {
+		t.Errorf("Status = %q, want %q", so.Status, stream.StatusContinue.String())
 	}
 }
 
@@ -256,10 +256,51 @@ func TestSchemaJSONIsValid(t *testing.T) {
 	if err := json.Unmarshal([]byte(stream.SchemaJSON), &v); err != nil {
 		t.Fatalf("SchemaJSON does not parse: %v", err)
 	}
-	if !strings.Contains(stream.SchemaJSON, stream.StatusDone) ||
-		!strings.Contains(stream.SchemaJSON, stream.StatusContinue) {
+	if !strings.Contains(stream.SchemaJSON, stream.StatusDone.String()) ||
+		!strings.Contains(stream.SchemaJSON, stream.StatusContinue.String()) {
 		t.Errorf("SchemaJSON should constrain status to %q and %q",
-			stream.StatusDone, stream.StatusContinue)
+			stream.StatusDone.String(), stream.StatusContinue.String())
+	}
+}
+
+// TestWriteUserMessage_Framing exercises the user-message envelope used
+// to feed claude on stdin: the framing must end with a newline and the
+// envelope must round-trip through json.Unmarshal with the original
+// text intact.
+func TestWriteUserMessage_Framing(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := stream.WriteUserMessage(&buf, "hello"); err != nil {
+		t.Fatalf("WriteUserMessage: %v", err)
+	}
+	out := buf.Bytes()
+	if !bytes.HasSuffix(out, []byte("\n")) {
+		t.Fatalf("user message must end with newline, got %q", out)
+	}
+
+	// Round-trip through a generic shape (the envelope types are
+	// unexported in stream; an any-typed decode is enough to assert
+	// the on-the-wire structure).
+	var decoded struct {
+		Type    string `json:"type"`
+		Message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(bytes.TrimRight(out, "\n"), &decoded); err != nil {
+		t.Fatalf("unmarshal written line: %v", err)
+	}
+	if decoded.Type != "user" || decoded.Message.Role != "user" {
+		t.Errorf("envelope roles wrong: %+v", decoded)
+	}
+	if len(decoded.Message.Content) != 1 ||
+		decoded.Message.Content[0].Type != "text" ||
+		decoded.Message.Content[0].Text != "hello" {
+		t.Errorf("content not preserved: %+v", decoded.Message.Content)
 	}
 }
 
@@ -267,10 +308,19 @@ func TestSchemaJSONIsValid(t *testing.T) {
 // strings.
 func TestStatusConstants(t *testing.T) {
 	t.Parallel()
-	if stream.StatusDone != "DONE" {
-		t.Errorf("StatusDone = %q", stream.StatusDone)
+	if stream.StatusDone.String() != "DONE" {
+		t.Errorf("StatusDone = %q", stream.StatusDone.String())
 	}
-	if stream.StatusContinue != "CONTINUE" {
-		t.Errorf("StatusContinue = %q", stream.StatusContinue)
+	if stream.StatusContinue.String() != "CONTINUE" {
+		t.Errorf("StatusContinue = %q", stream.StatusContinue.String())
+	}
+	if stream.StatusUnknown.String() != "" {
+		t.Errorf("StatusUnknown should print as empty, got %q", stream.StatusUnknown.String())
+	}
+	if got, ok := stream.ParseStatus("DONE"); !ok || got != stream.StatusDone {
+		t.Errorf("ParseStatus(DONE) = (%v, %v), want (StatusDone, true)", got, ok)
+	}
+	if got, ok := stream.ParseStatus("nope"); ok || got != stream.StatusUnknown {
+		t.Errorf("ParseStatus(nope) = (%v, %v), want (StatusUnknown, false)", got, ok)
 	}
 }

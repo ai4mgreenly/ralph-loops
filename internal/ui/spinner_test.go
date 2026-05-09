@@ -141,20 +141,30 @@ func (c *fakeClock) fireTick() bool {
 	}
 }
 
-// waitFor polls fn until it returns true or timeout elapses. Used to
-// synchronize on the spinner goroutine reaching the next blocking
-// step (calling After / NewTicker), since those calls happen inside a
-// goroutine the test does not own.
-func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
+// awaitPaint blocks on paintCh for one progress notch, failing the
+// test on timeout. Replaces the millisecond-poll loop the suite used
+// before the [Spinner] grew a paint-notification seam.
+func awaitPaint(t *testing.T, paintCh <-chan struct{}) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if fn() {
+	select {
+	case <-paintCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for paint notification")
+	}
+}
+
+// drainPaint pulls every queued paint notification off ch without
+// blocking. Used by [TestSpinner_StartStopReusable] between cycles
+// so a stale notch from the previous Start/Stop doesn't be consumed
+// by the next iteration's awaitPaint.
+func drainPaint(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
 			return
 		}
-		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("waitFor timed out after %v", timeout)
 }
 
 func TestSpinner_FormatElapsed_AllRanges(t *testing.T) {
@@ -207,19 +217,17 @@ func TestSpinner_SilentBeforeDelay(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "waiting", false)
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	s.Start()
-	// Wait for the goroutine to actually call After (otherwise Stop
-	// could win the race before the goroutine hits its select).
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.afterCh != nil
-	})
+	// Wait for the goroutine to install After (paint notch #1) so
+	// Stop doesn't win the race before the goroutine hits its select.
+	awaitPaint(t, paintCh)
 	s.Stop()
 
 	if buf.Len() != 0 {
@@ -234,31 +242,23 @@ func TestSpinner_PaintsAfterPreRoll(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "waiting for claude", false)
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	s.Start()
-	// Wait for After to be installed, then advance the fake clock by
-	// the spinner's delay so the elapsed-time annotation comes back as
-	// "3s", and fire the pre-roll.
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.afterCh != nil
-	})
+	// Notch 1: After installed.
+	awaitPaint(t, paintCh)
 	clk.advance(s.delay)
 	if !clk.firePreRoll() {
 		t.Fatal("pre-roll fire returned false")
 	}
-	// Wait for NewTicker to be installed (the goroutine paints once
-	// then enters the ticker select).
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.tickCh != nil
-	})
+	// Notch 2: first paint complete. Notch 3: ticker installed.
+	awaitPaint(t, paintCh)
+	awaitPaint(t, paintCh)
 
 	s.Stop()
 
@@ -285,18 +285,16 @@ func TestSpinner_StopBeforeFirstPaint(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "waiting", false)
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	s.Start()
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.afterCh != nil
-	})
-	s.Stop() // before firing pre-roll
+	awaitPaint(t, paintCh) // After installed
+	s.Stop()               // before firing pre-roll
 
 	if buf.Len() != 0 {
 		t.Errorf("spinner stopped before paint should leave nothing on stdout, got %q", buf.String())
@@ -310,28 +308,24 @@ func TestSpinner_StartStopReusable(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "x", false)
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	for i := 0; i < 3; i++ {
 		clk.reset()
+		drainPaint(paintCh)
 		s.Start()
-		waitFor(t, time.Second, func() bool {
-			clk.mu.Lock()
-			defer clk.mu.Unlock()
-			return clk.afterCh != nil
-		})
+		awaitPaint(t, paintCh) // After installed
 		clk.advance(s.delay)
 		if !clk.firePreRoll() {
 			t.Fatalf("iteration %d: pre-roll fire returned false", i)
 		}
-		waitFor(t, time.Second, func() bool {
-			clk.mu.Lock()
-			defer clk.mu.Unlock()
-			return clk.tickCh != nil
-		})
+		awaitPaint(t, paintCh) // first paint
+		awaitPaint(t, paintCh) // ticker installed
 		s.Stop()
 	}
 	if !strings.Contains(buf.String(), "x") {
@@ -346,38 +340,27 @@ func TestSpinner_TickAdvancesFrame(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "x", false)
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	s.Start()
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.afterCh != nil
-	})
+	awaitPaint(t, paintCh) // After installed
 	clk.advance(s.delay)
 	clk.firePreRoll()
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.tickCh != nil
-	})
+	awaitPaint(t, paintCh) // first paint
+	awaitPaint(t, paintCh) // ticker installed
 
-	// Drive a few ticks, snapshotting the buffer length each time so
-	// we know each tick produced output. Polling is needed because the
-	// spinner goroutine paints asynchronously after receiving a tick.
-	prev := buf.Len()
+	// Drive a few ticks; each tick produces a paint notch.
 	for i := 0; i < 3; i++ {
 		clk.advance(s.tick)
 		if !clk.fireTick() {
 			t.Fatalf("tick %d: fire returned false", i)
 		}
-		waitFor(t, time.Second, func() bool {
-			return buf.Len() > prev
-		})
-		prev = buf.Len()
+		awaitPaint(t, paintCh)
 	}
 	s.Stop()
 
@@ -394,29 +377,6 @@ func TestSpinner_TickAdvancesFrame(t *testing.T) {
 	}
 	if len(seen) < 2 {
 		t.Errorf("ticks did not advance the frame: saw %d distinct frames in %q", len(seen), out)
-	}
-}
-
-// TestSpinner_RealClockWiring is a smoke test that the production
-// realClock plumbing actually paints — we use the same shape as the
-// rest but with the default clock and a real (short) delay. This
-// guards against a regression where the clock seam compiled but
-// realClock no longer produced ticks.
-func TestSpinner_RealClockWiring(t *testing.T) {
-	t.Parallel()
-	buf := &safeBuffer{}
-	s := NewSpinner(buf, "real", false)
-	s.enabled = true
-	s.delay = 5 * time.Millisecond
-	s.tick = 5 * time.Millisecond
-
-	s.Start()
-	time.Sleep(40 * time.Millisecond)
-	s.Stop()
-
-	out := buf.String()
-	if !strings.Contains(out, "real") {
-		t.Errorf("real-clock smoke test missing label: %q", out)
 	}
 }
 
@@ -459,6 +419,31 @@ func TestIsTTY_StatErrorOnClosedFile(t *testing.T) {
 	}
 }
 
+// TestRealClock_WiresThroughTime sanity-checks the production
+// [clock] implementation: Now returns a recent instant, After fires
+// in finite time, and NewTicker delivers a tick that we can stop.
+// Replaces the polling-based smoke test the spinner suite used
+// before the paintCh seam landed.
+func TestRealClock_WiresThroughTime(t *testing.T) {
+	t.Parallel()
+	c := realClock{}
+	if c.Now().IsZero() {
+		t.Error("realClock.Now should never return zero")
+	}
+	select {
+	case <-c.After(2 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("realClock.After did not fire")
+	}
+	tickCh, stop := c.NewTicker(1 * time.Millisecond)
+	defer stop()
+	select {
+	case <-tickCh:
+	case <-time.After(time.Second):
+		t.Fatal("realClock.NewTicker did not fire")
+	}
+}
+
 // TestSpinner_DoubleStartIgnored covers the running.CompareAndSwap
 // false branch in Start: a second Start call while the spinner is
 // already running must be a no-op.
@@ -466,17 +451,15 @@ func TestSpinner_DoubleStartIgnored(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "x", false)
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	s.Start()
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.afterCh != nil
-	})
+	awaitPaint(t, paintCh)
 	// Second Start should short-circuit and NOT clobber stopCh/doneCh.
 	s.Start()
 	s.Stop()
@@ -489,24 +472,19 @@ func TestSpinner_PaintsWithColor(t *testing.T) {
 	t.Parallel()
 	buf := &safeBuffer{}
 	clk := newFakeClock(time.Unix(0, 0).UTC())
+	paintCh := make(chan struct{}, 8)
 
 	s := NewSpinner(buf, "wait", true) // useColor=true
 	s.enabled = true
 	_ = s.withClock(clk)
+	_ = s.withPaintCh(paintCh)
 
 	s.Start()
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.afterCh != nil
-	})
+	awaitPaint(t, paintCh) // After installed
 	clk.advance(s.delay)
 	clk.firePreRoll()
-	waitFor(t, time.Second, func() bool {
-		clk.mu.Lock()
-		defer clk.mu.Unlock()
-		return clk.tickCh != nil
-	})
+	awaitPaint(t, paintCh) // first paint
+	awaitPaint(t, paintCh) // ticker installed
 	s.Stop()
 
 	out := buf.String()

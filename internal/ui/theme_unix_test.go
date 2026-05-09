@@ -4,7 +4,6 @@ package ui
 
 import (
 	"os"
-	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -47,8 +46,9 @@ func TestWatchResize_NilTheme(t *testing.T) {
 }
 
 // TestWatchResize_GoroutineExits verifies that calling stop() releases
-// the watcher goroutine: the live goroutine count after stop()+brief
-// wait does not exceed the count before WatchResize was called.
+// the watcher goroutine. We use a sentinel channel closed by the
+// watcher just before it returns rather than runtime.NumGoroutine,
+// which is famously flaky as a leak detector.
 func TestWatchResize_GoroutineExits(t *testing.T) {
 	f, err := os.Open(os.DevNull)
 	if err != nil {
@@ -56,29 +56,23 @@ func TestWatchResize_GoroutineExits(t *testing.T) {
 	}
 	defer f.Close()
 
-	before := runtime.NumGoroutine()
+	exited := make(chan struct{})
 	th := NewThemeWith(false, 0)
-	stop := th.WatchResize(f)
+	stop := th.watchResizeWithHooks(f, nil, exited)
 	stop()
 
-	// Brief poll: the watcher's select needs a scheduling tick to drain
-	// done and return.
-	deadline := time.Now().Add(50 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= before {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if runtime.NumGoroutine() > before {
-		t.Errorf("goroutine leak: before=%d after=%d", before, runtime.NumGoroutine())
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("watcher goroutine did not exit after stop()")
 	}
 }
 
 // TestWatchResize_FiresOnSIGWINCH sends SIGWINCH to the current
 // process and verifies the watcher goroutine processes it without
-// crashing. We don't assert the new width value because detectWidth
-// on /dev/null returns 0 — the test verifies the plumbing fires.
+// crashing. We synchronize on a hook channel the watcher signals
+// after every resize handle, replacing the millisecond-poll loop the
+// previous version of this test used.
 func TestWatchResize_FiresOnSIGWINCH(t *testing.T) {
 	f, err := os.Open(os.DevNull)
 	if err != nil {
@@ -86,23 +80,20 @@ func TestWatchResize_FiresOnSIGWINCH(t *testing.T) {
 	}
 	defer f.Close()
 
+	resized := make(chan struct{}, 1)
 	th := NewThemeWith(false, 42)
-	stop := th.WatchResize(f)
+	stop := th.watchResizeWithHooks(f, resized, nil)
 	defer stop()
 
-	// Send SIGWINCH; the goroutine should observe it and call SetWidth
-	// with detectWidth(/dev/null) == 0.
 	if err := syscall.Kill(os.Getpid(), syscall.SIGWINCH); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
-
-	// Poll for width to drop from 42 to 0.
-	deadline := time.Now().Add(100 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if th.Width() == 0 {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
+	select {
+	case <-resized:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not handle SIGWINCH within timeout")
 	}
-	t.Errorf("watcher did not update width after SIGWINCH; Width=%d", th.Width())
+	if th.Width() != 0 {
+		t.Errorf("watcher did not update width after SIGWINCH; Width=%d", th.Width())
+	}
 }

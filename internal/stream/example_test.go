@@ -9,6 +9,20 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
+// ExampleParseStatus shows the wire-format → typed-Status round trip
+// callers use after reading a [stream.Result] event's structured output.
+func ExampleParseStatus() {
+	for _, label := range []string{"DONE", "CONTINUE", "WAT", ""} {
+		s, ok := stream.ParseStatus(label)
+		fmt.Printf("%-8s ok=%-5v status=%q\n", label, ok, s.String())
+	}
+	// Output:
+	// DONE     ok=true  status="DONE"
+	// CONTINUE ok=true  status="CONTINUE"
+	// WAT      ok=false status=""
+	//          ok=false status=""
+}
+
 // ExampleReader_Next walks a small in-memory event flow with the
 // concrete-type switch consumers are expected to use. The output line
 // per event captures the wire-format discriminator [stream.Event.Kind]

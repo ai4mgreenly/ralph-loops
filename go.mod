@@ -2,6 +2,8 @@ module github.com/ai4mgreenly/ralph-loops
 
 go 1.26
 
+toolchain go1.26.0
+
 require (
 	github.com/alecthomas/chroma/v2 v2.24.1
 	github.com/charmbracelet/x/ansi v0.11.7

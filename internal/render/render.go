@@ -6,17 +6,25 @@
 //
 // The package is split across several files:
 //
-//   - render.go    Package doc, the [Recorder] seam, the iteration rule.
-//   - emit.go      Per-event-type pretty printing and timing accounting.
-//   - format.go    Tool-specific parameter and result formatters.
-//   - diff.go      Line-by-line LCS diff used by [Emitter.emitEditResult].
-//   - highlight.go Chroma-driven syntax highlighting used by Read/Edit/Write.
+//   - render.go     Package doc and the [Recorder] seam.
+//   - emit.go       The [Emitter] type, options, and the cross-tool dispatch.
+//   - emit_bash.go  Bash-tool result rendering.
+//   - emit_read.go  Read-tool result rendering and `cat -n` stripping.
+//   - emit_edit.go  Edit-tool result rendering as a side-by-side diff.
+//   - emit_write.go Write-tool result rendering as a "diff from nothing".
+//   - format.go     Tool-agnostic parameter and result formatters.
+//   - diff.go       Line-by-line LCS diff used by [Emitter.emitEditResult].
+//   - highlight.go  Chroma-driven syntax highlighting used by Read/Edit/Write.
 //
 // The package depends on `internal/stream` for the typed event model
 // and `internal/ui` for output primitives, but knows nothing about the
-// outer iteration loop. The producer (the loop's stats accumulator)
-// supplies a [Recorder] so render can attribute timing and tally
-// blocks/usage without knowing about the concrete `*stats` type.
+// outer iteration loop. The [Recorder] interface lives on the consumer
+// side (here): the loop's stats accumulator implements it and is passed
+// in at [NewEmitter] time, so render can attribute timing and tally
+// blocks/usage without ever importing the loop's concrete `*stats`
+// type. This is the canonical "accept interfaces at the boundary"
+// inversion — the producer of the data defines what it can deliver,
+// and the consumer narrows that to what it actually needs.
 package render
 
 import (

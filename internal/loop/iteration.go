@@ -29,59 +29,72 @@ var errStreamEnded = errors.New("claude stream ended without result")
 // runIteration drives a single agent invocation: it asks the spawner
 // for a fresh [Session], sends the kickoff prompt, dispatches events
 // into the emitter, and applies the structured-output retry policy.
-// It returns the final status ("DONE" or "CONTINUE") on success, or
-// an error if the iteration could not complete.
+// It returns the final [stream.Status] on success, or an error if the
+// iteration could not complete.
 //
 // Cancellation of ctx (timeout or SIGINT) propagates through the
 // spawner's exec.CommandContext wiring, which delivers SIGINT to the
 // child's process group before the grace period elapses.
-func runIteration(ctx context.Context, cfg Config, sp Spawner, e *render.Emitter, s *stats) (string, error) {
-	sess, err := sp.Spawn(ctx, agentConfig(cfg))
+func runIteration(ctx context.Context, cfg Config, o options, sp Spawner, e *render.Emitter, s *stats) (status stream.Status, err error) {
+	sess, err := sp.Spawn(ctx, agentConfig(cfg, o))
 	if err != nil {
-		return "", err
+		return stream.StatusUnknown, err
 	}
+
+	// defer Close so a panic in pumpStream doesn't leak the child. The
+	// named return lets us merge the Close error with whatever we have.
+	var closeErr error
+	defer func() {
+		closeErr = sess.Close()
+
+		// Surface ctx errors first because they tell the operator
+		// whether the run was interrupted vs. naturally completed.
+		if cErr := ctx.Err(); cErr != nil {
+			// Preserve closeErr alongside the cancellation cause: a
+			// signaled child still has useful exit info.
+			err = errors.Join(cErr, closeErr)
+			status = stream.StatusUnknown
+			return
+		}
+		if err != nil {
+			return
+		}
+		if closeErr != nil {
+			// Narrow the failure-tolerance window to documented cases:
+			// claude is known to exit 0 or 1 even when the iteration
+			// produced a well-formed result. Anything else (signal death,
+			// exit codes >1) bubbles up.
+			var ee *agent.ExitError
+			if errors.As(closeErr, &ee) {
+				if !ee.Signaled && (ee.Code == 0 || ee.Code == 1) && status != stream.StatusUnknown {
+					return
+				}
+				err = fmt.Errorf("claude exited with status %d: %w", ee.Code, ee)
+				status = stream.StatusUnknown
+				return
+			}
+			err = fmt.Errorf("claude exited: %w", closeErr)
+			status = stream.StatusUnknown
+		}
+	}()
 
 	e.ResetIteration()
-	status, runErr := pumpStream(ctx, sess, e, s, cfg.Prompt)
-	closeErr := sess.Close()
-
-	// We surface ctx errors first because they tell the operator
-	// whether the run was interrupted vs. naturally completed.
-	if cErr := ctx.Err(); cErr != nil {
-		return "", cErr
-	}
-	if runErr != nil {
-		return "", runErr
-	}
-	if closeErr != nil {
-		// Narrow the failure-tolerance window to documented cases:
-		// claude is known to exit 0 or 1 even when the iteration
-		// produced a well-formed result. Anything else (signal death,
-		// exit codes >1) bubbles up.
-		var ee *agent.ExitError
-		if errors.As(closeErr, &ee) {
-			if (ee.Code == 0 || ee.Code == 1) && status != "" {
-				return status, nil
-			}
-			return "", fmt.Errorf("claude exited with status %d: %w", ee.Code, ee)
-		}
-		return "", fmt.Errorf("claude exited: %w", closeErr)
-	}
-	return status, nil
+	status, err = pumpStream(ctx, sess, e, s, cfg.Prompt)
+	return status, err
 }
 
-// agentConfig projects the full loop Config down to the subset the
-// agent package consumes. Loop-level concerns (Prompt, Duration,
-// Verbose, Version) intentionally do not cross the boundary.
-func agentConfig(cfg Config) agent.Config {
+// agentConfig projects the loop Config plus its options down to the
+// subset the agent package consumes. Loop-level concerns (Prompt,
+// Duration, Verbose, Version) intentionally do not cross the boundary.
+func agentConfig(cfg Config, o options) agent.Config {
 	return agent.Config{
-		Model:           cfg.Model,
-		Effort:          cfg.Effort,
-		Tools:           cfg.Tools,
-		SkipPermissions: cfg.SkipPermissions,
-		ConfigDir:       cfg.ConfigDir,
-		OneMContext:     cfg.OneMContext,
-		ClaudeAIMCP:     cfg.ClaudeAIMCP,
+		Model:           o.model,
+		Effort:          o.effort,
+		Tools:           o.tools,
+		SkipPermissions: o.skipPermissions,
+		ConfigDir:       o.configDir,
+		OneMContext:     o.oneMContext,
+		ClaudeAIMCP:     o.claudeAIMCP,
 		WorkDir:         cfg.WorkDir,
 	}
 }
@@ -97,9 +110,9 @@ func pumpStream(
 	e *render.Emitter,
 	s *stats,
 	prompt string,
-) (string, error) {
+) (stream.Status, error) {
 	if err := sess.Send(prompt); err != nil {
-		return "", fmt.Errorf("send kickoff: %w", err)
+		return stream.StatusUnknown, fmt.Errorf("send kickoff: %w", err)
 	}
 
 	r := sess.Events()
@@ -109,21 +122,21 @@ func pumpStream(
 			return status, nil
 		}
 		if !errors.Is(err, errBadStructuredOutput) {
-			return "", err
+			return stream.StatusUnknown, err
 		}
 		if retry >= maxRetriesPerIteration {
-			return "", fmt.Errorf("%w after %d retries", err, retry)
+			return stream.StatusUnknown, fmt.Errorf("%w after %d retries", err, retry)
 		}
 		// Respect cancellation between attempts. The scanner itself
 		// isn't context-aware, but at least the retry loop won't queue
 		// another correction once the operator has hit Ctrl-C.
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return stream.StatusUnknown, ctx.Err()
 		default:
 		}
 		if cErr := sess.Send(correctionMessage(err)); cErr != nil {
-			return "", fmt.Errorf("send correction: %w", cErr)
+			return stream.StatusUnknown, fmt.Errorf("send correction: %w", cErr)
 		}
 	}
 }
@@ -134,13 +147,13 @@ func pumpStream(
 // caller can retry. Unrecognised event types and unparseable lines
 // are surfaced verbatim and decoding resumes on the next line, so a
 // new event kind from claude does not abort the iteration.
-func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, error) {
+func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (stream.Status, error) {
 	for {
 		e.Spinner().Start()
 		ev, err := r.Next()
 		e.Spinner().Stop()
 		if errors.Is(err, io.EOF) {
-			return "", errStreamEnded
+			return stream.StatusUnknown, errStreamEnded
 		}
 		if err != nil {
 			// Forward-compat and resilience: log the offending line so
@@ -150,7 +163,7 @@ func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, err
 				e.OnDecodeError(*de)
 				continue
 			}
-			return "", fmt.Errorf("read stream: %w", err)
+			return stream.StatusUnknown, fmt.Errorf("read stream: %w", err)
 		}
 
 		s.tallyEvent(ev.Kind())
@@ -162,9 +175,10 @@ func readUntilResult(r *stream.Reader, e *render.Emitter, s *stats) (string, err
 			e.OnUser(ev)
 		case stream.Result:
 			e.OnResult(ev)
-			status := render.DecodeStatus(ev.StructuredOutput)
-			if status != stream.StatusDone && status != stream.StatusContinue {
-				return "", errBadStructuredOutput
+			label := render.DecodeStatus(ev.StructuredOutput)
+			status, ok := stream.ParseStatus(label)
+			if !ok {
+				return stream.StatusUnknown, errBadStructuredOutput
 			}
 			return status, nil
 		case stream.System:

@@ -1,4 +1,4 @@
-package cli
+package main
 
 import (
 	"bytes"
@@ -10,40 +10,25 @@ import (
 	"testing"
 )
 
-func sampleDefaults() UsageDefaults {
-	return UsageDefaults{
-		Version:         "1.2.3",
-		Reqs:            "./reqs",
-		Model:           "opus",
-		Effort:          "medium",
-		OneMContext:     true,
-		SkipPermissions: true,
-		ClaudeAIMCP:     false,
-		OutputLines:     200,
-	}
-}
-
 func TestWriteUsage_ContainsVersionAndDefaults(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	d := sampleDefaults()
-	WriteUsage(&buf, d)
+	writeUsage(&buf)
 	out := buf.String()
 
 	wants := []string{
-		"ralph 1.2.3",
+		"ralph " + version,
 		"USAGE",
 		"DESCRIPTION",
 		"FLAGS",
 		"REQUIREMENT IDS",
-		`"./reqs"`,
-		`"opus"`,
-		`"medium"`,
-		"200",
+		`"` + defaultReqs + `"`,
+		`"` + defaultModel + `"`,
+		`"` + defaultEffort + `"`,
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
-			t.Errorf("WriteUsage output missing %q", w)
+			t.Errorf("writeUsage output missing %q", w)
 		}
 	}
 }
@@ -51,18 +36,18 @@ func TestWriteUsage_ContainsVersionAndDefaults(t *testing.T) {
 func TestWriteUsagePaged_NonTTYWritesToWriter(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	WriteUsagePaged(&buf, sampleDefaults())
+	writeUsagePaged(&buf)
 	out := buf.String()
-	if !strings.Contains(out, "ralph 1.2.3") {
-		t.Errorf("WriteUsagePaged should write directly to non-TTY writer; got %q", out)
+	if !strings.Contains(out, "ralph "+version) {
+		t.Errorf("writeUsagePaged should write directly to non-TTY writer; got %q", out)
 	}
 	if !strings.Contains(out, "REQUIREMENT IDS") {
-		t.Errorf("WriteUsagePaged: full manual not emitted, got %q", out)
+		t.Errorf("writeUsagePaged: full manual not emitted, got %q", out)
 	}
 }
 
 // TestWriteUsagePaged_PagedBranchViaPTY exercises the TTY path of
-// WriteUsagePaged by passing the master end of a fresh pseudo-terminal
+// writeUsagePaged by passing the master end of a fresh pseudo-terminal
 // as stdout. The master is a character device so ui.IsTTY accepts it,
 // driving the os/exec spawn. PAGER=cat is set so the spawned pager is
 // a deterministic builtin: it copies stdin straight to the master pty.
@@ -91,13 +76,13 @@ func TestWriteUsagePaged_PagedBranchViaPTY(t *testing.T) {
 	}()
 
 	t.Setenv("PAGER", "cat")
-	WriteUsagePaged(master, sampleDefaults())
+	writeUsagePaged(master)
 
 	// Closing the master signals EOF to the drain goroutine.
 	master.Close()
 	<-doneCh
 
-	if !strings.Contains(collected.String(), "ralph 1.2.3") {
+	if !strings.Contains(collected.String(), "ralph "+version) {
 		t.Errorf("pty-routed paged output missing version banner: %q", collected.String())
 	}
 }

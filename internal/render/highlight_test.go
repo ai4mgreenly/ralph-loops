@@ -95,7 +95,6 @@ func TestBalanceSGRPerLine_TableDriven(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := balanceSGRPerLine(tc.in)
@@ -144,7 +143,6 @@ func TestScanSGR_ReturnsEscapesInOrder(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := scanSGR(tc.in)

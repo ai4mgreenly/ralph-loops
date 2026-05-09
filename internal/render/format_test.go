@@ -66,7 +66,6 @@ func TestFormatToolCallParam(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
@@ -104,7 +103,6 @@ func TestFormatToolCallParam_DeterministicFallback(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			first := formatToolCallParam(tc.tool, json.RawMessage(tc.input))
@@ -158,7 +156,6 @@ func TestFormatToolResult(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := formatToolResult(tc.tool, tc.block, json.RawMessage(tc.structured))

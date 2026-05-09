@@ -54,3 +54,19 @@ func HasModel(alias string) bool {
 	_, ok := Lookup(alias)
 	return ok
 }
+
+// modelOrder is the canonical ordering for [Models], cheapest first.
+// Hand-maintained alongside the [models] map so the help text and
+// flag-allow-list iterate in the documented order rather than map-
+// iteration order.
+var modelOrder = []string{"haiku", "sonnet", "opus"}
+
+// Models returns the set of known model aliases in cheapest-first
+// order. Callers (notably the CLI flag layer) use it to keep their
+// allow-list in lockstep with the pricing table; mutating the returned
+// slice is safe because it is rebuilt on every call.
+func Models() []string {
+	out := make([]string, len(modelOrder))
+	copy(out, modelOrder)
+	return out
+}

@@ -52,11 +52,57 @@ const (
 	BlockToolResult       = "tool_result"
 )
 
-// Status values the claude CLI is constrained to return via [SchemaJSON].
+// Status is the schema-constrained status the claude CLI returns at the
+// end of every iteration. The wire form is a string ("DONE" / "CONTINUE");
+// callers receive a typed value from [ParseStatus] and can compare with
+// the named constants below.
+//
+// The zero value [StatusUnknown] is used when a status field is absent
+// or carries an unrecognised label, so callers can distinguish "the
+// agent did not commit to a terminal answer" from a successful parse.
+type Status int
+
+// Status values. [StatusUnknown] is the zero value and prints as the
+// empty string so it can be distinguished from a parsed terminal value.
 const (
-	StatusDone     = "DONE"
-	StatusContinue = "CONTINUE"
+	StatusUnknown Status = iota
+	StatusDone
+	StatusContinue
 )
+
+// Wire-format labels matching the JSON schema enum values. Used to
+// drive [ParseStatus] and to assemble [SchemaJSON]; callers comparing
+// against parsed values should use the typed [Status] constants instead.
+const (
+	wireStatusDone     = "DONE"
+	wireStatusContinue = "CONTINUE"
+)
+
+// String returns the wire-format label for s. [StatusUnknown] renders
+// as the empty string.
+func (s Status) String() string {
+	switch s {
+	case StatusDone:
+		return wireStatusDone
+	case StatusContinue:
+		return wireStatusContinue
+	default:
+		return ""
+	}
+}
+
+// ParseStatus maps a wire-format status label to its typed [Status].
+// An empty or unrecognised label returns [StatusUnknown] and ok=false.
+func ParseStatus(s string) (Status, bool) {
+	switch s {
+	case wireStatusDone:
+		return StatusDone, true
+	case wireStatusContinue:
+		return StatusContinue, true
+	default:
+		return StatusUnknown, false
+	}
+}
 
 // Tool names as they appear in the `name` field of a tool_use block
 // (or the `tools` list of a `system` event). Only tools the codebase
@@ -75,7 +121,8 @@ const (
 
 // SchemaJSON is the JSON Schema passed to claude via --json-schema.
 // It forces the model to emit exactly {"status":"DONE"} or
-// {"status":"CONTINUE"} as its structured output.
+// {"status":"CONTINUE"} as its structured output. The enum values are
+// the same wire-format labels surfaced through [Status.String].
 const SchemaJSON = `{"type":"object","properties":{"status":{"type":"string","enum":["DONE","CONTINUE"]}},"required":["status"]}`
 
 // Buffer bounds for the internal line scanner. The upper bound is
@@ -120,10 +167,14 @@ type DecodeError struct {
 	Err error
 }
 
+// Error implements [error] and reports the line number alongside the
+// wrapped cause.
 func (e *DecodeError) Error() string {
 	return fmt.Sprintf("stream: line %d: %v", e.Line, e.Err)
 }
 
+// Unwrap returns the wrapped cause so callers can use [errors.Is] and
+// [errors.As] against [ErrUnknownType] or [ErrMalformed].
 func (e *DecodeError) Unwrap() error { return e.Err }
 
 // Reader decodes the claude stream-json line-oriented event stream.
@@ -170,7 +221,7 @@ func (r *Reader) Next() (Event, error) {
 		Subtype string `json:"subtype"`
 	}
 	if err := json.Unmarshal(line, &head); err != nil {
-		return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: %v", ErrMalformed, err)}
+		return nil, &DecodeError{Line: r.line, Bytes: line, Err: fmt.Errorf("%w: %w", ErrMalformed, err)}
 	}
 
 	switch head.Type {
@@ -219,6 +270,7 @@ type Assistant struct {
 	Message Message `json:"message"`
 }
 
+// Kind reports the wire-format discriminator for an [Assistant] event.
 func (Assistant) Kind() string   { return TypeAssistant }
 func (Assistant) isStreamEvent() {}
 
@@ -228,6 +280,7 @@ type User struct {
 	ToolUseResult json.RawMessage `json:"tool_use_result,omitempty"`
 }
 
+// Kind reports the wire-format discriminator for a [User] event.
 func (User) Kind() string   { return TypeUser }
 func (User) isStreamEvent() {}
 
@@ -241,6 +294,7 @@ type Result struct {
 	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
 }
 
+// Kind reports the wire-format discriminator for a [Result] event.
 func (Result) Kind() string   { return TypeResult }
 func (Result) isStreamEvent() {}
 
@@ -254,6 +308,7 @@ type System struct {
 	Tools          []string `json:"tools,omitempty"`
 }
 
+// Kind reports the wire-format discriminator for a [System] event.
 func (System) Kind() string   { return TypeSystem }
 func (System) isStreamEvent() {}
 
@@ -262,6 +317,7 @@ type RateLimit struct {
 	Info *RateLimitInfo `json:"rate_limit_info,omitempty"`
 }
 
+// Kind reports the wire-format discriminator for a [RateLimit] event.
 func (RateLimit) Kind() string   { return TypeRateLimit }
 func (RateLimit) isStreamEvent() {}
 
@@ -274,6 +330,9 @@ type UnknownEvent struct {
 	Payload json.RawMessage
 }
 
+// Kind reports the wire-format discriminator preserved from the
+// originating line. For [UnknownEvent] the value is whatever literal
+// "type" the wire carried.
 func (e UnknownEvent) Kind() string { return e.Type }
 func (UnknownEvent) isStreamEvent() {}
 
@@ -318,7 +377,52 @@ type Usage struct {
 }
 
 // StatusOutput is the schema-constrained reply ralph forces from claude
-// at the end of every iteration.
+// at the end of every iteration. The Status field carries the wire-format
+// label; use [ParseStatus] to convert to the typed [Status] enum.
 type StatusOutput struct {
 	Status string `json:"status"`
+}
+
+// userMessageBlock is one content block inside an outgoing user message.
+// The only kind ralph emits is "text".
+type userMessageBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// userMessagePayload is the inner Message field of a user-message
+// envelope sent on the agent's stdin.
+type userMessagePayload struct {
+	Role    string             `json:"role"`
+	Content []userMessageBlock `json:"content"`
+}
+
+// userMessage is the wire-format envelope for a single stream-json user
+// message line written to the agent's stdin.
+type userMessage struct {
+	Type    string             `json:"type"`
+	Message userMessagePayload `json:"message"`
+}
+
+// WriteUserMessage writes a single stream-json user-message envelope
+// containing text to w, terminated with the newline that the protocol's
+// line framing requires. Returns wrapped errors if marshaling or writing
+// fails.
+func WriteUserMessage(w io.Writer, text string) error {
+	msg := userMessage{
+		Type: "user",
+		Message: userMessagePayload{
+			Role:    "user",
+			Content: []userMessageBlock{{Type: "text", Text: text}},
+		},
+	}
+	encoded, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal user message: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	if _, err := w.Write(encoded); err != nil {
+		return fmt.Errorf("write user message: %w", err)
+	}
+	return nil
 }

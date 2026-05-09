@@ -1,3 +1,31 @@
+<!--
+This file is the operator prompt embedded into the ralph binary.
+
+It is read at compile time from cmd/ralph/main.go via:
+
+    //go:embed prompt.md
+    var promptTemplate string
+
+ralph performs literal string substitution on the embedded copy before
+sending the result as the kickoff message of every iteration. The
+supported placeholders are:
+
+  {{REQS}}     replaced with the value of --reqs (default "reqs")
+  {{WORKDIR}}  replaced with the WORKDIR positional argument
+
+There are no other substitutions. Any `{{...}}` token not in that list
+is sent through to claude verbatim — useful for shell or template syntax
+that should reach the agent unmangled.
+
+To test prompt changes:
+
+  1. Edit this file.
+  2. `make build` — the embedded copy is refreshed by go build.
+  3. `bin/ralph --duration=2m <some scratch dir>` to see the prompt
+     in action, or `go test ./cmd/ralph/...` for the unit tests that
+     exercise the substitution logic.
+-->
+
 # Ralph build agent
 
 You are an iterative build agent. You will be invoked many times in a loop until the application described by the spec is complete or the operator stops the loop.

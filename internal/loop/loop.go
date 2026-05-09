@@ -1,8 +1,8 @@
-// Package loop drives the ralph iteration loop: it asks a
-// [Spawner] for a fresh agent session per iteration, feeds it
-// the operator prompt, parses the stream-json event flow, and repeats
-// until the agent reports DONE, the wall-clock budget is exhausted,
-// or the operator presses Ctrl-C.
+// Package loop drives the ralph iteration loop: it asks a [Spawner] for
+// a fresh agent session per iteration, feeds it the operator prompt,
+// parses the stream-json event flow, and repeats until the agent
+// reports DONE, the wall-clock budget is exhausted, or the operator
+// presses Ctrl-C.
 //
 // The package is split across three files:
 //
@@ -22,106 +22,152 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 	"github.com/ai4mgreenly/ralph-loops/internal/pricing"
 	"github.com/ai4mgreenly/ralph-loops/internal/render"
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
-// allowedEfforts is the set of accepted values for [Config.Effort].
-// The canonical list lives in the [cmd/ralph] CLI; this duplicate
-// gives the package a defence-in-depth check at its boundary.
-//
-// TODO: collapse the two copies once an effort registry exists.
-var allowedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+// Default values for every [Option]. The CLI surfaces the same set
+// (with the same defaults) at the flag layer.
+const (
+	defaultModel       = "opus"
+	defaultEffort      = "medium"
+	defaultVersion     = "dev"
+	defaultOutputLines = 0 // 0 means "let the emitter pick"
+)
 
-// Config is the full set of inputs to a ralph run.
-//
-// String fields marked "required" must be non-empty; [Run] returns
-// an error wrapping [ErrInvalidConfig] otherwise. Optional string
-// fields have a documented zero-value meaning. Boolean fields default
-// to whatever the caller supplies; the [cmd/ralph] CLI picks defaults
-// that match the original ralph-scoops Ruby driver.
+// AllowedEfforts is the canonical set of accepted values for
+// [WithEffort]. Exported so the CLI flag layer can reuse the same list
+// for its --effort enumFlag, keeping the two validators in sync.
+var AllowedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+
+// Config carries the small set of values [Run] insists on. Everything
+// else is optional and threaded through [Option] arguments. A zero
+// value is rejected with [ErrInvalidConfig].
 type Config struct {
 	// ReqsDir is the path to the project's requirements directory.
-	// The agent reads from but never writes to this tree. Required.
+	// The agent reads from but never writes to this tree.
 	ReqsDir string
 
 	// WorkDir is the path to the application source tree. The agent
-	// reads and writes inside this tree. Required.
+	// reads and writes inside this tree. [Run] creates the directory
+	// (with any missing parents) before the first iteration.
 	WorkDir string
 
-	// Model is one of "haiku", "sonnet", or "opus". Required.
-	Model string
-
-	// Effort is one of "low", "medium", "high", "xhigh", or "max".
-	// Required.
-	Effort string
-
-	// Duration is the wall-clock budget for the run. Zero means the
-	// run is unbounded; negative values are rejected by [Run].
-	Duration time.Duration
-
-	// ConfigDir is exported to the child process as CLAUDE_CONFIG_DIR
-	// when non-empty. An empty string leaves the env var unset, which
-	// makes claude fall back to its own default (~/.claude).
-	ConfigDir string
-
-	// OneMContext enables the 1M-token context window when true.
-	OneMContext bool
-
-	// ClaudeAIMCP enables Claude.ai-managed MCP servers when true.
-	ClaudeAIMCP bool
-
-	// SkipPermissions passes --dangerously-skip-permissions through
-	// to the claude CLI when true.
-	SkipPermissions bool
-
-	// Tools is forwarded verbatim to claude --tools when non-empty.
-	Tools string
-
-	// Prompt is the operator prompt to feed to the agent at the
-	// start of each iteration. Path placeholders should already be
-	// substituted.
+	// Prompt is the operator prompt fed to the agent at the start of
+	// each iteration. Path placeholders should already be substituted.
 	Prompt string
 
-	// Version is the ralph version string included in the run banner.
-	Version string
-
-	// Verbose controls whether low-signal stream events — currently
-	// `system` (init / tool list / permission mode) and `rate_limit` —
-	// are echoed to the operator. Off by default; enabled via
-	// `--verbose` for debugging or detailed run inspection.
-	Verbose bool
-
-	// OutputLines is the maximum number of lines of tool output
-	// (Bash stdout/stderr, Read file contents, Edit/Write hunks)
-	// replayed in the activity log per result. Zero falls back to the
-	// emitter's built-in default.
-	OutputLines int
-
-	// Theme owns the colour and width state used by every rendering
-	// helper in this run. Required: callers must construct one via
-	// [ui.NewTheme] (or [ui.NewThemeWith] in tests) so the loop and
-	// the emitter share a single source of truth.
+	// Theme owns the colour and width state shared by every rendering
+	// helper in this run. Construct via [ui.NewTheme] (or
+	// [ui.NewThemeWith] in tests).
 	Theme *ui.Theme
-
-	// ResultsHome is the directory where the JSONL results log is
-	// written. An empty string falls back to ~/.ralph-loops (or no
-	// log at all when the user's home directory cannot be determined).
-	// Tests typically point this at a t.TempDir().
-	ResultsHome string
-
-	// Now is the wall-clock source threaded into stats. Zero falls
-	// back to [time.Now]; tests pin this to a fixed time so timestamp
-	// assertions can be exact.
-	Now func() time.Time
 }
 
-// ErrInvalidConfig is returned by [Run] when the supplied [Config]
+// Option configures one knob on a [Run] invocation. Pass options to
+// [Run] rather than mutating fields after the fact.
+type Option func(*options)
+
+// options is the private bag of resolved option values. It collects
+// the model/effort knobs, behaviour switches, and seams (clock,
+// results path) so the run kernel can see them as a single struct.
+type options struct {
+	model           string
+	effort          string
+	version         string
+	tools           string
+	configDir       string
+	duration        time.Duration
+	oneMContext     bool
+	claudeAIMCP     bool
+	skipPermissions bool
+	verbose         bool
+	outputLines     int
+	now             func() time.Time
+	resultsHome     string
+	// spawner, when non-nil, overrides the production [Spawner] inside
+	// [Run]. Set via [WithSpawner]; production callers leave it nil so
+	// [defaultSpawner] supplies the real claude-backed implementation.
+	spawner Spawner
+}
+
+// defaultOptions produces the option struct populated with documented
+// defaults; option functions then layer on top.
+func defaultOptions() options {
+	return options{
+		model:       defaultModel,
+		effort:      defaultEffort,
+		version:     defaultVersion,
+		outputLines: defaultOutputLines,
+	}
+}
+
+// WithModel sets the claude model alias (one of "haiku", "sonnet",
+// "opus"). Default: "opus".
+func WithModel(m string) Option { return func(o *options) { o.model = m } }
+
+// WithEffort sets the effort level (one of "low", "medium", "high",
+// "xhigh", "max"). Default: "medium".
+func WithEffort(e string) Option { return func(o *options) { o.effort = e } }
+
+// WithVersion sets the version string included in the run banner.
+// Default: "dev".
+func WithVersion(v string) Option { return func(o *options) { o.version = v } }
+
+// WithTools forwards a comma-separated tool list to the agent.
+// Empty (the default) lets claude expose its full built-in toolset.
+func WithTools(t string) Option { return func(o *options) { o.tools = t } }
+
+// WithConfigDir exports the given path as CLAUDE_CONFIG_DIR for the
+// child process. Empty (the default) leaves the env var unset so
+// claude falls back to its own ~/.claude.
+func WithConfigDir(p string) Option { return func(o *options) { o.configDir = p } }
+
+// WithDuration sets the wall-clock cap for the run. Zero (the default)
+// means unlimited; negative values are rejected by [Run].
+func WithDuration(d time.Duration) Option { return func(o *options) { o.duration = d } }
+
+// WithOneMContext toggles the 1M-token context window.
+func WithOneMContext(v bool) Option { return func(o *options) { o.oneMContext = v } }
+
+// WithClaudeAIMCP toggles the Claude.ai-managed MCP servers.
+func WithClaudeAIMCP(v bool) Option { return func(o *options) { o.claudeAIMCP = v } }
+
+// WithSkipPermissions passes --dangerously-skip-permissions to claude.
+func WithSkipPermissions(v bool) Option { return func(o *options) { o.skipPermissions = v } }
+
+// WithVerbose toggles the rendering of low-signal stream events
+// (system init, rate_limit) into the operator log.
+func WithVerbose(v bool) Option { return func(o *options) { o.verbose = v } }
+
+// WithOutputLines caps the number of tool-output lines replayed per
+// result before truncation. A value <= 0 leaves the emitter's own
+// default in place.
+func WithOutputLines(n int) Option { return func(o *options) { o.outputLines = n } }
+
+// WithNow installs a deterministic clock for tests. Production code
+// should leave it unset, in which case [time.Now] is used.
+func WithNow(now func() time.Time) Option { return func(o *options) { o.now = now } }
+
+// WithResultsHome overrides the default results-log directory
+// (~/.ralph-loops). An empty string disables the log entirely.
+func WithResultsHome(p string) Option { return func(o *options) { o.resultsHome = p } }
+
+// WithSpawner installs a custom [Spawner] in place of the production
+// one backed by the claude CLI. Intended for tests: it lets a [Run]
+// invocation be driven by a fake spawner so the entire loop —
+// validation, signal handling, results-JSONL log — can be exercised
+// without forking a subprocess. Production code should leave this
+// unset.
+func WithSpawner(s Spawner) Option { return func(o *options) { o.spawner = s } }
+
+// ErrInvalidConfig is returned by [Run] when [Config] or an [Option]
 // fails validation. Callers can use errors.Is to detect the case.
 var ErrInvalidConfig = errors.New("invalid config")
 
@@ -130,16 +176,15 @@ var ErrInvalidConfig = errors.New("invalid config")
 var ErrInterrupted = errors.New("interrupted")
 
 // ErrTimedOut is returned when the wall-clock budget set by
-// [Config.Duration] expires before the agent reports DONE.
+// [WithDuration] expires before the agent reports DONE.
 var ErrTimedOut = errors.New("duration budget exhausted")
 
-// exitReason classifies how a run terminated. It prints (and JSON-
-// marshals) as a short noun matching the legacy string constants
-// ("done", "timeout", "interrupted", "error"); the zero value
-// [exitNone] renders as the empty string so a panel printed mid-run
-// can omit the `exit:` line entirely.
+// exitReason classifies how a run terminated. Its [exitReason.String]
+// renders as the empty string for the zero value so a panel printed
+// mid-run can omit the `exit:` line entirely.
 type exitReason int
 
+//go:generate stringer -type=exitReason -trimprefix=exit
 const (
 	exitNone exitReason = iota
 	exitDone
@@ -149,9 +194,8 @@ const (
 )
 
 // String returns the human-readable label for r used in the panel and
-// the results.jsonl record. Unknown values produce "unknown" rather
-// than panicking so a stray default-zero from a future refactor stays
-// debuggable.
+// the results.jsonl record. The lowercase strings match the legacy
+// panel format and the JSON wire shape.
 func (r exitReason) String() string {
 	switch r {
 	case exitNone:
@@ -169,48 +213,70 @@ func (r exitReason) String() string {
 	}
 }
 
-// Run validates cfg, sets up signal handling, and drives the
-// iteration loop until DONE, the budget expires, or a signal arrives.
-// The final stats panel is always written to stdout; the returned
-// error indicates how the run terminated.
+// Run validates cfg, applies opts, sets up signal handling, and drives
+// the iteration loop until DONE, the budget expires, or a signal
+// arrives. The final stats panel is always written to stdout; the
+// returned error indicates how the run terminated.
 //
-// As a convenience, [Config.WorkDir] is created (with any missing
-// parents) before the first iteration spawns. This lets operators
-// point ralph at a not-yet-existing scratch directory without a
-// preparatory `mkdir`.
-func Run(cfg Config) error {
-	if err := validate(cfg); err != nil {
+// The supplied ctx is the parent of every derived context: cancelling
+// it short-circuits the run cleanly. Run still installs its own
+// SIGINT/SIGTERM handler on top of ctx, because most callers
+// (including [cmd/ralph]) pass [context.Background] and rely on Run
+// for signal handling.
+//
+// [Config.WorkDir] is created (with any missing parents) before the
+// first iteration spawns, so operators can point ralph at a not-yet-
+// existing scratch directory without a preparatory `mkdir`.
+//
+// Run is single-shot: spawn a fresh Run per process. Reusing one
+// Config across two concurrent calls is not supported.
+func Run(ctx context.Context, cfg Config, opts ...Option) error {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if err := validate(cfg, o); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	if err := os.MkdirAll(cfg.WorkDir, 0o755); err != nil {
 		return fmt.Errorf("create workdir %q: %w", cfg.WorkDir, err)
 	}
-	return runWith(cfg, cfg.Duration, os.Stdout, newClaudeSpawner())
+	sp := o.spawner
+	if sp == nil {
+		sp = defaultSpawner()
+	}
+	return runWith(ctx, cfg, o, os.Stdout, sp)
 }
 
-// runWith is the testable kernel of [Run]. It assumes inputs are
-// already validated and writes the banner and stats panel to w. The
-// spawner seam lets tests drive a full run with no subprocess.
-func runWith(cfg Config, budget time.Duration, w io.Writer, sp Spawner) error {
-	now := cfg.Now
+// defaultSpawner returns the production [Spawner] backed by the real
+// claude CLI. *agent.Spawner satisfies the consumer-side interface in
+// this package directly because [agent.Spawner.Spawn] returns the
+// [agent.Session] interface, not a concrete type.
+func defaultSpawner() Spawner { return agent.NewSpawner() }
+
+// runWith is the testable kernel of [Run]. It assumes cfg is already
+// validated and writes the banner and stats panel to w. The spawner
+// seam lets tests drive a full run with no subprocess.
+func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner) error {
+	now := o.now
 	if now == nil {
 		now = time.Now
 	}
-	resultsHome := cfg.ResultsHome
+	resultsHome := o.resultsHome
 	if resultsHome == "" {
 		resultsHome = defaultResultsHomePath()
 	}
 
-	ui.Header(w, cfg.Version, cfg.Model, cfg.Effort, formatBudget(budget))
+	ui.Header(w, o.version, o.model, o.effort, formatBudget(o.duration))
 	fmt.Fprintf(w, "reqs=%s\nworkdir=%s\n\n", cfg.ReqsDir, cfg.WorkDir)
 
 	// First SIGINT/SIGTERM cancels the context, giving the run a chance
 	// to wind down gracefully. signal.NotifyContext (Go 1.16+) replaces
 	// the hand-rolled goroutine that used to live here.
-	sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stopSig := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSig()
 
-	ctx, cancel := withBudget(sigCtx, budget)
+	runCtx, cancel := withBudget(sigCtx, o.duration)
 	defer cancel()
 
 	// A second SIGINT after the context is already canceled is the
@@ -220,15 +286,15 @@ func runWith(cfg Config, budget time.Duration, w io.Writer, sp Spawner) error {
 	stopForce := installForceQuit(sigCtx, w, os.Exit)
 	defer stopForce()
 
-	s := newStats(cfg.Model, now, resultsHome)
+	s := newStats(o.model, now, resultsHome)
 	e := render.NewEmitter(
 		w, s, cfg.Theme,
-		render.WithVerbose(cfg.Verbose),
-		render.WithOutputLines(cfg.OutputLines),
+		render.WithVerbose(o.verbose),
+		render.WithOutputLines(o.outputLines),
 	)
 
-	exitReason, runErr := drive(ctx, cfg, sp, e, s)
-	sum := s.snapshot(cfg.ReqsDir, exitReason)
+	exit, runErr := drive(runCtx, cfg, o, sp, e, s)
+	sum := s.snapshot(cfg.ReqsDir, exit)
 	sum.writeText(w, cfg.Theme.Width())
 	appendResultsJSONL(resultsHome, sum)
 
@@ -238,7 +304,7 @@ func runWith(cfg Config, budget time.Duration, w io.Writer, sp Spawner) error {
 // drive runs successive iterations until ctx is cancelled or claude
 // returns DONE. It returns the exit reason for the panel and either
 // nil, [ErrInterrupted], [ErrTimedOut], or a wrapped runtime error.
-func drive(ctx context.Context, cfg Config, sp Spawner, e *render.Emitter, s *stats) (exitReason, error) {
+func drive(ctx context.Context, cfg Config, o options, sp Spawner, e *render.Emitter, s *stats) (exitReason, error) {
 	for {
 		// Check for cancellation between iterations as well as during
 		// them; an iteration that finishes the same instant as a
@@ -248,8 +314,8 @@ func drive(ctx context.Context, cfg Config, sp Spawner, e *render.Emitter, s *st
 		}
 
 		s.incrementIteration()
-		e.IterationBanner(s.iterations)
-		status, err := runIteration(ctx, cfg, sp, e, s)
+		e.IterationBanner(s.iterationCount())
+		status, err := runIteration(ctx, cfg, o, sp, e, s)
 		if err != nil {
 			if cErr := ctx.Err(); cErr != nil {
 				return ctxExit(cErr)
@@ -265,15 +331,18 @@ func drive(ctx context.Context, cfg Config, sp Spawner, e *render.Emitter, s *st
 // ctxExit translates a context error into a (panel-reason, returned-
 // error) pair. Callers must only invoke it after observing ctx.Err()
 // != nil, so the only sentinels that can appear here are
-// [context.Canceled] and [context.DeadlineExceeded].
+// [context.Canceled] and [context.DeadlineExceeded]. A future-proof
+// default branch returns a wrapped "unexpected" error rather than
+// panicking, so a stray context implementation cannot crash the run.
 func ctxExit(err error) (exitReason, error) {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return exitTimedOut, ErrTimedOut
 	case errors.Is(err, context.Canceled):
 		return exitInterrupted, ErrInterrupted
+	default:
+		return exitErrored, fmt.Errorf("unexpected ctx error: %w", err)
 	}
-	panic("unreachable: ctx.Err() returned non-Canceled/DeadlineExceeded: " + err.Error())
 }
 
 // withBudget wraps ctx with a deadline if budget is positive,
@@ -323,6 +392,12 @@ func installForceQuit(sigCtx context.Context, w io.Writer, quit func(int)) func(
 
 	return func() {
 		signal.Stop(sigCh)
+		// Drain any signal queued between Stop and the receive in the
+		// goroutine, so no goroutine leak retains a delivered signal.
+		select {
+		case <-sigCh:
+		default:
+		}
 		close(done)
 	}
 }
@@ -336,19 +411,16 @@ func formatBudget(d time.Duration) string {
 	return d.String()
 }
 
-// validate returns nil if cfg has every required field populated, or
-// a joined error listing each missing field otherwise.
-func validate(cfg Config) error {
+// validate returns nil if cfg/o have every required field populated,
+// or a joined error listing each missing/invalid field otherwise.
+func validate(cfg Config, o options) error {
 	required := []struct {
 		name  string
 		value string
 	}{
 		{"ReqsDir", cfg.ReqsDir},
 		{"WorkDir", cfg.WorkDir},
-		{"Model", cfg.Model},
-		{"Effort", cfg.Effort},
 		{"Prompt", cfg.Prompt},
-		{"Version", cfg.Version},
 	}
 	var errs []error
 	for _, f := range required {
@@ -356,28 +428,17 @@ func validate(cfg Config) error {
 			errs = append(errs, fmt.Errorf("%s is required", f.name))
 		}
 	}
-	if cfg.Duration < 0 {
-		errs = append(errs, fmt.Errorf("Duration must be non-negative (got %v)", cfg.Duration))
-	}
 	if cfg.Theme == nil {
-		errs = append(errs, fmt.Errorf("Theme is required"))
+		errs = append(errs, errors.New("Theme is required"))
 	}
-	if cfg.Model != "" && !pricing.HasModel(cfg.Model) {
-		errs = append(errs, fmt.Errorf("Model %q is not a known alias", cfg.Model))
+	if o.duration < 0 {
+		errs = append(errs, fmt.Errorf("duration must be non-negative (got %v)", o.duration))
 	}
-	if cfg.Effort != "" && !contains(allowedEfforts, cfg.Effort) {
-		errs = append(errs, fmt.Errorf("Effort %q must be one of %v", cfg.Effort, allowedEfforts))
+	if !pricing.HasModel(o.model) {
+		errs = append(errs, fmt.Errorf("model %q is not a known alias", o.model))
+	}
+	if !slices.Contains(AllowedEfforts, o.effort) {
+		errs = append(errs, fmt.Errorf("effort %q must be one of %v", o.effort, AllowedEfforts))
 	}
 	return errors.Join(errs...)
-}
-
-// contains reports whether s is in xs. A small helper kept local to
-// the package to avoid pulling in slices for one call site.
-func contains(xs []string, s string) bool {
-	for _, x := range xs {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"flag"
 	"fmt"
@@ -14,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ai4mgreenly/ralph-loops/internal/cli"
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
 	"github.com/ai4mgreenly/ralph-loops/internal/loop"
+	"github.com/ai4mgreenly/ralph-loops/internal/pricing"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
@@ -26,6 +27,11 @@ import (
 // value here is what unstamped builds (e.g. `go run`) report.
 var version = "dev"
 
+// promptTemplate is the operator prompt sent to claude at the start of
+// every iteration. It is embedded from prompt.md at build time; see that
+// file's header for the supported `{{REQS}}` and `{{WORKDIR}}` template
+// substitutions and instructions for testing prompt changes.
+//
 //go:embed prompt.md
 var promptTemplate string
 
@@ -47,27 +53,14 @@ const (
 // Zero means unlimited.
 const defaultDuration time.Duration = 0
 
-// allowedModels and allowedEfforts are the permitted values for their
-// respective enumFlag-typed CLI flags.
+// allowedModels / allowedEfforts source from the pricing/loop
+// packages so the CLI's flag validation stays in lockstep with the
+// downstream model registry and the loop's runtime check. Initialised
+// at package load.
 var (
-	allowedModels  = []string{"haiku", "sonnet", "opus"}
-	allowedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+	allowedModels  = pricing.Models()
+	allowedEfforts = loop.AllowedEfforts
 )
-
-// usageDefaults snapshots the flag defaults into the shape the manual
-// printer wants.
-func usageDefaults() cli.UsageDefaults {
-	return cli.UsageDefaults{
-		Version:         version,
-		Reqs:            defaultReqs,
-		Model:           defaultModel,
-		Effort:          defaultEffort,
-		OneMContext:     defaultOneMContext,
-		SkipPermissions: defaultSkipPermissions,
-		ClaudeAIMCP:     defaultClaudeAIMCP,
-		OutputLines:     defaultOutputLines,
-	}
-}
 
 // enumFlag is a flag.Value implementation that constrains a string flag
 // to a fixed set of allowed values. The default value is supplied by
@@ -120,7 +113,7 @@ func main() {
 // than imposed via os.Exit.
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		cli.WriteUsage(stderr, usageDefaults())
+		writeUsage(stderr)
 		return exitUsage
 	}
 	// Real subcommands take precedence over the loop's flag parser so
@@ -134,7 +127,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ralph init: requires exactly one PATH argument")
 			return exitUsage
 		}
-		if err := cli.Init(args[1]); err != nil {
+		if err := scaffoldReqs(args[1]); err != nil {
 			fmt.Fprintf(stderr, "ralph: %s\n", err)
 			return exitRuntime
 		}
@@ -162,22 +155,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "ralph %s\n", version)
 		return exitSuccess
 	case "help":
-		cli.WriteUsagePaged(stdout, usageDefaults())
+		writeUsagePaged(stdout)
 		return exitSuccess
 	default:
 		return runLoop(args, stdout, stderr)
 	}
 }
 
-// runLoop parses the loop subcommand's flags, materialises a
-// [loop.Config], and hands off to [loop.Run]. It also services
+// runLoop parses the loop subcommand's flags, builds a [loop.Config]
+// with [loop.Option]s, and hands off to [loop.Run]. It also services
 // `--version`/`-v` and `--help`/`-h`, which the flag package allows in
-// any position — fixing the longstanding bug where
-// `ralph --reqs=foo --version` fell through to the loop driver.
+// any position.
 func runLoop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ralph", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.Usage = func() { cli.WriteUsage(stderr, usageDefaults()) }
+	fs.Usage = func() { writeUsage(stderr) }
 
 	var (
 		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory")
@@ -215,13 +207,13 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		return exitSuccess
 	}
 	if showHelp {
-		cli.WriteUsagePaged(stdout, usageDefaults())
+		writeUsagePaged(stdout)
 		return exitSuccess
 	}
 
 	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "ralph: WORKDIR positional argument is required")
-		cli.WriteUsage(stderr, usageDefaults())
+		writeUsage(stderr)
 		return exitUsage
 	}
 	workdir := fs.Arg(0)
@@ -236,24 +228,26 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	defer stopResize()
 
 	cfg := loop.Config{
-		ReqsDir:         *reqs,
-		WorkDir:         workdir,
-		Model:           model.String(),
-		Effort:          effort.String(),
-		Duration:        duration,
-		ConfigDir:       *configDir,
-		OneMContext:     *oneM,
-		ClaudeAIMCP:     *mcp,
-		SkipPermissions: *skipPerm,
-		Tools:           *tools,
-		Prompt:          prompt,
-		Version:         version,
-		Verbose:         *verbose,
-		OutputLines:     *outputLines,
-		Theme:           theme,
+		ReqsDir: *reqs,
+		WorkDir: workdir,
+		Prompt:  prompt,
+		Theme:   theme,
+	}
+	opts := []loop.Option{
+		loop.WithModel(model.String()),
+		loop.WithEffort(effort.String()),
+		loop.WithVersion(version),
+		loop.WithDuration(duration),
+		loop.WithConfigDir(*configDir),
+		loop.WithTools(*tools),
+		loop.WithOneMContext(*oneM),
+		loop.WithClaudeAIMCP(*mcp),
+		loop.WithSkipPermissions(*skipPerm),
+		loop.WithVerbose(*verbose),
+		loop.WithOutputLines(*outputLines),
 	}
 
-	if err := loop.Run(cfg); err != nil {
+	if err := loop.Run(context.Background(), cfg, opts...); err != nil {
 		fmt.Fprintf(stderr, "ralph: %s\n", err)
 		return exitRuntime
 	}

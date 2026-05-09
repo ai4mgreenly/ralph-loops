@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/pricing"
@@ -20,11 +21,16 @@ import (
 // Ruby driver's ljust(18).
 const statsLabelWidth = 18
 
-// stats accumulates per-run telemetry across every iteration. It is
-// not safe for concurrent use; the iteration driver pushes updates
-// from a single goroutine, then the outer loop reads it once at the
-// end to render the panel.
+// stats accumulates per-run telemetry across every iteration. The
+// loop driver writes to it from one goroutine today, but the
+// [render.Recorder] surface is exposed to a separate package and the
+// embedded [sync.Mutex] guards every mutating method so a future
+// renderer running concurrently is race-safe by construction. The
+// in-process snapshot returns a value copy under the same lock so
+// readers cannot observe a torn state.
 type stats struct {
+	mu sync.Mutex
+
 	model     string
 	startTime time.Time
 
@@ -109,11 +115,35 @@ func newStats(model string, now func() time.Time, resultsHome string) *stats {
 // package (render) can satisfy that interface against the loop's
 // unexported stats type. tallyEvent and incrementIteration stay
 // unexported because they are driven by the loop itself, not render.
-func (s *stats) tallyEvent(t string)         { s.events[t]++ }
-func (s *stats) TallyBlock(t string)         { s.blocks[t]++ }
-func (s *stats) incrementIteration()         { s.iterations++ }
-func (s *stats) AddLLMTime(d time.Duration)  { s.llmTime += d }
-func (s *stats) AddToolTime(d time.Duration) { s.toolTime += d }
+func (s *stats) tallyEvent(t string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events[t]++
+}
+
+func (s *stats) TallyBlock(t string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blocks[t]++
+}
+
+func (s *stats) incrementIteration() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.iterations++
+}
+
+func (s *stats) AddLLMTime(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.llmTime += d
+}
+
+func (s *stats) AddToolTime(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolTime += d
+}
 
 // TrackUsage rolls a single result event's usage into the running
 // totals and updates the cost estimate using the pricing table.
@@ -121,6 +151,8 @@ func (s *stats) TrackUsage(u *stream.Usage) {
 	if u == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.tokens.input += u.InputTokens
 	s.tokens.output += u.OutputTokens
 	s.tokens.cacheRead += u.CacheReadInputTokens
@@ -204,8 +236,12 @@ type summaryTime struct {
 
 // snapshot freezes the current accumulator state into a [summary]. It
 // reads the wall clock to compute elapsed time, so callers should
-// invoke it once at the end of the run.
+// invoke it once at the end of the run. The maps are cloned under the
+// lock so the returned value is fully independent of subsequent
+// mutations.
 func (s *stats) snapshot(reqs string, exit exitReason) summary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	end := s.now()
 	elapsed := end.Sub(s.startTime)
 	other := elapsed - s.llmTime - s.toolTime
@@ -235,6 +271,15 @@ func (s *stats) snapshot(reqs string, exit exitReason) summary {
 			TotalSeconds: int(elapsed.Seconds()),
 		},
 	}
+}
+
+// iterationCount returns the number of iterations attempted so far,
+// taking the lock so a concurrent renderer or test cannot observe a
+// torn write.
+func (s *stats) iterationCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.iterations
 }
 
 // writeText renders sum to w in the operator-facing panel format.

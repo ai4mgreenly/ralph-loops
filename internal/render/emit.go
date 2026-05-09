@@ -83,6 +83,13 @@ type toolRef struct {
 	input json.RawMessage
 }
 
+// defaultOutputLines bounds how many lines of tool output we replay
+// in the activity log when [Config.OutputLines] is unset. Bash, Read,
+// and Edit output can be enormous; ten lines covers the common case
+// (a build's tail end, the top of a file, a small edit hunk) without
+// flooding the operator. Operators override via `--output-lines`.
+const defaultOutputLines = 10
+
 // NewEmitter constructs an Emitter writing to out and updating rec,
 // using theme for colour and width decisions. The wall-clock source
 // is taken indirectly through `time.Now` so tests can install a
@@ -258,13 +265,6 @@ func (e *Emitter) emitToolCall(b stream.Block) {
 	e.theme.Tool(e.out, markerCall, content, true)
 }
 
-// defaultOutputLines bounds how many lines of tool output we replay
-// in the activity log when [Config.OutputLines] is unset. Bash, Read,
-// and Edit output can be enormous; ten lines covers the common case
-// (a build's tail end, the top of a file, a small edit hunk) without
-// flooding the operator. Operators override via `--output-lines`.
-const defaultOutputLines = 10
-
 // emitOutputBlock renders the shared terminal-style result block used
 // by Bash, Read, Edit, Write, and any future tool that prefers raw
 // output to a one-line summary. The first input line gets marker
@@ -290,306 +290,16 @@ func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
 	e.theme.WriteBlock(e.out, marker, lines, true)
 }
 
-// emitBashResult renders the result of a Bash tool call as a tight
-// terminal-style block: stdout lines first, stderr lines after in dim
-// red, capped at [Emitter.OutputLines] with a trailing `...` when
-// more were available.
-func (e *Emitter) emitBashResult(b stream.Block, structured json.RawMessage) {
-	var s struct {
-		Stdout string `json:"stdout"`
-		Stderr string `json:"stderr"`
-	}
-	if len(structured) > 0 {
-		_ = json.Unmarshal(structured, &s)
-	}
-
-	marker := markerResult
-	if b.IsError {
-		marker = markerError
-	}
-
-	var lines []ui.Line
-	push := func(text string, color ui.Color) {
-		text = strings.TrimRight(text, "\n")
-		if text == "" {
-			return
-		}
-		for _, l := range strings.Split(text, "\n") {
-			lines = append(lines, ui.Line{Text: strings.TrimRight(l, " \t\r"), Color: color})
-		}
-	}
-	push(s.Stdout, ui.Plain)
-	push(s.Stderr, ui.DimRed)
-
-	e.emitOutputBlock(marker, lines)
-}
-
-// emitReadResult renders the result of a Read tool call as the same
-// terminal-style block used by Bash, but populated from the file
-// content claude returns in the result block. The result text comes
-// back with `cat -n`-style line-number prefixes; those are stripped
-// so what the operator sees matches what the agent saw, then the
-// stripped body is run through the syntax highlighter using the
-// original Read call's `file_path` to pick a lexer.
-func (e *Emitter) emitReadResult(b stream.Block, ref toolRef) {
-	marker := markerResult
-	if b.IsError {
-		marker = markerError
-	}
-
-	content := strings.TrimRight(extractContentText(b), "\n")
-	if content == "" {
-		e.emitOutputBlock(marker, nil)
-		return
-	}
-
-	stripped := make([]string, 0, strings.Count(content, "\n")+1)
-	for _, l := range strings.Split(content, "\n") {
-		stripped = append(stripped, strings.TrimRight(stripLineNumber(l), " \t\r"))
-	}
-	// Drop a single trailing empty element so the line count matches
-	// what chroma's output produces after [splitLinesNoTrailing] strips
-	// its own trailing newline. Without this, files whose last source
-	// line is blank (or whose content ends in `\n` once stripped of line
-	// numbers) trigger the length-mismatch fallback to plain text.
-	if n := len(stripped); n > 0 && stripped[n-1] == "" {
-		stripped = stripped[:n-1]
-	}
-
-	highlighted := highlightLines(filePathOf(ref.input), strings.Join(stripped, "\n"), e.theme.UseColor())
-	if len(highlighted) != len(stripped) {
-		highlighted = stripped
-	}
-
-	lines := make([]ui.Line, len(highlighted))
-	for i, text := range highlighted {
-		lines[i] = ui.Line{Text: text}
-	}
-
-	e.emitOutputBlock(marker, lines)
-}
-
-// emitEditResult renders the result of an Edit tool call as a
-// line-by-line diff between the call's old_string and new_string:
-// removed lines get a `- ` prefix and a dim-red background tint,
-// additions get `+ ` and a dim-green background tint, and surrounding
-// context (lines common to both) get two leading spaces and no tint.
-// Each line body is syntax-highlighted using a lexer chosen from the
-// original Edit call's `file_path`; the bg-restoration in
-// [ui.Color.Paint] keeps the diff tint solid across chroma's
-// per-token resets. The diff is computed from the saved tool-call
-// input rather than the result block, so the diff reflects what the
-// agent intended to change even when the edit failed.
-func (e *Emitter) emitEditResult(b stream.Block, ref toolRef) {
-	marker := markerResult
-	if b.IsError {
-		marker = markerError
-	}
-
-	var input struct {
-		OldString string `json:"old_string"`
-		NewString string `json:"new_string"`
-	}
-	_ = json.Unmarshal(ref.input, &input)
-
-	filePath := filePathOf(ref.input)
-	highlightedOld := indexHighlightedLines(filePath, input.OldString, e.theme.UseColor())
-	highlightedNew := indexHighlightedLines(filePath, input.NewString, e.theme.UseColor())
-
-	d := diffLines(input.OldString, input.NewString)
-	lines := make([]ui.Line, 0, len(d))
-	var oi, ni int
-	for _, op := range d {
-		var prefix string
-		var color ui.Color
-		var body string
-		switch op.op {
-		case diffRemove:
-			prefix, color = "- ", ui.DiffRemoveBg
-			body = pickHighlighted(highlightedOld, oi, op.text)
-			oi++
-		case diffAdd:
-			prefix, color = "+ ", ui.DiffAddBg
-			body = pickHighlighted(highlightedNew, ni, op.text)
-			ni++
-		default:
-			prefix, color = "  ", ui.Plain
-			body = pickHighlighted(highlightedNew, ni, op.text)
-			oi++
-			ni++
-		}
-		lines = append(lines, ui.Line{Text: prefix + body, Color: color})
-	}
-
-	e.emitOutputBlock(marker, lines)
-}
-
-// indexHighlightedLines returns the lines of content highlighted for
-// filePath, or nil if highlighting failed in a way that left the line
-// count out of sync with the source. Callers pair the returned slice
-// with the original lines so a fall-through to plain text is always
-// possible per line.
-func indexHighlightedLines(filePath, content string, useColor bool) []string {
-	if content == "" {
-		return nil
-	}
-	plain := splitDiffLines(content)
-	hi := highlightLines(filePath, content, useColor)
-	if len(hi) != len(plain) {
-		return plain
-	}
-	return hi
-}
-
-// pickHighlighted returns lines[i] when in range, otherwise fallback.
-// Used by the Edit and Write renderers as a per-line fallback so a
-// short or nil highlighted slice never panics the renderer — it just
-// degrades to the raw source text for that line.
-func pickHighlighted(lines []string, i int, fallback string) string {
-	if i < 0 || i >= len(lines) {
-		return fallback
-	}
-	return lines[i]
-}
-
-// emitWriteResult renders the result of a Write tool call as a
-// "diff from nothing": every line of the new content is shown as an
-// addition (`+ ` prefix, green background tint), mirroring the way
-// Edit renders its hunks. Line bodies are syntax-highlighted from
-// the original Write call's `file_path`. This is faithful for
-// new-file writes (the common case) and a stylised view for
-// overwrites — the `←  Write  <path>` header is the operator's cue
-// that something pre-existing may have been replaced.
-func (e *Emitter) emitWriteResult(b stream.Block, ref toolRef) {
-	marker := markerResult
-	if b.IsError {
-		marker = markerError
-	}
-
-	content := strings.TrimRight(writeContent(ref.input), "\n")
-	if content == "" {
-		e.emitOutputBlock(marker, nil)
-		return
-	}
-
-	plain := strings.Split(content, "\n")
-	hi := indexHighlightedLines(filePathOf(ref.input), content, e.theme.UseColor())
-
-	lines := make([]ui.Line, len(plain))
-	for i, raw := range plain {
-		body := pickHighlighted(hi, i, strings.TrimRight(raw, " \t\r"))
-		lines[i] = ui.Line{Text: "+ " + body, Color: ui.DiffAddBg}
-	}
-	e.emitOutputBlock(marker, lines)
-}
-
-// extractContentText pulls plain text out of a tool_result block's
-// `content` field, which the claude CLI encodes either as a bare JSON
-// string or as an array of {type:"text", text:"..."} objects. Returns
-// an empty string for any other shape.
-func extractContentText(b stream.Block) string {
-	if len(b.Content) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(b.Content, &s); err == nil {
-		return s
-	}
-	var arr []struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(b.Content, &arr); err == nil {
-		var sb strings.Builder
-		for _, item := range arr {
-			sb.WriteString(item.Text)
-		}
-		return sb.String()
-	}
-	return ""
-}
-
-// stripLineNumber removes a leading `cat -n`-style line-number prefix
-// (optional spaces, digits, single tab) from s. Lines that don't match
-// the pattern pass through unchanged, so non-Read consumers and any
-// content that legitimately starts with whitespace and digits stay
-// intact.
-func stripLineNumber(s string) string {
-	i := 0
-	for i < len(s) && s[i] == ' ' {
-		i++
-	}
-	digitStart := i
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-	}
-	if i == digitStart || i >= len(s) || s[i] != '\t' {
-		return s
-	}
-	return s[i+1:]
-}
-
-// bashCommand pulls the `command` field from a Bash tool_use input.
-// Returns an empty string if the field is missing or the JSON is
-// malformed; the renderer then prints a bare arrow rather than crash.
-func bashCommand(input json.RawMessage) string {
-	var s struct {
-		Command string `json:"command"`
-	}
-	_ = json.Unmarshal(input, &s)
-	return s.Command
-}
-
-// writeContent pulls the `content` field from a Write tool_use
-// input. Same fail-soft semantics as [bashCommand].
-func writeContent(input json.RawMessage) string {
-	var s struct {
-		Content string `json:"content"`
-	}
-	_ = json.Unmarshal(input, &s)
-	return s.Content
-}
-
 // filePathOf pulls the `file_path` field from a tool_use input.
-// Shared by the Read and Edit renderers (and any other tool that
-// keys on a single path). Same fail-soft semantics as [bashCommand].
+// Shared by the Read, Edit, and Write renderers (and any other tool
+// that keys on a single path). Same fail-soft semantics as
+// [bashCommand].
 func filePathOf(input json.RawMessage) string {
 	var s struct {
 		FilePath string `json:"file_path"`
 	}
 	_ = json.Unmarshal(input, &s)
 	return s.FilePath
-}
-
-// readTarget renders a Read tool_use input as a `file_path` plus an
-// optional `:start-end` line-range suffix when the agent narrowed the
-// read via `offset` and/or `limit`. The suffix mirrors grep -n's
-// `file:line` convention so the operator can see at a glance what
-// slice the agent asked for.
-//
-//	Read(foo.go)                       → "foo.go"
-//	Read(foo.go, offset=200, limit=50) → "foo.go:200-249"
-//	Read(foo.go, offset=200)           → "foo.go:200-"
-//	Read(foo.go, limit=50)             → "foo.go:1-50"
-//
-// Same fail-soft semantics as [filePathOf].
-func readTarget(input json.RawMessage) string {
-	var s struct {
-		FilePath string `json:"file_path"`
-		Offset   int    `json:"offset"`
-		Limit    int    `json:"limit"`
-	}
-	_ = json.Unmarshal(input, &s)
-	if s.Offset == 0 && s.Limit == 0 {
-		return s.FilePath
-	}
-	start := s.Offset
-	if start == 0 {
-		start = 1
-	}
-	if s.Limit > 0 {
-		return fmt.Sprintf("%s:%d-%d", s.FilePath, start, start+s.Limit-1)
-	}
-	return fmt.Sprintf("%s:%d-", s.FilePath, start)
 }
 
 // emitUserText renders a replayed user-text block (typically the

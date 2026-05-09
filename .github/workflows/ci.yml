@@ -6,19 +6,25 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ["1.26.x"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
 
       - name: go vet
         run: go vet ./...
 
       - name: gofmt
-        run: gofmt -l . | tee /dev/stderr | (! read)
+        if: runner.os != 'Windows'
+        run: test -z "$(gofmt -l .)"
 
       - name: go build
         run: go build ./...
@@ -26,7 +32,42 @@ jobs:
       - name: go test
         run: go test ./... -race -count=1
 
+  cross-vet:
+    # Compile-checks the build-tag branches that the matrix above would
+    # otherwise only exercise from the matching host. Runs on Linux but
+    # cross-compiles for both targets so internal/agent/claude_unix.go +
+    # claude_other.go and internal/ui/theme_unix.go + theme_other.go all
+    # get type-checked on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: go vet (windows)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go vet ./...
+
+      - name: go vet (linux)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: go vet ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v1.62.2

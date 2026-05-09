@@ -1,4 +1,4 @@
-package cli
+package main
 
 import (
 	"fmt"
@@ -10,25 +10,10 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
-// UsageDefaults carries the default flag values shown in the operator
-// manual. The CLI passes these in so the help text and the flag
-// definitions stay in sync without making either side a circular
-// import target.
-type UsageDefaults struct {
-	Version         string
-	Reqs            string
-	Model           string
-	Effort          string
-	OneMContext     bool
-	SkipPermissions bool
-	ClaudeAIMCP     bool
-	OutputLines     int
-}
-
-// WriteUsage emits the operator manual to w. It is intentionally
-// self-contained — ralph carries no separate config file and no man
-// page, so this text is the canonical reference.
-func WriteUsage(w io.Writer, d UsageDefaults) {
+// writeUsage emits the operator manual to w. It reads its defaults
+// directly from this package's flag-default constants so the help
+// text and the flag definitions stay in sync.
+func writeUsage(w io.Writer) {
 	fmt.Fprintf(w, `ralph %s — iterative build-agent driver
 
 USAGE
@@ -123,27 +108,27 @@ REQUIREMENT IDS
   Dashes are replaced with underscores inside Go test names so the
   result is a valid identifier.
 `,
-		d.Version,
-		d.Reqs,
-		d.Model,
-		d.Effort,
-		d.OneMContext,
-		d.SkipPermissions,
-		d.ClaudeAIMCP,
-		d.OutputLines,
+		version,
+		defaultReqs,
+		defaultModel,
+		defaultEffort,
+		defaultOneMContext,
+		defaultSkipPermissions,
+		defaultClaudeAIMCP,
+		defaultOutputLines,
 	)
 }
 
-// WriteUsagePaged writes the manual to stdout, routing through a
-// pager when stdout is a terminal. The pager honors $PAGER if set
-// (e.g. PAGER=cat short-circuits paging entirely); otherwise it
-// falls back to `less -FRX`, whose -F flag means "quit if the
-// content fits on one screen", so short manuals stay inline. Any
-// pre-spawn failure (no pager binary, blocked StdinPipe) drops back
-// to writing directly to stdout.
-func WriteUsagePaged(stdout io.Writer, d UsageDefaults) {
+// writeUsagePaged writes the manual to stdout, routing through a pager
+// when stdout is a terminal. The pager honors $PAGER if set
+// (e.g. PAGER=cat short-circuits paging entirely); otherwise it falls
+// back to `less -FRX`, whose -F flag means "quit if the content fits
+// on one screen", so short manuals stay inline. Any pre-spawn failure
+// (no pager binary, blocked StdinPipe) drops back to writing directly
+// to stdout.
+func writeUsagePaged(stdout io.Writer) {
 	if !ui.IsTTY(stdout) {
-		WriteUsage(stdout, d)
+		writeUsage(stdout)
 		return
 	}
 
@@ -154,7 +139,7 @@ func WriteUsagePaged(stdout io.Writer, d UsageDefaults) {
 		argv = []string{"less", "-FRX"}
 	}
 	if len(argv) == 0 {
-		WriteUsage(stdout, d)
+		writeUsage(stdout)
 		return
 	}
 
@@ -163,14 +148,14 @@ func WriteUsagePaged(stdout io.Writer, d UsageDefaults) {
 	cmd.Stderr = os.Stderr
 	pipe, err := cmd.StdinPipe()
 	if err != nil {
-		WriteUsage(stdout, d)
+		writeUsage(stdout)
 		return
 	}
 	if err := cmd.Start(); err != nil {
-		WriteUsage(stdout, d)
+		writeUsage(stdout)
 		return
 	}
-	WriteUsage(pipe, d)
+	writeUsage(pipe)
 	_ = pipe.Close()
 	_ = cmd.Wait()
 }

@@ -109,7 +109,7 @@ func TestRunWith_DrivenByFakeSpawner(t *testing.T) {
 	sp := &fakeSpawner{scripts: [][]byte{[]byte(doneScript)}}
 
 	var out bytes.Buffer
-	err := runWith(minimalValidConfig(), 5*time.Second, &out, sp)
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), &out, sp)
 	if err != nil {
 		t.Fatalf("runWith: %v", err)
 	}
@@ -139,7 +139,7 @@ func (e erroringSpawner) Spawn(context.Context, agent.Config) (Session, error) {
 
 func TestRunWith_PropagatesSpawnError(t *testing.T) {
 	sentinel := errors.New("spawn boom")
-	err := runWith(minimalValidConfig(), 5*time.Second, io.Discard, erroringSpawner{err: sentinel})
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, erroringSpawner{err: sentinel})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel error to propagate, got %v", err)
 	}
@@ -165,7 +165,7 @@ func TestRunWith_CorrectionLoopRecoversAfterBadOutput(t *testing.T) {
 		[]byte(doneScript),
 	}}
 
-	err := runWith(minimalValidConfig(), 5*time.Second, io.Discard, sp)
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
 	if err != nil {
 		t.Fatalf("runWith: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestRunWith_RetryCapExhausts(t *testing.T) {
 	bad := strings.Repeat(badStructuredOutputScript, maxRetriesPerIteration+2)
 	sp := &fakeSpawner{scripts: [][]byte{[]byte(bad)}}
 
-	err := runWith(minimalValidConfig(), 5*time.Second, io.Discard, sp)
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
 	if err == nil {
 		t.Fatal("expected error from retry-cap exhaustion, got nil")
 	}
@@ -218,7 +218,7 @@ func TestRunWith_DecodeErrorContinues(t *testing.T) {
 	sp := &fakeSpawner{scripts: [][]byte{[]byte(script)}}
 
 	var out bytes.Buffer
-	err := runWith(minimalValidConfig(), 5*time.Second, &out, sp)
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), &out, sp)
 	if err != nil {
 		t.Fatalf("runWith: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestRunWith_NonZeroExitWrapsExitError(t *testing.T) {
 		closeErrs: []error{exitErr},
 	}
 
-	err := runWith(minimalValidConfig(), 5*time.Second, io.Discard, sp)
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
 	if err == nil {
 		t.Fatal("expected non-nil error from non-zero exit, got nil")
 	}

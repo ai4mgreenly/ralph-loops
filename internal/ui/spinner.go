@@ -72,6 +72,12 @@ type Spinner struct {
 	start   time.Time
 	stopCh  chan struct{}
 	doneCh  chan struct{}
+
+	// paintCh, when non-nil, receives one empty value after every
+	// paint and once when the goroutine reaches its post-pre-roll
+	// blocking select (so tests can synchronize on goroutine state
+	// without polling). Production code never sets it.
+	paintCh chan<- struct{}
 }
 
 // NewSpinner returns a Spinner that paints to out, prefixed with
@@ -95,10 +101,33 @@ func NewSpinner(out io.Writer, label string, useColor bool) *Spinner {
 
 // withClock swaps in an alternative [clock] implementation. Intended
 // for tests that need deterministic paint timing; production code
-// keeps the [realClock] installed by [NewSpinner].
-func (s *Spinner) withClock(c clock) *Spinner {
+// keeps the [realClock] installed by [NewSpinner]. Returns the
+// receiver so tests can chain configuration calls.
+func (s *Spinner) withClock(c clock) *Spinner { //nolint:unparam // fluent test seam
 	s.clk = c
 	return s
+}
+
+// withPaintCh installs a notification channel that receives one
+// empty value after each paint (and once after the pre-roll select
+// becomes ready for an After fire). Used by tests to synchronize on
+// goroutine progression without polling. Returns the receiver so
+// tests can chain configuration calls.
+func (s *Spinner) withPaintCh(ch chan<- struct{}) *Spinner { //nolint:unparam // fluent test seam
+	s.paintCh = ch
+	return s
+}
+
+// notifyPaint signals one progress notch on s.paintCh. Non-blocking:
+// a slow test consumer never wedges the spinner.
+func (s *Spinner) notifyPaint() {
+	if s.paintCh == nil {
+		return
+	}
+	select {
+	case s.paintCh <- struct{}{}:
+	default:
+	}
 }
 
 // Start begins a new wait interval. The spinner pre-rolls for the
@@ -133,10 +162,12 @@ func (s *Spinner) run() {
 
 	// Pre-roll: don't paint anything at all until the wait is long
 	// enough to be worth annotating.
+	preRoll := s.clk.After(s.delay)
+	s.notifyPaint() // tests: After is now installed
 	select {
 	case <-s.stopCh:
 		return
-	case <-s.clk.After(s.delay):
+	case <-preRoll:
 	}
 
 	frame := 0
@@ -152,9 +183,11 @@ func (s *Spinner) run() {
 		frame = (frame + 1) % len(spinnerFrames)
 	}
 	paint()
+	s.notifyPaint() // tests: first paint complete
 
 	tickCh, tickStop := s.clk.NewTicker(s.tick)
 	defer tickStop()
+	s.notifyPaint() // tests: ticker installed
 	for {
 		select {
 		case <-s.stopCh:
@@ -162,6 +195,7 @@ func (s *Spinner) run() {
 			return
 		case <-tickCh:
 			paint()
+			s.notifyPaint() // tests: tick paint complete
 		}
 	}
 }

@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"os/exec"
 	"slices"
@@ -86,29 +84,6 @@ func TestBuildEnv_DisablesOneMWhenOff(t *testing.T) {
 	env := buildEnv(Config{OneMContext: false})
 	if !envContains(env, "CLAUDE_CODE_DISABLE_1M_CONTEXT=1") {
 		t.Errorf("expected CLAUDE_CODE_DISABLE_1M_CONTEXT=1 when OneMContext is false")
-	}
-}
-
-func TestWriteUserMessage_Framing(t *testing.T) {
-	var buf bytes.Buffer
-	if err := writeUserMessage(&buf, "hello"); err != nil {
-		t.Fatalf("writeUserMessage: %v", err)
-	}
-
-	out := buf.Bytes()
-	if !bytes.HasSuffix(out, []byte("\n")) {
-		t.Fatalf("user message must end with newline, got %q", out)
-	}
-
-	var decoded userMessage
-	if err := json.Unmarshal(bytes.TrimRight(out, "\n"), &decoded); err != nil {
-		t.Fatalf("unmarshal written line: %v", err)
-	}
-	if decoded.Type != "user" || decoded.Message.Role != "user" {
-		t.Errorf("envelope roles wrong: %+v", decoded)
-	}
-	if len(decoded.Message.Content) != 1 || decoded.Message.Content[0].Text != "hello" {
-		t.Errorf("content not preserved: %+v", decoded.Message.Content)
 	}
 }
 

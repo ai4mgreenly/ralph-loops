@@ -11,12 +11,13 @@ import (
 // settings. Tests pass useColor=false when asserting raw strings
 // without ANSI escapes, useColor=true when asserting on the painted
 // output.
-func newTestTheme(useColor bool, width int) *Theme {
+func newTestTheme(t *testing.T, useColor bool, width int) *Theme {
+	t.Helper()
 	return NewThemeWith(useColor, width)
 }
 
 func TestWriteBlock_FirstLineMarkerAndContinuation(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	th.WriteBlock(&buf, "→", []Line{
 		{Text: "first"},
@@ -29,7 +30,7 @@ func TestWriteBlock_FirstLineMarkerAndContinuation(t *testing.T) {
 }
 
 func TestWriteBlock_SoftWrapPreservesGutter(t *testing.T) {
-	th := newTestTheme(false, 13) // 13 - Gutter(3) = 10 visible per line
+	th := newTestTheme(t, false, 13) // 13 - Gutter(3) = 10 visible per line
 	var buf bytes.Buffer
 	th.WriteBlock(&buf, "→", []Line{{Text: "abcdefghijKLMNO"}}, false)
 	// First segment uses marker prefix; the wrap continuation gets
@@ -41,7 +42,7 @@ func TestWriteBlock_SoftWrapPreservesGutter(t *testing.T) {
 }
 
 func TestWriteBlock_SoftWrapBetweenLogicalLines(t *testing.T) {
-	th := newTestTheme(false, 13) // 10 visible runes per line
+	th := newTestTheme(t, false, 13) // 10 visible runes per line
 	var buf bytes.Buffer
 	th.WriteBlock(&buf, "→", []Line{
 		{Text: "+ short"},
@@ -66,7 +67,7 @@ func TestWriteBlock_SoftWrapBetweenLogicalLines(t *testing.T) {
 }
 
 func TestWriteBlock_NonTTYNoWrap(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	long := strings.Repeat("x", 200)
 	th.WriteBlock(&buf, "→", []Line{{Text: long}}, false)
@@ -77,7 +78,7 @@ func TestWriteBlock_NonTTYNoWrap(t *testing.T) {
 }
 
 func TestWriteBlock_TrailingBlank(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	th.WriteBlock(&buf, "→", []Line{{Text: "x"}}, true)
 	if got := buf.String(); got != "→  x\n\n" {
@@ -86,7 +87,7 @@ func TestWriteBlock_TrailingBlank(t *testing.T) {
 }
 
 func TestWriteBlock_EmptyLinesProducesBareMarker(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	th.WriteBlock(&buf, "→", nil, true)
 	if got := buf.String(); got != "→\n\n" {
@@ -95,7 +96,7 @@ func TestWriteBlock_EmptyLinesProducesBareMarker(t *testing.T) {
 }
 
 func TestWriteBlock_PerLineColorAfterWrap(t *testing.T) {
-	th := newTestTheme(true, 8) // 8 - 3 = 5 visible per line
+	th := newTestTheme(t, true, 8) // 8 - 3 = 5 visible per line
 
 	var buf bytes.Buffer
 	th.WriteBlock(&buf, "→", []Line{{Text: "abcdefghij", Color: DimRed}}, false)
@@ -161,7 +162,7 @@ func TestWrapVisible_EmptyAndNoWrap(t *testing.T) {
 }
 
 func TestPaint_BgRestoresAfterInteriorReset(t *testing.T) {
-	th := newTestTheme(true, 0)
+	th := newTestTheme(t, true, 0)
 	// A foreground span inside a bg paint: the inner reset must be
 	// followed by a re-emission of the bg so the line tint stays solid.
 	got := th.Paint(DiffAddBg, "\x1b[31mabc\x1b[0mdef")
@@ -172,7 +173,7 @@ func TestPaint_BgRestoresAfterInteriorReset(t *testing.T) {
 }
 
 func TestPaint_DiffRemoveBg_NoInteriorReset(t *testing.T) {
-	th := newTestTheme(true, 0)
+	th := newTestTheme(t, true, 0)
 	got := th.Paint(DiffRemoveBg, "plain")
 	want := diffRemoveBgEscape + "plain" + resetEscape
 	if got != want {
@@ -181,7 +182,7 @@ func TestPaint_DiffRemoveBg_NoInteriorReset(t *testing.T) {
 }
 
 func TestTool_BackgroundFillsToEdge(t *testing.T) {
-	th := newTestTheme(true, 13) // 10 visible runes per line
+	th := newTestTheme(t, true, 13) // 10 visible runes per line
 
 	var buf bytes.Buffer
 	th.Tool(&buf, "←", "ls", false)
@@ -196,7 +197,7 @@ func TestTool_BackgroundFillsToEdge(t *testing.T) {
 }
 
 func TestTool_BackgroundOnEveryWrappedLine(t *testing.T) {
-	th := newTestTheme(true, 13) // 10 visible runes per line
+	th := newTestTheme(t, true, 13) // 10 visible runes per line
 
 	var buf bytes.Buffer
 	th.Tool(&buf, "←", "abcdefghijKLM", false) // 13 runes -> 10 + 3
@@ -212,7 +213,7 @@ func TestTool_BackgroundOnEveryWrappedLine(t *testing.T) {
 }
 
 func TestTool_NonTTYDropsFillAndColor(t *testing.T) {
-	th := newTestTheme(false, 0) // non-TTY: no wrap, no fill
+	th := newTestTheme(t, false, 0) // non-TTY: no wrap, no fill
 	var buf bytes.Buffer
 	th.Tool(&buf, "←", "ls", false)
 	if got := buf.String(); got != "←  ls\n" {
@@ -221,7 +222,7 @@ func TestTool_NonTTYDropsFillAndColor(t *testing.T) {
 }
 
 func TestDecorate_UsesGutterAndDim(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	th.Decorate(&buf, "↑", "assistant (empty)")
 	want := "↑  assistant (empty)\n\n"
@@ -231,7 +232,7 @@ func TestDecorate_UsesGutterAndDim(t *testing.T) {
 }
 
 func TestRaw_NoTrailingBlank(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	th.Raw(&buf, "←", "ls\nfoo")
 	want := "←  ls\n   foo\n"
@@ -241,7 +242,7 @@ func TestRaw_NoTrailingBlank(t *testing.T) {
 }
 
 func TestLead_TrailingBlank(t *testing.T) {
-	th := newTestTheme(false, 0)
+	th := newTestTheme(t, false, 0)
 	var buf bytes.Buffer
 	th.Lead(&buf, "*", "hello\nworld")
 	want := "*  hello\n   world\n\n"
@@ -251,7 +252,7 @@ func TestLead_TrailingBlank(t *testing.T) {
 }
 
 func TestLead_PaintsLightBlue(t *testing.T) {
-	th := newTestTheme(true, 0)
+	th := newTestTheme(t, true, 0)
 
 	var buf bytes.Buffer
 	th.Lead(&buf, "*", "hello\nworld")

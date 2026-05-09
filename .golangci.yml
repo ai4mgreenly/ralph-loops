@@ -1,3 +1,9 @@
+# golangci-lint v1.62.x
+#
+# Pin a specific config schema. golangci-lint v2 changed the layout;
+# this file is the v1-style config that pairs with v1.62.x (installed
+# via `make tools`).
+
 run:
   timeout: 5m
 
@@ -5,14 +11,48 @@ linters:
   disable-all: true
   enable:
     - errcheck
-    - govet
-    - staticcheck
-    - unused
+    - errorlint
+    - gci
     - gofmt
+    - gofumpt
     - goimports
+    - govet
     - ineffassign
+    - misspell
     - revive
+    - staticcheck
+    - unparam
+    - unused
+
+linters-settings:
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(github.com/ai4mgreenly/ralph-loops)
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+        disabled: false
+        arguments:
+          - "checkPrivateReceivers"
+          - "disableStutteringCheck"
+  errorlint:
+    errorf: true
+    asserts: true
+    comparison: true
 
 issues:
   exclude-dirs:
     - tmp
+    - examples
+  # Tests have a license to skip exported-identifier doc comments and
+  # other strictness — there is no public package surface inside _test.go.
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - revive
+        - errcheck
+        - errorlint
+        - unparam
