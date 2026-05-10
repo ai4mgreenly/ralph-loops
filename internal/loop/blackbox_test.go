@@ -76,17 +76,23 @@ func TestRun_Blackbox_HappyPath(t *testing.T) {
 	}
 }
 
-// TestRun_Blackbox_RejectsBadEffort confirms the public validation
-// path surfaces ErrInvalidConfig from outside the package.
-func TestRun_Blackbox_RejectsBadEffort(t *testing.T) {
+// TestRun_Blackbox_RejectsUnpricedModel pins the operator-facing
+// guarantee that running with a model ralph cannot price for fails
+// fast at startup, instead of silently reporting $0.0000 after a
+// successful (and possibly expensive) run.
+func TestRun_Blackbox_RejectsUnpricedModel(t *testing.T) {
 	cfg := loop.Config{
 		ReqsDir: "reqs",
 		WorkDir: ".",
 		Prompt:  "operator prompt",
 		Theme:   ui.NewThemeWith(false, 0),
 	}
-	err := loop.Run(context.Background(), cfg, loop.WithEffort("ludicrous"))
+	err := loop.Run(context.Background(), cfg, loop.WithModel("not-a-real-model"))
 	if !errors.Is(err, loop.ErrInvalidConfig) {
 		t.Errorf("expected ErrInvalidConfig, got %v", err)
 	}
+	if err != nil && !strings.Contains(err.Error(), "pricing") {
+		t.Errorf("expected error to mention pricing, got %v", err)
+	}
 }
+

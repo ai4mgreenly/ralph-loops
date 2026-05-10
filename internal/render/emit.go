@@ -154,7 +154,7 @@ func (e *Emitter) OnAssistant(a stream.Assistant) {
 		e.rec.TallyBlock(b.Type)
 		switch b.Type {
 		case stream.BlockText:
-			e.theme.Lead(e.out, markerCall, strings.TrimRight(b.Text, " \t\r\n"))
+			e.theme.Lead(e.out, markerCall, e.capLines(strings.TrimRight(b.Text, " \t\r\n")))
 		case stream.BlockToolUse:
 			e.tools[b.ID] = toolRef{name: b.Name, input: b.Input}
 			e.emitToolCall(b)
@@ -249,7 +249,7 @@ func (e *Emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
 func (e *Emitter) emitToolCall(b stream.Block) {
 	switch b.Name {
 	case stream.ToolBash:
-		e.theme.Tool(e.out, markerCall, bashCommand(b.Input), true)
+		e.theme.Tool(e.out, markerCall, e.capLines(bashCommand(b.Input)), true)
 		return
 	case stream.ToolRead:
 		e.theme.Tool(e.out, markerCall, "Read  "+readTarget(b.Input), true)
@@ -263,6 +263,28 @@ func (e *Emitter) emitToolCall(b stream.Block) {
 		content += "  " + param
 	}
 	e.theme.Tool(e.out, markerCall, content, true)
+}
+
+// capLines truncates s to at most [Emitter.outputLines] lines (falling
+// back to [defaultOutputLines] when unset), appending a `...` marker
+// on truncation. Single-line and short multi-line bodies pass through
+// unchanged. The cap exists to keep call-side decorators —
+// [theme.Tool] for Bash heredocs, [theme.Lead] for assistant prose —
+// from leaking unbounded payloads into the operator log; result-side
+// blocks already get the same treatment via [Emitter.emitOutputBlock].
+func (e *Emitter) capLines(s string) string {
+	maxLines := e.outputLines
+	if maxLines <= 0 {
+		maxLines = defaultOutputLines
+	}
+	parts := strings.Split(s, "\n")
+	if len(parts) <= maxLines {
+		return s
+	}
+	capped := make([]string, 0, maxLines+1)
+	capped = append(capped, parts[:maxLines]...)
+	capped = append(capped, "...")
+	return strings.Join(capped, "\n")
 }
 
 // emitOutputBlock renders the shared terminal-style result block used

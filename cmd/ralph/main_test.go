@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
 )
@@ -79,8 +82,50 @@ func TestRun_NewID_RejectsExtraArgs(t *testing.T) {
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(stderr, "no arguments") {
+	if !strings.Contains(stderr, "no positional arguments") {
 		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+func TestRun_NewID_BatchProducesDistinctMonotonicIDs(t *testing.T) {
+	const n = 5
+	code, stdout, stderr := runCapture("newid", "--number", "5")
+	if code != exitSuccess {
+		t.Fatalf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
+	}
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	if len(lines) != n {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), n, stdout)
+	}
+	seen := make(map[string]bool, n)
+	var prev time.Time
+	for i, id := range lines {
+		if seen[id] {
+			t.Errorf("duplicate ID at line %d: %q", i, id)
+		}
+		seen[id] = true
+		ts, err := idgen.TimeOf(id)
+		if err != nil {
+			t.Fatalf("line %d %q: %v", i, id, err)
+		}
+		if i > 0 && !ts.After(prev) {
+			t.Errorf("line %d ts %v not strictly after prev %v", i, ts, prev)
+		}
+		prev = ts
+	}
+}
+
+func TestRun_NewID_RejectsNonPositiveNumber(t *testing.T) {
+	for _, n := range []string{"0", "-1"} {
+		t.Run("number="+n, func(t *testing.T) {
+			code, _, stderr := runCapture("newid", "--number", n)
+			if code != exitUsage {
+				t.Errorf("exit = %d, want %d", code, exitUsage)
+			}
+			if !strings.Contains(stderr, "--number must be > 0") {
+				t.Errorf("stderr = %q", stderr)
+			}
+		})
 	}
 }
 
@@ -119,6 +164,115 @@ func TestRun_TimeOf_InvalidID(t *testing.T) {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
 	}
 	if !strings.Contains(stderr, "ralph:") {
+		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+// decodeUnverified parses the single-line JSON [unverifiedReport]
+// printed by `ralph unverified`. Used by every test in this group so
+// the JSON shape is asserted in one place.
+func decodeUnverified(t *testing.T, stdout string) unverifiedReport {
+	t.Helper()
+	var rep unverifiedReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+		t.Fatalf("decode %q: %v", stdout, err)
+	}
+	return rep
+}
+
+// chdirTemp builds a workdir layout under t.TempDir(), seeds its
+// reqs/ directory and .ralph/ ledger from the supplied bodies, chdirs
+// the test process into the workdir, and registers a t.Cleanup that
+// restores the original cwd. `ralph unverified` reads the workdir
+// from the current directory, so every CLI test in this group needs
+// the same setup.
+func chdirTemp(t *testing.T, specBody, ledgerBody string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "reqs"), 0o755); err != nil {
+		t.Fatalf("mkdir reqs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "reqs", "spec.md"), []byte(specBody), 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	if ledgerBody != "" {
+		ralphDir := filepath.Join(tmp, ".ralph")
+		if err := os.MkdirAll(ralphDir, 0o755); err != nil {
+			t.Fatalf("mkdir .ralph: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(ralphDir, "requirements-verified.jsonl"), []byte(ledgerBody), 0o644); err != nil {
+			t.Fatalf("write ledger: %v", err)
+		}
+	}
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+	return tmp
+}
+
+func TestRun_Unverified_PendingShape(t *testing.T) {
+	chdirTemp(t,
+		"R-052Y-EKE0\nR-3HX7-91ZA\nR-9PQR-12ST\nR-XXXX-XXXX (placeholder)\n",
+		`{"id":"R-052Y-EKE0"}`+"\n")
+
+	code, stdout, stderr := runCapture("unverified")
+	if code != exitSuccess {
+		t.Fatalf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
+	}
+	rep := decodeUnverified(t, stdout)
+	if rep.Status != "pending" {
+		t.Errorf("Status = %q, want %q", rep.Status, "pending")
+	}
+	if rep.Count != 2 {
+		t.Errorf("Count = %d, want 2", rep.Count)
+	}
+	want := []string{"R-3HX7-91ZA", "R-9PQR-12ST"}
+	if !reflect.DeepEqual(rep.List, want) {
+		t.Errorf("List = %v, want %v", rep.List, want)
+	}
+}
+
+func TestRun_Unverified_DoneShape(t *testing.T) {
+	chdirTemp(t,
+		"R-052Y-EKE0\n",
+		`{"id":"R-052Y-EKE0"}`+"\n")
+
+	code, stdout, stderr := runCapture("unverified")
+	if code != exitSuccess {
+		t.Fatalf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
+	}
+	rep := decodeUnverified(t, stdout)
+	if rep.Status != "done" {
+		t.Errorf("Status = %q, want %q", rep.Status, "done")
+	}
+	if rep.Count != 0 {
+		t.Errorf("Count = %d, want 0", rep.Count)
+	}
+	// Empty list must serialise as `[]`, never `null`, so JSON consumers
+	// can index without a nil-check.
+	if rep.List == nil {
+		t.Error("List should be non-nil empty slice, got nil")
+	}
+	if len(rep.List) != 0 {
+		t.Errorf("List = %v, want empty", rep.List)
+	}
+	if !strings.Contains(stdout, `"list":[]`) {
+		t.Errorf("done payload should encode list as []: %q", stdout)
+	}
+}
+
+func TestRun_Unverified_RejectsPositional(t *testing.T) {
+	chdirTemp(t, "R-052Y-EKE0\n", "")
+	code, _, stderr := runCapture("unverified", "some-path")
+	if code != exitUsage {
+		t.Errorf("exit = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "no positional") {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
@@ -313,25 +467,20 @@ func TestRun_Help_AfterOtherFlags(t *testing.T) {
 	}
 }
 
-func TestRun_Loop_RejectsInvalidModel(t *testing.T) {
-	code, _, stderr := runCapture("--model=foo", ".")
+func TestRun_Loop_RejectsEmptyEngine(t *testing.T) {
+	code, _, stderr := runCapture("--engine=", ".")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
 	}
-	// enumFlag.Set surfaces the allowed alternatives in its error;
-	// the flag package then echoes that back through the FlagSet's
-	// configured output (stderr).
-	if !strings.Contains(stderr, "haiku") || !strings.Contains(stderr, "sonnet") || !strings.Contains(stderr, "opus") {
-		t.Errorf("stderr should list allowed models, got: %q", stderr)
+	if !strings.Contains(stderr, "--engine") {
+		t.Errorf("stderr should mention --engine, got %q", stderr)
 	}
 }
 
-func TestRun_Loop_RejectsInvalidEffort(t *testing.T) {
-	code, _, stderr := runCapture("--effort=foo", ".")
-	if code != exitUsage {
-		t.Errorf("exit = %d, want %d", code, exitUsage)
-	}
-	if !strings.Contains(stderr, "low") || !strings.Contains(stderr, "max") {
-		t.Errorf("stderr should list allowed effort levels, got: %q", stderr)
+func TestRun_Help_DocumentsEngine(t *testing.T) {
+	_, stdout, _ := runCapture("help")
+	if !strings.Contains(stdout, "--engine=COMMAND") {
+		t.Errorf("help output missing --engine flag row: %q", stdout)
 	}
 }
+

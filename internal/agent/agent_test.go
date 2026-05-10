@@ -51,6 +51,22 @@ func TestBuildArgs_OmitsSkipPermissions(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_RawForwarded(t *testing.T) {
+	cfg := Config{Model: "opus", Effort: "medium", Raw: true}
+	got := buildArgs(cfg)
+	if !slices.Contains(got, "--raw") {
+		t.Errorf("--raw should be forwarded when Raw is true: %v", got)
+	}
+}
+
+func TestBuildArgs_OmitsRaw(t *testing.T) {
+	cfg := Config{Model: "opus", Effort: "medium"}
+	got := buildArgs(cfg)
+	if slices.Contains(got, "--raw") {
+		t.Errorf("--raw should be omitted when Raw is false: %v", got)
+	}
+}
+
 func TestBuildEnv_FullConfig(t *testing.T) {
 	cfg := Config{
 		ConfigDir:   "/tmp/cfg",

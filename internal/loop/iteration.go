@@ -96,6 +96,7 @@ func agentConfig(cfg Config, o options) agent.Config {
 		OneMContext:     o.oneMContext,
 		ClaudeAIMCP:     o.claudeAIMCP,
 		WorkDir:         cfg.WorkDir,
+		Raw:             o.raw,
 	}
 }
 

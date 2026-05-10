@@ -8,8 +8,8 @@ import (
 )
 
 // setProcessGroup arranges for cmd to run in its own process group so
-// signals delivered to -pgid reach the entire subtree (claude plus any
-// tool grandchildren).
+// signals delivered to -pgid reach the entire subtree (the engine
+// plus any tool grandchildren).
 func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }

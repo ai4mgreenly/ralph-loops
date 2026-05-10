@@ -80,6 +80,14 @@ Mint a fresh ID by running:
 
     ralph newid
 
+To mint several at once — useful when drafting a batch of new
+requirements in one pass — pass `--number=N` (or `-n N`):
+
+    ralph newid --number=5
+
+The IDs print one per line. Because each ID is anchored to a distinct
+elapsed millisecond, `--number=N` takes at least ~N-1 ms.
+
 Recover the timestamp an ID was minted from:
 
     ralph time-of R-XXXX-XXXX

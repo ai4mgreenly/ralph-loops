@@ -4,7 +4,7 @@ import "testing"
 
 func TestLookup_KnownAliases(t *testing.T) {
 	t.Parallel()
-	for _, alias := range []string{"haiku", "sonnet", "opus"} {
+	for _, alias := range []string{"haiku", "sonnet", "opus", "gpt-5.5"} {
 		if _, ok := Lookup(alias); !ok {
 			t.Errorf("Lookup missing alias %q", alias)
 		}
@@ -57,7 +57,10 @@ func TestHasModel(t *testing.T) {
 func TestModels_RatesAreSane(t *testing.T) {
 	t.Parallel()
 	for alias, p := range models {
-		if p.Input <= 0 || p.Output <= 0 || p.CacheRead <= 0 || p.CacheCreate <= 0 {
+		// Some vendors don't bill cache-create separately (OpenAI is the
+		// canonical case); zero is therefore valid. Negative is always a
+		// typo.
+		if p.Input <= 0 || p.Output <= 0 || p.CacheRead <= 0 || p.CacheCreate < 0 {
 			t.Errorf("%s: non-positive rate in %+v", alias, p)
 		}
 		if p.Output <= p.Input {

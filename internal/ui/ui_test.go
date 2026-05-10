@@ -556,8 +556,8 @@ func TestColor_String(t *testing.T) {
 func TestHeader(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	Header(&buf, "1.2.3", "opus", "medium", "unlimited")
-	want := "ralph v1.2.3\nmodel=opus effort=medium duration=unlimited\n\n"
+	Header(&buf, "1.2.3", "claude", "opus", "medium", "unlimited")
+	want := "ralph v1.2.3\nengine=claude model=opus effort=medium duration=unlimited\n\n"
 	if got := buf.String(); got != want {
 		t.Errorf("Header:\ngot  %q\nwant %q", got, want)
 	}

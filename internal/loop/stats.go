@@ -31,7 +31,9 @@ const statsLabelWidth = 18
 type stats struct {
 	mu sync.Mutex
 
+	engine    string
 	model     string
+	effort    string
 	startTime time.Time
 
 	// now is the wall-clock source. Held as a func so tests can pin
@@ -93,14 +95,18 @@ var orderedBlockTypes = []string{
 // newStats returns a zero-valued accumulator anchored to now() and
 // configured to compute cost against the named model. Unknown models
 // produce zero-cost output; the operator still gets the token counts.
-// resultsHome is the directory the closing panel's JSONL log gets
-// written to; an empty string disables that log.
-func newStats(model string, now func() time.Time, resultsHome string) *stats {
+// engine and effort are recorded alongside the model so the closing
+// panel and the JSONL log can report which engine command and effort
+// level the run used. resultsHome is the directory the closing panel's
+// JSONL log gets written to; an empty string disables that log.
+func newStats(engine, model, effort string, now func() time.Time, resultsHome string) *stats {
 	if now == nil {
 		now = time.Now
 	}
 	return &stats{
+		engine:      engine,
 		model:       model,
+		effort:      effort,
 		now:         now,
 		resultsHome: resultsHome,
 		startTime:   now(),
@@ -206,6 +212,9 @@ func (c *costUSD) UnmarshalJSON(b []byte) error {
 // reconstruct the report.
 type summary struct {
 	Reqs       string         `json:"reqs"`
+	Engine     string         `json:"engine"`
+	Model      string         `json:"model"`
+	Effort     string         `json:"effort"`
 	Exit       string         `json:"exit,omitempty"`
 	Iterations int            `json:"iterations"`
 	Events     map[string]int `json:"events"`
@@ -250,6 +259,9 @@ func (s *stats) snapshot(reqs string, exit exitReason) summary {
 	}
 	return summary{
 		Reqs:       reqs,
+		Engine:     s.engine,
+		Model:      s.model,
+		Effort:     s.effort,
 		Exit:       exit.String(),
 		Iterations: s.iterations,
 		Events:     maps.Clone(s.events),
@@ -291,6 +303,15 @@ func (sum summary) writeText(w io.Writer, width int) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, rule)
 	fmt.Fprintf(w, "reqs:        %s\n", sum.Reqs)
+	if sum.Engine != "" {
+		fmt.Fprintf(w, "engine:      %s\n", sum.Engine)
+	}
+	if sum.Model != "" {
+		fmt.Fprintf(w, "model:       %s\n", sum.Model)
+	}
+	if sum.Effort != "" {
+		fmt.Fprintf(w, "effort:      %s\n", sum.Effort)
+	}
 	if sum.Exit != "" {
 		fmt.Fprintf(w, "exit:        %s\n", sum.Exit)
 	}

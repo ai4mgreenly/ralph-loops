@@ -4,12 +4,14 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -26,7 +28,7 @@ import (
 // in-tree — no external claude binary required.
 
 // helperSpawner returns a [*Spawner] wired to re-exec the test binary
-// in helper mode. The cfg-shaped flags claude expects are still
+// in helper mode. The cfg-shaped flags the engine expects are still
 // produced (so we exercise the real argv path) but the helper just
 // ignores them.
 func helperSpawner(t *testing.T, mode string) *Spawner {
@@ -37,8 +39,8 @@ func helperSpawner(t *testing.T, mode string) *Spawner {
 	}
 	// "--" separates test framework flags from the production argv
 	// the spawner appends. Without the separator, Go's testing
-	// package would gobble the claude flags as unknown test flags.
-	sp := newSpawnerWithBinary(exe, "-test.run=TestHelperProcess", "--")
+	// package would gobble the engine flags as unknown test flags.
+	sp := newSpawnerWithExtraArgs(exe, "-test.run=TestHelperProcess", "--")
 	sp.Stderr = io.Discard
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("HELPER_MODE", mode)
@@ -191,6 +193,45 @@ func TestSpawner_CancelDeliversSignal(t *testing.T) {
 	}
 }
 
+func TestSpawner_StdoutTapMirrorsBytes(t *testing.T) {
+	sp := helperSpawner(t, "happy")
+	var tap bytes.Buffer
+	sp.Stdout = &tap
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := sp.Spawn(ctx, Config{Model: "opus", Effort: "medium", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := sess.Send("kickoff"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if ev := drainUntil(t, sess.Events(), stream.TypeResult); ev == nil {
+		_ = sess.Close()
+		t.Fatal("did not see result event before EOF")
+	}
+	if err := sess.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+
+	got := tap.String()
+	// The "happy" helper prints exactly two lines verbatim; the tap
+	// must observe both, byte-for-byte, in order.
+	want := []string{
+		`{"type":"system","subtype":"init","model":"sonnet"}` + "\n",
+		`{"type":"result","is_error":false,"structured_output":{"status":"DONE"}}` + "\n",
+	}
+	for _, line := range want {
+		if !strings.Contains(got, line) {
+			t.Errorf("tap missing line %q\nfull tap: %q", line, got)
+		}
+	}
+	if got != want[0]+want[1] {
+		t.Errorf("tap content = %q, want %q", got, want[0]+want[1])
+	}
+}
+
 func TestSpawner_HangingChildIsKilled(t *testing.T) {
 	sp := helperSpawner(t, "hang")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -199,9 +240,9 @@ func TestSpawner_HangingChildIsKilled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	cs, ok := sess.(*claudeSession)
+	cs, ok := sess.(*engineSession)
 	if !ok {
-		t.Fatalf("expected *claudeSession, got %T", sess)
+		t.Fatalf("expected *engineSession, got %T", sess)
 	}
 	pid := cs.cmd.Process.Pid
 

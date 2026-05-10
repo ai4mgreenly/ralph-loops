@@ -20,26 +20,36 @@ USAGE
   ralph [flags] WORKDIR        Run the iteration loop against WORKDIR.
   ralph init PATH              Scaffold PATH/reqs/ with a starter spec
                                and a brief for an interactive helper agent.
-  ralph newid                  Print a fresh requirement ID (R-XXXX-XXXX).
+  ralph newid [--number=N|-n N]
+                               Print N fresh requirement IDs (R-XXXX-XXXX),
+                               one per line. Default N=1. Each ID is
+                               anchored to a distinct elapsed millisecond,
+                               so N IDs take at least ~N-1 ms.
   ralph time-of ID             Print the UTC instant from which ID was minted.
+  ralph unverified             Print a JSON report of the IDs in --reqs not
+                               yet recorded in ./.ralph/requirements-verified.jsonl.
+                               The current directory is treated as the workdir.
   ralph version                Print version.
   ralph help                   Print this manual.
 
 DESCRIPTION
-  ralph spawns the claude CLI in a loop. Each iteration the agent reads
-  the spec under --reqs, inspects the source tree at WORKDIR, makes one
-  focused change, runs whatever tests the project defines, and reports
-  back DONE or CONTINUE. The loop ends when the agent reports DONE or
-  the wall-clock budget set by --duration expires.
+  ralph spawns an engine CLI in a loop. The engine is the binary that
+  implements claude's stream-json wire contract — by default the
+  claude CLI itself, or any drop-in replacement passed via --engine.
+  Each iteration the agent reads the spec under --reqs, inspects the
+  source tree at WORKDIR, makes one focused change, runs whatever tests
+  the project defines, and reports back DONE or CONTINUE. The loop ends
+  when the agent reports DONE or the wall-clock budget set by
+  --duration expires.
 
   The minimal invocation
 
       ralph .
 
   uses every default below: it reads the spec from ./reqs/, builds in
-  the current directory, calls opus at medium effort with the 1M-token
-  context window enabled and permission prompts skipped, and runs until
-  DONE with no time cap.
+  the current directory, drives claude (sonnet, high effort) with the
+  1M-token context window enabled and permission prompts skipped, and
+  runs until DONE with no time cap.
 
 CONTRACT WITH THE AGENT
   --reqs is read-only to the agent. It is the operator's input; only
@@ -50,8 +60,25 @@ CONTRACT WITH THE AGENT
 FLAGS (loop subcommand)
   --reqs=PATH                          requirements directory
                                        (default: %q)
-  --model=haiku|sonnet|opus            model alias (default: %q)
-  --effort=low|medium|high|xhigh|max   effort level (default: %q)
+  --engine=COMMAND                     engine command (claude drop-in
+                                       replacement) resolved via $PATH;
+                                       must implement claude's
+                                       stream-json contract
+                                       (default: %q)
+  --model=NAME                         model alias forwarded to the
+                                       engine. Must have a pricing
+                                       entry in internal/pricing —
+                                       ralph rejects unknown models at
+                                       startup so operators are not
+                                       surprised by a $0.0000 cost
+                                       report on an untracked model.
+                                       Adding a new model is one row
+                                       in pricing.go (default: %q).
+  --effort=NAME                        effort level forwarded to the
+                                       engine. Engine-specific
+                                       (e.g. low|medium|high|xhigh|max
+                                       for claude); ralph does not
+                                       validate (default: %q).
   --duration=DURATION                  wall-clock budget, Go duration
                                        syntax: 30s, 90m, 4h, 1h30m.
                                        Empty = unlimited (default).
@@ -61,14 +88,23 @@ FLAGS (loop subcommand)
                                        (default: %t)
   --dangerously-skip-permissions[=BOOL]
                                        pass --dangerously-skip-permissions
-                                       through to claude (default: %t)
+                                       through to the engine (default: %t)
   --enable-claudeai-mcp-servers[=BOOL]
                                        enable Claude.ai-managed MCP
                                        servers (default: %t)
-  --tools=LIST                         pass --tools through to claude.
+  --tools=LIST                         pass --tools through to the engine.
                                        Empty = all built-ins (default).
   --verbose[=BOOL]                     echo low-signal stream events
                                        (system init, rate_limit) (default: false)
+  --raw[=BOOL]                         debug passthrough: dump the
+                                       engine's stdout verbatim as
+                                       JSONL (prefixed with a
+                                       _ralph_kickoff envelope describing
+                                       the prompt), suppress every
+                                       decorator, run exactly one
+                                       iteration. Use to capture a
+                                       diagnosable wire trace from an
+                                       alternate engine (default: false).
   --output-lines=N                     max lines of tool output (Bash
                                        stdout/stderr, Read contents,
                                        Edit/Write hunks) replayed per
@@ -83,7 +119,7 @@ EXAMPLES
       ralph .
 
   Custom budget and a different model:
-      ralph --model=sonnet --duration=2h .
+      ralph --model=opus --duration=2h .
 
   Spec lives elsewhere, code in ./app:
       ralph --reqs=../shared-spec ./app
@@ -110,6 +146,7 @@ REQUIREMENT IDS
 `,
 		version,
 		defaultReqs,
+		defaultEngine,
 		defaultModel,
 		defaultEffort,
 		defaultOneMContext,

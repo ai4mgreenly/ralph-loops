@@ -16,7 +16,7 @@ import (
 )
 
 func TestStats_TrackUsageComputesCost(t *testing.T) {
-	s := newStats("opus", nil, "")
+	s := newStats("claude", "opus", "high", nil, "")
 	s.TrackUsage(&stream.Usage{
 		InputTokens:              1_000_000,
 		OutputTokens:             1_000_000,
@@ -39,7 +39,7 @@ func TestStats_TrackUsageComputesCost(t *testing.T) {
 }
 
 func TestStats_TrackUsageUnknownModelStillTalliesTokens(t *testing.T) {
-	s := newStats("nonexistent", nil, "")
+	s := newStats("claude", "nonexistent", "high", nil, "")
 	s.TrackUsage(&stream.Usage{InputTokens: 100})
 	if s.cost != 0 {
 		t.Errorf("expected zero cost for unknown model, got %d", s.cost)
@@ -50,7 +50,7 @@ func TestStats_TrackUsageUnknownModelStillTalliesTokens(t *testing.T) {
 }
 
 func TestStats_CostJSONRoundTrips(t *testing.T) {
-	s := newStats("opus", nil, "")
+	s := newStats("claude", "opus", "high", nil, "")
 	s.TrackUsage(&stream.Usage{
 		InputTokens:              1_000_000,
 		OutputTokens:             1_000_000,
@@ -78,7 +78,7 @@ func TestStats_CostJSONRoundTrips(t *testing.T) {
 }
 
 func TestStats_PanelLayout(t *testing.T) {
-	s := newStats("opus", nil, "")
+	s := newStats("claude", "opus", "high", nil, "")
 	s.iterations = 2
 	s.tallyEvent(stream.TypeAssistant)
 	s.tallyEvent(stream.TypeAssistant)
@@ -97,6 +97,8 @@ func TestStats_PanelLayout(t *testing.T) {
 	wantSubstrings := []string{
 		ui.RuleChar + ui.RuleChar + ui.RuleChar, // unicode rule appears
 		"reqs:        /some/reqs",
+		"model:       opus",
+		"effort:      high",
 		"exit:        done",
 		"iterations:  2",
 		"assistant          2",
@@ -123,7 +125,7 @@ func TestStats_PanelLayout(t *testing.T) {
 }
 
 func TestStats_PanelOmitsExitWhenEmpty(t *testing.T) {
-	s := newStats("opus", nil, "")
+	s := newStats("claude", "opus", "high", nil, "")
 	var buf bytes.Buffer
 	s.snapshot("/some/reqs", exitNone).writeText(&buf, 0)
 	if strings.Contains(buf.String(), "exit:") {
@@ -183,7 +185,7 @@ func TestAppendResultsJSONL_SilentWhenMkdirFails(t *testing.T) {
 }
 
 func TestStats_SnapshotShape(t *testing.T) {
-	s := newStats("opus", nil, "")
+	s := newStats("claude", "opus", "high", nil, "")
 	s.iterations = 3
 	s.tallyEvent(stream.TypeAssistant)
 	s.TallyBlock(stream.BlockText)
@@ -194,6 +196,12 @@ func TestStats_SnapshotShape(t *testing.T) {
 	sum := s.snapshot("/path/to/reqs", exitDone)
 	if sum.Reqs != "/path/to/reqs" {
 		t.Errorf("Reqs = %q", sum.Reqs)
+	}
+	if sum.Model != "opus" {
+		t.Errorf("Model = %q, want %q", sum.Model, "opus")
+	}
+	if sum.Effort != "high" {
+		t.Errorf("Effort = %q, want %q", sum.Effort, "high")
 	}
 	if sum.Exit != "done" {
 		t.Errorf("Exit = %q", sum.Exit)

@@ -12,7 +12,7 @@ import (
 // path is covered by the integration tests in package agent — but
 // we do exercise the side-effect-free getters callers compose with.
 func TestSpawner_Blackbox_NewSpawnerNotNil(t *testing.T) {
-	sp := agent.NewSpawner()
+	sp := agent.NewSpawner("claude")
 	if sp == nil {
 		t.Fatal("NewSpawner returned nil")
 	}

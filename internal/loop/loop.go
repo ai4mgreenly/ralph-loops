@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
-	"slices"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -36,16 +37,12 @@ import (
 // Default values for every [Option]. The CLI surfaces the same set
 // (with the same defaults) at the flag layer.
 const (
-	defaultModel       = "opus"
-	defaultEffort      = "medium"
+	defaultEngine      = "claude"
+	defaultModel       = "sonnet"
+	defaultEffort      = "high"
 	defaultVersion     = "dev"
 	defaultOutputLines = 0 // 0 means "let the emitter pick"
 )
-
-// AllowedEfforts is the canonical set of accepted values for
-// [WithEffort]. Exported so the CLI flag layer can reuse the same list
-// for its --effort enumFlag, keeping the two validators in sync.
-var AllowedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 
 // Config carries the small set of values [Run] insists on. Everything
 // else is optional and threaded through [Option] arguments. A zero
@@ -78,6 +75,7 @@ type Option func(*options)
 // the model/effort knobs, behaviour switches, and seams (clock,
 // results path) so the run kernel can see them as a single struct.
 type options struct {
+	engine          string
 	model           string
 	effort          string
 	version         string
@@ -88,12 +86,13 @@ type options struct {
 	claudeAIMCP     bool
 	skipPermissions bool
 	verbose         bool
+	raw             bool
 	outputLines     int
 	now             func() time.Time
 	resultsHome     string
 	// spawner, when non-nil, overrides the production [Spawner] inside
 	// [Run]. Set via [WithSpawner]; production callers leave it nil so
-	// [defaultSpawner] supplies the real claude-backed implementation.
+	// [defaultSpawner] supplies the real engine-backed implementation.
 	spawner Spawner
 }
 
@@ -101,6 +100,7 @@ type options struct {
 // defaults; option functions then layer on top.
 func defaultOptions() options {
 	return options{
+		engine:      defaultEngine,
 		model:       defaultModel,
 		effort:      defaultEffort,
 		version:     defaultVersion,
@@ -108,12 +108,17 @@ func defaultOptions() options {
 	}
 }
 
+// WithEngine sets the engine command — the agent CLI ralph spawns each
+// iteration. The named binary is resolved via $PATH at [Run] time and
+// must implement claude's stream-json wire contract. Default: "claude".
+func WithEngine(s string) Option { return func(o *options) { o.engine = s } }
+
 // WithModel sets the claude model alias (one of "haiku", "sonnet",
-// "opus"). Default: "opus".
+// "opus"). Default: "sonnet".
 func WithModel(m string) Option { return func(o *options) { o.model = m } }
 
 // WithEffort sets the effort level (one of "low", "medium", "high",
-// "xhigh", "max"). Default: "medium".
+// "xhigh", "max"). Default: "high".
 func WithEffort(e string) Option { return func(o *options) { o.effort = e } }
 
 // WithVersion sets the version string included in the run banner.
@@ -145,6 +150,17 @@ func WithSkipPermissions(v bool) Option { return func(o *options) { o.skipPermis
 // WithVerbose toggles the rendering of low-signal stream events
 // (system init, rate_limit) into the operator log.
 func WithVerbose(v bool) Option { return func(o *options) { o.verbose = v } }
+
+// WithRaw enables debug passthrough: the loop suppresses every
+// rendering decorator (banner, iteration headers, spinner, formatted
+// events, stats panel, results.jsonl) and instead taps the engine's
+// stdout, copying every byte the engine emits to the run writer
+// verbatim. The session sends the kickoff prompt — first prefixed onto
+// the wire as a `{"type":"_ralph_kickoff","prompt":"..."}` envelope so
+// the trace records its own input — and then drains the stream to EOF.
+// Exactly one iteration runs; structured-output retries are off because
+// nothing is parsed. Intended for diagnosing alternate-engine traces.
+func WithRaw(v bool) Option { return func(o *options) { o.raw = v } }
 
 // WithOutputLines caps the number of tool-output lines replayed per
 // result before truncation. A value <= 0 leaves the emitter's own
@@ -243,33 +259,40 @@ func Run(ctx context.Context, cfg Config, opts ...Option) error {
 	}
 	sp := o.spawner
 	if sp == nil {
-		sp = defaultSpawner()
+		// Resolve the engine binary against $PATH up front so a missing
+		// or misspelled command crashes loudly before we print the
+		// banner or open the results log. The default "claude" is
+		// validated through the same path; an operator who has not
+		// installed claude (or whose PATH is wrong) gets a clear error
+		// rather than an opaque failure on the first iteration.
+		if _, err := exec.LookPath(o.engine); err != nil {
+			return fmt.Errorf("engine %q not found in PATH: %w", o.engine, err)
+		}
+		sp = defaultSpawner(o.engine, o.raw, os.Stdout)
 	}
 	return runWith(ctx, cfg, o, os.Stdout, sp)
 }
 
-// defaultSpawner returns the production [Spawner] backed by the real
-// claude CLI. *agent.Spawner satisfies the consumer-side interface in
+// defaultSpawner returns the production [Spawner] backed by the named
+// engine CLI. *agent.Spawner satisfies the consumer-side interface in
 // this package directly because [agent.Spawner.Spawn] returns the
 // [agent.Session] interface, not a concrete type.
-func defaultSpawner() Spawner { return agent.NewSpawner() }
+//
+// When raw is true, the spawner taps the engine's stdout into tap so
+// every byte the engine emits is mirrored verbatim — the substrate
+// for [WithRaw].
+func defaultSpawner(engine string, raw bool, tap io.Writer) Spawner {
+	sp := agent.NewSpawner(engine)
+	if raw {
+		sp.Stdout = tap
+	}
+	return sp
+}
 
 // runWith is the testable kernel of [Run]. It assumes cfg is already
 // validated and writes the banner and stats panel to w. The spawner
 // seam lets tests drive a full run with no subprocess.
 func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner) error {
-	now := o.now
-	if now == nil {
-		now = time.Now
-	}
-	resultsHome := o.resultsHome
-	if resultsHome == "" {
-		resultsHome = defaultResultsHomePath()
-	}
-
-	ui.Header(w, o.version, o.model, o.effort, formatBudget(o.duration))
-	fmt.Fprintf(w, "reqs=%s\nworkdir=%s\n\n", cfg.ReqsDir, cfg.WorkDir)
-
 	// First SIGINT/SIGTERM cancels the context, giving the run a chance
 	// to wind down gracefully. signal.NotifyContext (Go 1.16+) replaces
 	// the hand-rolled goroutine that used to live here.
@@ -279,14 +302,30 @@ func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner
 	runCtx, cancel := withBudget(sigCtx, o.duration)
 	defer cancel()
 
-	// A second SIGINT after the context is already canceled is the
-	// operator telling us "I'm done waiting." Translate it into a
-	// hard exit. We register a separate channel because NotifyContext
-	// stops listening once it has fired.
-	stopForce := installForceQuit(sigCtx, w, os.Exit)
+	// Once the first SIGINT cancels sigCtx, give the run a fixed grace
+	// window to wind down on its own. If it is still running when the
+	// deadline fires, force a hard exit — the operator should not have
+	// to babysit a stuck shutdown.
+	stopForce := installShutdownDeadline(sigCtx, forceQuitDeadline, w, os.Exit)
 	defer stopForce()
 
-	s := newStats(o.model, now, resultsHome)
+	if o.raw {
+		return runRaw(runCtx, cfg, o, w, sp)
+	}
+
+	now := o.now
+	if now == nil {
+		now = time.Now
+	}
+	resultsHome := o.resultsHome
+	if resultsHome == "" {
+		resultsHome = defaultResultsHomePath()
+	}
+
+	ui.Header(w, o.version, o.engine, o.model, o.effort, formatBudget(o.duration))
+	fmt.Fprintf(w, "reqs=%s\nworkdir=%s\n\n", cfg.ReqsDir, cfg.WorkDir)
+
+	s := newStats(o.engine, o.model, o.effort, now, resultsHome)
 	e := render.NewEmitter(
 		w, s, cfg.Theme,
 		render.WithVerbose(o.verbose),
@@ -294,7 +333,7 @@ func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner
 	)
 
 	exit, runErr := drive(runCtx, cfg, o, sp, e, s)
-	sum := s.snapshot(cfg.ReqsDir, exit)
+	sum := s.snapshot(realPath(cfg.ReqsDir), exit)
 	sum.writeText(w, cfg.Theme.Width())
 	appendResultsJSONL(resultsHome, sum)
 
@@ -354,52 +393,67 @@ func withBudget(parent context.Context, budget time.Duration) (context.Context, 
 	return context.WithTimeout(parent, budget)
 }
 
-// installForceQuit watches for a second SIGINT arriving after sigCtx
-// has already been canceled by the first one. When that happens the
-// operator has signalled they are unwilling to wait for graceful
-// shutdown, so we log to w (or stderr if w is nil) and call quit(130)
-// — the conventional "terminated by SIGINT" status. The returned
-// function uninstalls the handler and should be deferred.
-//
-// quit is injected so tests can drive a real second-SIGINT and assert
-// the call rather than terminating the test process. Production code
-// passes [os.Exit].
-func installForceQuit(sigCtx context.Context, w io.Writer, quit func(int)) func() {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+// forceQuitDeadline is how long [installShutdownDeadline] waits after
+// the first interrupt before force-quitting. Long enough that a normal
+// graceful shutdown completes inside it; short enough that a stuck run
+// doesn't leave the operator hammering Ctrl-C.
+const forceQuitDeadline = 10 * time.Second
 
+// installShutdownDeadline arms a force-quit timer that starts when
+// sigCtx is canceled (i.e. after the first SIGINT). If the run is
+// still alive `deadline` later, we log to w (or stderr if w is nil)
+// and call quit(130) — the conventional "terminated by SIGINT" status.
+// The returned function disarms the timer and should be deferred; once
+// it has run the goroutine exits without firing.
+//
+// quit is injected so tests can pass a tiny deadline and assert the
+// call rather than terminating the test process. Production code
+// passes [os.Exit].
+func installShutdownDeadline(sigCtx context.Context, deadline time.Duration, w io.Writer, quit func(int)) func() {
 	done := make(chan struct{})
 	go func() {
-		// Wait for the graceful-cancel context to fire before we start
-		// listening for a "second" signal — otherwise we'd race with
-		// NotifyContext and could turn a single Ctrl-C into a hard exit.
+		// Wait for the graceful-cancel context to fire before arming the
+		// timer; otherwise the deadline would start counting from
+		// program launch and a long, healthy run could trip it.
 		select {
 		case <-sigCtx.Done():
 		case <-done:
 			return
 		}
+		t := time.NewTimer(deadline)
+		defer t.Stop()
 		select {
-		case <-sigCh:
+		case <-t.C:
 			out := w
 			if out == nil {
 				out = os.Stderr
 			}
-			fmt.Fprintln(out, "ralph: received second interrupt; force-quitting")
+			fmt.Fprintf(out, "ralph: graceful shutdown exceeded %s; force-quitting\n", deadline)
 			quit(130)
 		case <-done:
 		}
 	}()
 
-	return func() {
-		signal.Stop(sigCh)
-		// Drain any signal queued between Stop and the receive in the
-		// goroutine, so no goroutine leak retains a delivered signal.
-		select {
-		case <-sigCh:
-		default:
-		}
-		close(done)
+	return func() { close(done) }
+}
+
+// realPath returns p resolved to an absolute, symlink-followed path
+// suitable for the closing report. If either resolution step fails the
+// best partial result is returned, falling back to p unchanged — the
+// report should never be derailed by a path that can't be canonicalised.
+func realPath(p string) string {
+	if p == "" {
+		return p
 	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return resolved
 }
 
 // formatBudget renders the wall-clock cap for the run banner, with a
@@ -434,11 +488,18 @@ func validate(cfg Config, o options) error {
 	if o.duration < 0 {
 		errs = append(errs, fmt.Errorf("duration must be non-negative (got %v)", o.duration))
 	}
+	// --model is gated against the pricing table — not against an
+	// engine-specific allowlist. The gate exists so an operator who
+	// runs a model ralph can't price for is told up front, instead of
+	// discovering after the fact that a multi-hour run reported
+	// $0.0000. Add new entries to internal/pricing/pricing.go (it is
+	// additive: alternate engines like gpt-5.5 live alongside the
+	// haiku/sonnet/opus rows). --effort stays pass-through: the engine
+	// owns its vocabulary and effort has no pricing implication.
 	if !pricing.HasModel(o.model) {
-		errs = append(errs, fmt.Errorf("model %q is not a known alias", o.model))
-	}
-	if !slices.Contains(AllowedEfforts, o.effort) {
-		errs = append(errs, fmt.Errorf("effort %q must be one of %v", o.effort, AllowedEfforts))
+		errs = append(errs, fmt.Errorf(
+			"model %q has no pricing entry; add it to internal/pricing/pricing.go (known: %v)",
+			o.model, pricing.Models()))
 	}
 	return errors.Join(errs...)
 }

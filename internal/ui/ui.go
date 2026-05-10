@@ -206,10 +206,11 @@ func wrapVisible(s string, max int) []string {
 }
 
 // Header writes the run banner. duration may be any pre-formatted
-// string (for example "unlimited" or "4h 0m 0s").
-func Header(w io.Writer, version, model, effort, duration string) {
+// string (for example "unlimited" or "4h 0m 0s"). engine is the
+// command name of the agent CLI being driven (typically "claude").
+func Header(w io.Writer, version, engine, model, effort, duration string) {
 	fmt.Fprintf(w, "ralph v%s\n", version)
-	fmt.Fprintf(w, "model=%s effort=%s duration=%s\n\n", model, effort, duration)
+	fmt.Fprintf(w, "engine=%s model=%s effort=%s duration=%s\n\n", engine, model, effort, duration)
 }
 
 // FormatBytes renders a byte count as a compact human-readable string

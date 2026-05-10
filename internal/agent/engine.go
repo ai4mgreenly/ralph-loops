@@ -14,11 +14,6 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
-// claudeBinary is the executable name the production spawner runs.
-// Tests can construct a Spawner with a different binary to exercise
-// process plumbing without invoking the real CLI.
-const claudeBinary = "claude"
-
 // waitDelay caps how long [exec.Cmd.Wait] will block after the
 // context cancels and SIGINT has been delivered. After this elapses
 // the runtime escalates to SIGKILL on the process group.
@@ -31,40 +26,51 @@ const waitDelay = 10 * time.Second
 // response observed in practice.
 const closeGrace = 5 * time.Second
 
-// NewSpawner returns the production [*Spawner] that runs the `claude`
-// CLI from $PATH. Each Spawn invokes the binary anew; nothing is
-// cached between iterations.
-func NewSpawner() *Spawner {
-	return &Spawner{binary: claudeBinary, Stderr: os.Stderr}
+// NewSpawner returns the production [*Spawner] that runs the named
+// engine binary from $PATH. The engine must implement claude's
+// stream-json wire contract; the canonical implementation is the
+// `claude` CLI, but any drop-in replacement works. Each Spawn invokes
+// the binary anew; nothing is cached between iterations.
+func NewSpawner(binary string) *Spawner {
+	return &Spawner{binary: binary, Stderr: os.Stderr}
 }
 
-// newSpawnerWithBinary is the test seam used by integration tests in
-// this package: it returns a [*Spawner] that runs the named binary
-// (typically the test binary itself in re-exec mode) instead of the
-// production claude CLI. Production code constructs spawners via
-// [NewSpawner] and never sees this constructor.
-func newSpawnerWithBinary(path string, args ...string) *Spawner {
-	return &Spawner{binary: path, extraArgs: args, Stderr: os.Stderr}
+// newSpawnerWithExtraArgs is the test seam used by integration tests
+// in this package: it returns a [*Spawner] that runs the named binary
+// with extraArgs prepended to the per-spawn argument list. Tests use
+// it to thread re-exec sentinels (e.g. -test.run=TestHelperProcess)
+// into the child without disturbing the [buildArgs] shape. Production
+// code constructs spawners via [NewSpawner] and never sees this
+// constructor.
+func newSpawnerWithExtraArgs(binary string, args ...string) *Spawner {
+	return &Spawner{binary: binary, extraArgs: args, Stderr: os.Stderr}
 }
 
-// Spawner launches one claude process per Spawn call and returns a
+// Spawner launches one engine process per Spawn call and returns a
 // [Session] that owns its stdin pipe, stream.Reader, and lifecycle.
 // Construct via [NewSpawner].
 type Spawner struct {
 	binary string
 	// extraArgs is prepended to the per-spawn argument list and is only
-	// populated by the test-only [newSpawnerWithBinary]: it lets tests
-	// thread re-exec sentinels (e.g. -test.run=TestHelperProcess) into
-	// the child without disturbing the [buildArgs] shape.
+	// populated by the test-only [newSpawnerWithExtraArgs]: it lets
+	// tests thread re-exec sentinels (e.g. -test.run=TestHelperProcess)
+	// into the child without disturbing the [buildArgs] shape.
 	extraArgs []string
 
 	// Stderr is the writer the spawned process's stderr is connected to.
 	// A nil value defaults to [os.Stderr] at Spawn time so callers can
 	// leave it unset; tests typically redirect to a [bytes.Buffer].
 	Stderr io.Writer
+
+	// Stdout, if non-nil, taps the engine's stdout: every byte read off
+	// the pipe is copied verbatim to this writer before being handed to
+	// the [stream.Reader]. Used by ralph's --raw mode to dump the
+	// engine's wire output untouched. A nil value (the default) leaves
+	// the pipe untapped.
+	Stdout io.Writer
 }
 
-// Spawn launches one claude process and returns a [Session]. ctx is
+// Spawn launches one engine process and returns a [Session]. ctx is
 // wired through [exec.CommandContext]: cancelling it triggers SIGINT
 // to the whole process group, with SIGKILL escalation after [waitDelay].
 func (c *Spawner) Spawn(ctx context.Context, cfg Config) (Session, error) {
@@ -78,10 +84,11 @@ func (c *Spawner) Spawn(ctx context.Context, cfg Config) (Session, error) {
 		cmd.Stderr = os.Stderr
 	}
 
-	// Put claude into its own process group so we can signal the entire
-	// subtree (claude plus any tool grandchildren). cmd.Cancel sends
-	// SIGINT to -pgid, the canonical "kill the whole pipeline" target;
-	// WaitDelay then escalates to SIGKILL if the group hasn't exited.
+	// Put the engine into its own process group so we can signal the
+	// entire subtree (engine plus any tool grandchildren). cmd.Cancel
+	// sends SIGINT to -pgid, the canonical "kill the whole pipeline"
+	// target; WaitDelay then escalates to SIGKILL if the group hasn't
+	// exited.
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -106,33 +113,45 @@ func (c *Spawner) Spawn(ctx context.Context, cfg Config) (Session, error) {
 		return nil, fmt.Errorf("start %s: %w", c.binary, err)
 	}
 
-	return &claudeSession{
+	var src io.Reader = stdout
+	if c.Stdout != nil {
+		src = io.TeeReader(stdout, c.Stdout)
+	}
+
+	return &engineSession{
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: stdout,
-		reader: stream.NewReader(stdout),
+		src:    src,
+		reader: stream.NewReader(src),
 	}, nil
 }
 
-// claudeSession is the production [Session] implementation; it wraps
-// one running claude subprocess.
-type claudeSession struct {
+// engineSession is the production [Session] implementation; it wraps
+// one running engine subprocess.
+type engineSession struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	// src is what stream.Reader (and Close's drain) consume from. It
+	// equals stdout in the untapped case, or io.TeeReader(stdout, tap)
+	// when Stdout was set on the Spawner. Draining via src — not
+	// stdout — keeps the tap whole at close time, when the scanner's
+	// buffer plus any unread pipe bytes still need to flow through.
+	src    io.Reader
 	reader *stream.Reader
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-func (s *claudeSession) Events() *stream.Reader { return s.reader }
+func (s *engineSession) Events() *stream.Reader { return s.reader }
 
-func (s *claudeSession) Send(text string) error {
+func (s *engineSession) Send(text string) error {
 	return stream.WriteUserMessage(s.stdin, text)
 }
 
-// Close closes stdin (so claude can exit cleanly), waits for the
+// Close closes stdin (so the engine can exit cleanly), waits for the
 // process to reap, and translates the wait outcome into the package's
 // public error contract. Subsequent calls return the original result.
 //
@@ -141,7 +160,7 @@ func (s *claudeSession) Send(text string) error {
 // process if EOF has not arrived after [closeGrace]. exec.Cmd.Wait
 // requires StdoutPipe readers to reach EOF before it can reap the
 // child, so a stuck producer would otherwise wedge here forever.
-func (s *claudeSession) Close() error {
+func (s *engineSession) Close() error {
 	s.closeOnce.Do(func() {
 		_ = s.stdin.Close()
 
@@ -152,7 +171,7 @@ func (s *claudeSession) Close() error {
 		// the AfterFunc below is the escalation backstop.
 		drainDone := make(chan struct{})
 		go func() {
-			_, _ = io.Copy(io.Discard, s.stdout)
+			_, _ = io.Copy(io.Discard, s.src)
 			close(drainDone)
 		}()
 
@@ -189,7 +208,7 @@ func translateWaitErr(err error) error {
 	return err
 }
 
-// buildArgs constructs the command-line for a single claude
+// buildArgs constructs the command-line for a single engine
 // invocation.
 func buildArgs(cfg Config) []string {
 	args := []string{"-p"}
@@ -207,12 +226,15 @@ func buildArgs(cfg Config) []string {
 		"--replay-user-messages",
 		"--json-schema", stream.SchemaJSON,
 	)
+	if cfg.Raw {
+		args = append(args, "--raw")
+	}
 	return args
 }
 
 // buildEnv constructs the environment for the child process. The
-// parent's environment is inherited so claude can find PATH, HOME,
-// etc.; we layer ralph-specific switches on top.
+// parent's environment is inherited so the engine can find PATH,
+// HOME, etc.; we layer ralph-specific switches on top.
 func buildEnv(cfg Config) []string {
 	env := os.Environ()
 	if cfg.ConfigDir != "" {

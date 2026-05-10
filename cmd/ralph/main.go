@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +18,7 @@ import (
 
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
 	"github.com/ai4mgreenly/ralph-loops/internal/loop"
-	"github.com/ai4mgreenly/ralph-loops/internal/pricing"
+	"github.com/ai4mgreenly/ralph-loops/internal/reqs"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
@@ -47,8 +48,9 @@ var promptTemplate string
 // here so the help text and the FlagSet stay in sync.
 const (
 	defaultReqs            = "reqs"
-	defaultModel           = "opus"
-	defaultEffort          = "medium"
+	defaultEngine          = "claude"
+	defaultModel           = "sonnet"
+	defaultEffort          = "high"
 	defaultConfigDir       = ""
 	defaultTools           = ""
 	defaultOneMContext     = true
@@ -60,49 +62,6 @@ const (
 // defaultDuration is the wall-clock cap when --duration is not given.
 // Zero means unlimited.
 const defaultDuration time.Duration = 0
-
-// allowedModels / allowedEfforts source from the pricing/loop
-// packages so the CLI's flag validation stays in lockstep with the
-// downstream model registry and the loop's runtime check. Initialised
-// at package load.
-var (
-	allowedModels  = pricing.Models()
-	allowedEfforts = loop.AllowedEfforts
-)
-
-// enumFlag is a flag.Value implementation that constrains a string flag
-// to a fixed set of allowed values. The default value is supplied by
-// the caller and considered valid even if it is not in allowed (so we
-// can construct an enumFlag without forcing every default into the
-// allowed set).
-type enumFlag struct {
-	value   string
-	allowed []string
-	name    string
-}
-
-// newEnumFlag constructs an enumFlag with the given default and
-// allowed-set. name is used in error messages.
-func newEnumFlag(name, def string, allowed []string) *enumFlag {
-	return &enumFlag{value: def, allowed: allowed, name: name}
-}
-
-// String reports the current value. It is also used by the flag
-// package to render defaults in usage strings.
-func (e *enumFlag) String() string {
-	return e.value
-}
-
-// Set validates v against the allowed set and stores it on success.
-func (e *enumFlag) Set(v string) error {
-	for _, ok := range e.allowed {
-		if v == ok {
-			e.value = v
-			return nil
-		}
-	}
-	return fmt.Errorf("invalid %s %q: must be one of %s", e.name, v, strings.Join(e.allowed, "|"))
-}
 
 // Exit codes follow the convention used by Unix CLIs: 0 success, 1
 // runtime error, 2 usage error.
@@ -141,12 +100,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return exitSuccess
 	case "newid":
-		if len(args) > 1 {
-			fmt.Fprintln(stderr, "ralph newid: takes no arguments")
-			return exitUsage
-		}
-		fmt.Fprintln(stdout, idgen.New())
-		return exitSuccess
+		return runNewID(args[1:], stdout, stderr)
 	case "time-of":
 		if len(args) != 2 {
 			fmt.Fprintln(stderr, "ralph time-of: requires exactly one ID argument")
@@ -159,6 +113,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stdout, t.UTC().Format("2006-01-02T15:04:05.000Z"))
 		return exitSuccess
+	case "unverified":
+		return runUnverified(args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintf(stdout, "ralph %s\n", version)
 		return exitSuccess
@@ -168,6 +124,121 @@ func run(args []string, stdout, stderr io.Writer) int {
 	default:
 		return runLoop(args, stdout, stderr)
 	}
+}
+
+// unverifiedReport is the structured result printed by the
+// `ralph unverified` subcommand. The status field disambiguates the
+// done state so an agent reading the output can tell "all verified"
+// from "command produced no output at all" — empty stdout, with a
+// shell pipeline that swallowed an error, is too easy to misread.
+type unverifiedReport struct {
+	// Status is "done" when every spec ID is already verified, and
+	// "pending" otherwise. The two strings are the only possible
+	// values.
+	Status string `json:"status"`
+	// Count is the length of List, repeated for callers that prefer
+	// to branch on a number rather than parse the array.
+	Count int `json:"count"`
+	// List is the sorted set of unverified IDs. Serialised as `[]`
+	// (never `null`) when empty so JSON consumers can rely on a
+	// single shape.
+	List []string `json:"list"`
+}
+
+// runNewID mints -n requirement IDs and prints them to stdout, one
+// per line. Each ID is anchored to a millisecond that has already
+// elapsed by the time it is minted, so the ID space stays reserved
+// for past wall-clock instants — never the future. Because [idgen]
+// derives one ID per millisecond, minting N distinct IDs takes at
+// least ~N-1 ms of wall clock: when the current millisecond matches
+// the one used for the previous mint, the loop sleeps until the next
+// tick rather than skipping ahead.
+func runNewID(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ralph newid", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var count int
+	fs.IntVar(&count, "number", 1, "number of IDs to mint")
+	fs.IntVar(&count, "n", 1, "number of IDs to mint (shorthand)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "ralph newid: takes no positional arguments")
+		return exitUsage
+	}
+	if count <= 0 {
+		fmt.Fprintf(stderr, "ralph newid: --number must be > 0, got %d\n", count)
+		return exitUsage
+	}
+
+	var lastMs int64 = -1
+	for i := 0; i < count; i++ {
+		// Spin until time.Now() has crossed into a millisecond strictly
+		// later than the last one we minted from. The first iteration's
+		// gate (lastMs == -1) admits any non-negative ms, so a single
+		// mint costs no wall-clock wait.
+		var now time.Time
+		for {
+			now = time.Now()
+			ms := now.Sub(idgen.Epoch).Milliseconds()
+			if ms > lastMs {
+				lastMs = ms
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		fmt.Fprintln(stdout, idgen.NewAt(now))
+	}
+	return exitSuccess
+}
+
+// runUnverified emits a single-line JSON [unverifiedReport] describing
+// the IDs that appear in the spec under --reqs but are not yet
+// recorded in the current workdir's verification ledger. It is the
+// single-tool-call replacement for the prompt's grep + jsonl + diff
+// procedure: faster, deterministic, cheap on the agent's context
+// budget, and — because the report is always JSON — never produces
+// ambiguous empty output that an agent would feel compelled to retry.
+//
+// The workdir is the process's current working directory. Ralph spawns
+// the agent with cwd set to WORKDIR, so the agent (and any human
+// running the command from a project root) gets the right answer with
+// no positional argument to manage.
+func runUnverified(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ralph unverified", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	reqsDir := fs.String("reqs", defaultReqs, "path to requirements directory")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "ralph unverified: takes no positional arguments")
+		return exitUsage
+	}
+	ids, err := reqs.Unverified(*reqsDir, ".")
+	if err != nil {
+		fmt.Fprintf(stderr, "ralph: %s\n", err)
+		return exitRuntime
+	}
+	rep := unverifiedReport{
+		Status: "pending",
+		Count:  len(ids),
+		List:   ids,
+	}
+	if len(ids) == 0 {
+		rep.Status = "done"
+		rep.List = []string{}
+	}
+	enc, err := json.Marshal(rep)
+	if err != nil {
+		// json.Marshal of a fixed-shape struct cannot realistically fail,
+		// but the surface is non-trivial enough to keep an explicit
+		// fallback path rather than ignoring the error.
+		fmt.Fprintf(stderr, "ralph: marshal report: %s\n", err)
+		return exitRuntime
+	}
+	fmt.Fprintln(stdout, string(enc))
+	return exitSuccess
 }
 
 // runLoop parses the loop subcommand's flags, builds a [loop.Config]
@@ -181,8 +252,9 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 
 	var (
 		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory")
-		model       = newEnumFlag("--model", defaultModel, allowedModels)
-		effort      = newEnumFlag("--effort", defaultEffort, allowedEfforts)
+		engine      = fs.String("engine", defaultEngine, "engine command (drop-in claude replacement) resolved via $PATH")
+		model       = fs.String("model", defaultModel, "model alias forwarded to the engine; must have a pricing entry in internal/pricing")
+		effort      = fs.String("effort", defaultEffort, "effort level forwarded to the engine (engine-specific; e.g. low|medium|high|xhigh|max for claude)")
 		duration    time.Duration
 		configDir   = fs.String("config-dir", defaultConfigDir, "value exported as CLAUDE_CONFIG_DIR; empty inherits claude's default (~/.claude)")
 		oneM        = fs.Bool("1m-context", defaultOneMContext, "enable 1M-token context window")
@@ -190,13 +262,12 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		skipPerm    = fs.Bool("dangerously-skip-permissions", defaultSkipPermissions, "pass --dangerously-skip-permissions to claude")
 		tools       = fs.String("tools", defaultTools, "comma-separated tool list; empty means all built-ins")
 		verbose     = fs.Bool("verbose", false, "echo low-signal stream events (system init, rate_limit)")
+		raw         = fs.Bool("raw", false, "debug passthrough: dump engine stdout verbatim as JSONL, suppress all decoration, run one iteration")
 		outputLines = fs.Int("output-lines", defaultOutputLines, "max lines of tool output to replay per result before truncating with `...`")
 
 		showVersion bool
 		showHelp    bool
 	)
-	fs.Var(model, "model", "haiku|sonnet|opus")
-	fs.Var(effort, "effort", "low|medium|high|xhigh|max")
 	fs.DurationVar(&duration, "duration", defaultDuration, "wall-clock budget (e.g. 4h, 90m); 0 means unlimited")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	fs.BoolVar(&showVersion, "v", false, "print version and exit (shorthand)")
@@ -217,6 +288,11 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	if showHelp {
 		writeUsagePaged(stdout)
 		return exitSuccess
+	}
+
+	if *engine == "" {
+		fmt.Fprintln(stderr, "ralph: --engine must not be empty")
+		return exitUsage
 	}
 
 	if fs.NArg() != 1 {
@@ -242,8 +318,9 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		Theme:   theme,
 	}
 	opts := []loop.Option{
-		loop.WithModel(model.String()),
-		loop.WithEffort(effort.String()),
+		loop.WithEngine(*engine),
+		loop.WithModel(*model),
+		loop.WithEffort(*effort),
 		loop.WithVersion(version),
 		loop.WithDuration(duration),
 		loop.WithConfigDir(*configDir),
@@ -252,6 +329,7 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		loop.WithClaudeAIMCP(*mcp),
 		loop.WithSkipPermissions(*skipPerm),
 		loop.WithVerbose(*verbose),
+		loop.WithRaw(*raw),
 		loop.WithOutputLines(*outputLines),
 	}
 

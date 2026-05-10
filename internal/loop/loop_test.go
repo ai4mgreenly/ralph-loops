@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -93,14 +92,11 @@ func TestCtxExit_TranslatesContextErrors(t *testing.T) {
 	}
 }
 
-// TestInstallForceQuit_SecondSIGINTCallsQuit drives a real second
-// SIGINT and confirms quit(130) is invoked. This is the kind of test
-// that's flaky if rushed, so we synchronize via a polling loop on the
-// "graceful" context's Done channel before sending the second signal.
-func TestInstallForceQuit_SecondSIGINTCallsQuit(t *testing.T) {
-	// Not parallel: this test sends real SIGINT to the test process,
-	// and parallel goroutines from other tests would observe the same
-	// signal stream.
+// TestInstallShutdownDeadline_FiresAfterCancel cancels the "graceful"
+// context to model the first SIGINT, then waits for the deadline timer
+// to elapse and confirms quit(130) is invoked.
+func TestInstallShutdownDeadline_FiresAfterCancel(t *testing.T) {
+	t.Parallel()
 
 	sigCtx, stopSig := context.WithCancel(context.Background())
 
@@ -114,20 +110,12 @@ func TestInstallForceQuit_SecondSIGINTCallsQuit(t *testing.T) {
 		}
 	}
 
-	stop := installForceQuit(sigCtx, io.Discard, quit)
+	stop := installShutdownDeadline(sigCtx, 25*time.Millisecond, io.Discard, quit)
 	defer stop()
 
-	// First "interrupt" — we just cancel sigCtx directly to model the
-	// first SIGINT having already been consumed by NotifyContext. This
-	// puts the goroutine into its second-signal listening state without
-	// racing the OS signal pipe.
+	// Model the first SIGINT having been consumed by NotifyContext.
+	// This arms the deadline timer.
 	stopSig()
-
-	// Now send a real SIGINT. installForceQuit registered its own
-	// signal.Notify so it sees this directly.
-	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
-		t.Fatalf("kill self: %v", err)
-	}
 
 	select {
 	case got := <-quitCh:
@@ -140,6 +128,27 @@ func TestInstallForceQuit_SecondSIGINTCallsQuit(t *testing.T) {
 
 	if got := quitCode.Load(); got != 130 {
 		t.Errorf("quitCode = %d, want 130", got)
+	}
+}
+
+// TestInstallShutdownDeadline_StopDisarms confirms that disarming the
+// deadline before sigCtx is canceled prevents quit from firing.
+func TestInstallShutdownDeadline_StopDisarms(t *testing.T) {
+	t.Parallel()
+
+	sigCtx, stopSig := context.WithCancel(context.Background())
+	defer stopSig()
+
+	var called atomic.Bool
+	stop := installShutdownDeadline(sigCtx, 5*time.Millisecond, io.Discard, func(int) {
+		called.Store(true)
+	})
+	stop()
+
+	stopSig()
+	time.Sleep(50 * time.Millisecond)
+	if called.Load() {
+		t.Error("quit fired after stop() — disarm did not take effect")
 	}
 }
 

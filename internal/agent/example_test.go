@@ -43,15 +43,16 @@ func ExampleNewSpawner() {
 		return
 	}
 
-	// The production constructor reads "claude" from $PATH; the
-	// stub-binary seam used by integration tests is unexported, so
-	// the example demonstrates the public surface by prepending the
-	// stub's directory to $PATH for the duration of the call.
+	// The production constructor resolves the engine binary from
+	// $PATH; the stub-binary seam used by integration tests is
+	// unexported, so the example demonstrates the public surface by
+	// prepending the stub's directory to $PATH for the duration of
+	// the call.
 	oldPath := os.Getenv("PATH")
 	os.Setenv("PATH", dir+":"+oldPath)
 	defer os.Setenv("PATH", oldPath)
 
-	sp := agent.NewSpawner()
+	sp := agent.NewSpawner("claude")
 	sp.Stderr = io.Discard
 
 	ctx, cancel := context.WithCancel(context.Background())

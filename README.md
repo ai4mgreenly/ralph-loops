@@ -98,7 +98,7 @@ something the build agent can actually start on, then kick off
     ralph .
 
 `ralph` reads `./reqs/`, treats the current directory as the
-workdir, and calls opus at medium effort with the 1M-token context
+workdir, and calls sonnet at high effort with the 1M-token context
 window enabled, iterating until the agent reports DONE or you
 interrupt. Each iteration is bracketed by a banner so you can see
 the cadence; per-event stream output appears underneath, with a
@@ -110,7 +110,7 @@ for later inspection.
 
 To tune the run:
 
-    ralph --model=sonnet --duration=2h .
+    ralph --model=opus --duration=2h .
     ralph --1m-context=false --reqs=../shared-spec ./app
     ralph --effort=high --tools=Bash,Read,Write,Edit .
 

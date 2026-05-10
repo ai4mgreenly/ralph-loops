@@ -1,8 +1,11 @@
-// Package agent wraps the claude CLI as a long-lived child process.
-// It exposes a [Spawner] type — produced by [NewSpawner] — together
-// with the [Session] interface its Spawn method returns. Each Session
-// owns one running claude process: its stdin pipe, its stream-json
-// reader, and its lifecycle.
+// Package agent wraps an engine CLI as a long-lived child process.
+// The engine is the binary that implements claude's stream-json wire
+// contract — typically the `claude` CLI itself, but ralph's --engine
+// flag lets callers swap in any drop-in replacement. The package
+// exposes a [Spawner] type — produced by [NewSpawner] — together with
+// the [Session] interface its Spawn method returns. Each Session owns
+// one running engine process: its stdin pipe, its stream-json reader,
+// and its lifecycle.
 //
 // Production code in [internal/loop] consumes a Spawner directly. Tests
 // in that package supply their own Spawner / Session pair (typically a
@@ -17,7 +20,7 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
-// Config captures the per-spawn knobs ralph forwards to the claude
+// Config captures the per-spawn knobs ralph forwards to the engine
 // CLI. It is intentionally smaller than loop.Config: nothing here
 // concerns the operator prompt, wall-clock budget, or output-rendering
 // choices, all of which the loop owns.
@@ -28,14 +31,16 @@ type Config struct {
 	// Effort is one of "low", "medium", "high", "xhigh", or "max".
 	Effort string
 
-	// Tools, if non-empty, is forwarded verbatim to claude --tools.
+	// Tools, if non-empty, is forwarded verbatim to the engine's
+	// --tools flag.
 	Tools string
 
 	// SkipPermissions passes --dangerously-skip-permissions when true.
 	SkipPermissions bool
 
 	// ConfigDir, if non-empty, is exported as CLAUDE_CONFIG_DIR. An
-	// empty string leaves the env var unset so claude uses ~/.claude.
+	// empty string leaves the env var unset so the engine falls back
+	// to its own default (claude uses ~/.claude).
 	ConfigDir string
 
 	// OneMContext enables the 1M-token context window when true.
@@ -47,6 +52,15 @@ type Config struct {
 	// WorkDir is the working directory for the spawned process. The
 	// agent reads and writes inside this tree.
 	WorkDir string
+
+	// Raw, when true, appends `--raw` to the engine's argv. The flag is
+	// ralph's debug-passthrough convention: an engine that recognizes it
+	// is asked to dump diagnostic detail (typically raw HTTP traffic)
+	// suitable for trace capture. Drop-in replacements that don't know
+	// the flag will reject it loudly, which is the desired behavior —
+	// `--raw` is a signal that the operator wants engine-level visibility
+	// and a silent no-op would defeat the point.
+	Raw bool
 }
 
 // Session is one running agent process. The lifecycle is:
