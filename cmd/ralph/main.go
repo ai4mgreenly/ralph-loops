@@ -2,18 +2,22 @@
 // against a project's requirements directory.
 //
 // Run `ralph help` for a full operator manual. The minimal invocation
-// is `ralph WORKDIR`, which uses default values for every flag.
+// is plain `ralph`, run from the project root of a tree scaffolded by
+// `ralph init` (the directory that contains reqs/ and app-root/).
+// ralph then spawns the agent with its working directory set to
+// app-root/, so the agent's standing AGENTS.md auto-loads.
 package main
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"strings"
+	"path/filepath"
 	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
@@ -28,26 +32,24 @@ import (
 // value here is what unstamped builds (e.g. `go run`) report.
 var version = "dev"
 
-// promptTemplate is the operator prompt sent to claude at the start of
-// every iteration. It is embedded from prompt.md at build time, then
-// passed through literal string substitution before being sent as the
-// kickoff message. Supported placeholders:
-//
-//	{{REQS}}     replaced with the value of --reqs (default "reqs")
-//	{{WORKDIR}}  replaced with the WORKDIR positional argument
-//
-// Any other `{{...}}` token is sent through verbatim. To test changes,
-// edit prompt.md, run `make build`, and invoke `bin/ralph` against a
-// scratch directory; unit tests for the substitution logic live in
-// cmd/ralph.
-//
-//go:embed prompt.md
-var promptTemplate string
+// kickoffPrompt is the single-iteration nudge sent to the agent. The
+// standing operator instructions live in the app-root AGENTS.md file
+// scaffolded by `ralph init`; claude auto-loads that file from the
+// working directory, so the kickoff only needs to wake the agent and
+// point it at the standing instructions.
+const kickoffPrompt = "Read AGENTS.md if you have not already, then perform one iteration of work as described there."
 
 // Default values for every flag the loop subcommand accepts. Centralised
 // here so the help text and the FlagSet stay in sync.
+//
+// defaultReqs is project-root-relative because the loop subcommand is
+// invoked from the project root. defaultUnverifiedReqs is different
+// because `ralph unverified` is called by the agent from inside the
+// app-root subdirectory, where the spec sits at "../reqs".
 const (
 	defaultReqs            = "reqs"
+	defaultAppRoot         = "app-root"
+	defaultUnverifiedReqs  = "../reqs"
 	defaultEngine          = "claude"
 	defaultModel           = "sonnet"
 	defaultEffort          = "high"
@@ -90,15 +92,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// runLoop after flag parsing so they work regardless of position.
 	switch args[0] {
 	case "init":
-		if len(args) != 2 {
-			fmt.Fprintln(stderr, "ralph init: requires exactly one PATH argument")
-			return exitUsage
-		}
-		if err := scaffoldReqs(args[1]); err != nil {
-			fmt.Fprintf(stderr, "ralph: %s\n", err)
-			return exitRuntime
-		}
-		return exitSuccess
+		return runInit(args[1:], stdout, stderr)
 	case "newid":
 		return runNewID(args[1:], stdout, stderr)
 	case "time-of":
@@ -194,20 +188,19 @@ func runNewID(args []string, stdout, stderr io.Writer) int {
 
 // runUnverified emits a single-line JSON [unverifiedReport] describing
 // the IDs that appear in the spec under --reqs but are not yet
-// recorded in the current workdir's verification ledger. It is the
-// single-tool-call replacement for the prompt's grep + jsonl + diff
-// procedure: faster, deterministic, cheap on the agent's context
+// recorded in the local .ralph/requirements-verified.jsonl ledger. It
+// is the single-tool-call replacement for the prompt's grep + jsonl +
+// diff procedure: faster, deterministic, cheap on the agent's context
 // budget, and — because the report is always JSON — never produces
 // ambiguous empty output that an agent would feel compelled to retry.
 //
-// The workdir is the process's current working directory. Ralph spawns
-// the agent with cwd set to WORKDIR, so the agent (and any human
-// running the command from a project root) gets the right answer with
-// no positional argument to manage.
+// The ledger is read from the process's current working directory, so
+// the command does the right thing when invoked from the app-root the
+// agent itself runs in.
 func runUnverified(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ralph unverified", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	reqsDir := fs.String("reqs", defaultReqs, "path to requirements directory")
+	reqsDir := fs.String("reqs", defaultUnverifiedReqs, "path to requirements directory")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -251,7 +244,8 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() { writeUsage(stderr) }
 
 	var (
-		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory")
+		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory, relative to the project root")
+		appRoot     = fs.String("app-root", defaultAppRoot, "path to the application source subdirectory, relative to the project root")
 		engine      = fs.String("engine", defaultEngine, "engine command (drop-in claude replacement) resolved via $PATH")
 		model       = fs.String("model", defaultModel, "model alias forwarded to the engine; must have a pricing entry in internal/pricing")
 		effort      = fs.String("effort", defaultEffort, "effort level forwarded to the engine (engine-specific; e.g. low|medium|high|xhigh|max for claude)")
@@ -279,7 +273,7 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	}
 
 	// --version / --help are honored regardless of where they appear
-	// among other flags. They beat WORKDIR validation so that
+	// among other flags. They beat the cwd foot-gun check so that
 	// `ralph --reqs=foo --version` prints the version cleanly.
 	if showVersion {
 		fmt.Fprintf(stdout, "ralph %s\n", version)
@@ -295,17 +289,23 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "ralph: WORKDIR positional argument is required")
+	if fs.NArg() > 1 {
+		fmt.Fprintln(stderr, "ralph: at most one positional argument (PROJECT_ROOT)")
 		writeUsage(stderr)
 		return exitUsage
 	}
-	workdir := fs.Arg(0)
-
-	prompt := strings.NewReplacer(
-		"{{REQS}}", *reqs,
-		"{{WORKDIR}}", workdir,
-	).Replace(promptTemplate)
+	projectRoot := "."
+	if fs.NArg() == 1 {
+		projectRoot = fs.Arg(0)
+	}
+	if err := os.Chdir(projectRoot); err != nil {
+		fmt.Fprintf(stderr, "ralph: chdir %q: %s\n", projectRoot, err)
+		return exitUsage
+	}
+	if err := checkProjectRoot(*appRoot); err != nil {
+		fmt.Fprintf(stderr, "ralph: %s\n", err)
+		return exitUsage
+	}
 
 	theme := ui.NewTheme(os.Stdout)
 	stopResize := theme.WatchResize(os.Stdout)
@@ -313,8 +313,8 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 
 	cfg := loop.Config{
 		ReqsDir: *reqs,
-		WorkDir: workdir,
-		Prompt:  prompt,
+		WorkDir: *appRoot,
+		Prompt:  kickoffPrompt,
 		Theme:   theme,
 	}
 	opts := []loop.Option{
@@ -338,4 +338,20 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		return exitRuntime
 	}
 	return exitSuccess
+}
+
+// checkProjectRoot verifies that cwd looks like a ralph project root:
+// the configured app-root subdirectory must exist and must contain an
+// AGENTS.md. A missing AGENTS.md is treated the same as a missing
+// directory because the agent depends on it as its standing-instructions
+// file; running without it would yield a confused, persona-less agent.
+func checkProjectRoot(appRoot string) error {
+	marker := filepath.Join(appRoot, "AGENTS.md")
+	if _, err := os.Lstat(marker); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("no %s found; run `ralph` from a project root scaffolded by `ralph init` (or pass --app-root)", marker)
+		}
+		return fmt.Errorf("stat %s: %w", marker, err)
+	}
+	return nil
 }

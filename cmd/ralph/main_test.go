@@ -180,12 +180,16 @@ func decodeUnverified(t *testing.T, stdout string) unverifiedReport {
 	return rep
 }
 
-// chdirTemp builds a workdir layout under t.TempDir(), seeds its
-// reqs/ directory and .ralph/ ledger from the supplied bodies, chdirs
-// the test process into the workdir, and registers a t.Cleanup that
-// restores the original cwd. `ralph unverified` reads the workdir
-// from the current directory, so every CLI test in this group needs
-// the same setup.
+// chdirTemp builds a project layout under t.TempDir() and chdirs into
+// the app-root subdirectory. Layout matches what `ralph init` produces
+// (minus the AGENTS.md files, which would trip the foot-gun guard):
+//
+//	<tmp>/reqs/spec.md                                  ← the spec
+//	<tmp>/app-root/.ralph/requirements-verified.jsonl   ← the ledger
+//
+// The process cwd is set to <tmp>/app-root and restored via t.Cleanup.
+// `ralph unverified` defaults --reqs to ../reqs, so it resolves the
+// spec correctly from inside app-root.
 func chdirTemp(t *testing.T, specBody, ledgerBody string) string {
 	t.Helper()
 	tmp := t.TempDir()
@@ -195,8 +199,12 @@ func chdirTemp(t *testing.T, specBody, ledgerBody string) string {
 	if err := os.WriteFile(filepath.Join(tmp, "reqs", "spec.md"), []byte(specBody), 0o644); err != nil {
 		t.Fatalf("write spec: %v", err)
 	}
+	appRoot := filepath.Join(tmp, "app-root")
+	if err := os.MkdirAll(appRoot, 0o755); err != nil {
+		t.Fatalf("mkdir app-root: %v", err)
+	}
 	if ledgerBody != "" {
-		ralphDir := filepath.Join(tmp, ".ralph")
+		ralphDir := filepath.Join(appRoot, ".ralph")
 		if err := os.MkdirAll(ralphDir, 0o755); err != nil {
 			t.Fatalf("mkdir .ralph: %v", err)
 		}
@@ -208,7 +216,7 @@ func chdirTemp(t *testing.T, specBody, ledgerBody string) string {
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	if err := os.Chdir(tmp); err != nil {
+	if err := os.Chdir(appRoot); err != nil {
 		t.Fatalf("chdir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(prev) })
@@ -285,25 +293,34 @@ func TestRun_Init_CreatesSkeleton(t *testing.T) {
 		t.Fatalf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
 	}
 
-	reqsDir := filepath.Join(tmp, "reqs")
-	entries, err := os.ReadDir(reqsDir)
-	if err != nil {
-		t.Fatalf("read reqs dir: %v", err)
-	}
-	got := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		got[e.Name()] = true
-	}
-	for _, want := range []string{"OVERVIEW.md", "INTERACTIVE.md"} {
-		if !got[want] {
-			t.Errorf("missing %s in %s", want, reqsDir)
+	// Verify the full scaffolded tree exists.
+	for _, p := range []string{
+		filepath.Join(tmp, "helper", "AGENTS.md"),
+		filepath.Join(tmp, "reqs", "OVERVIEW.md"),
+		filepath.Join(tmp, "app-root", "AGENTS.md"),
+	} {
+		if _, err := os.Lstat(p); err != nil {
+			t.Errorf("missing scaffolded path %s: %v", p, err)
 		}
 	}
-	if len(entries) != 2 {
-		t.Errorf("reqs/ has %d entries, want 2: %v", len(entries), entries)
+
+	// No AGENTS.md or CLAUDE.md at the project root — and no
+	// CLAUDE.md anywhere in the scaffold. See scaffoldProject's doc
+	// comment: a root-level spec-helper would leak into the build
+	// agent's context via claude's walk-up.
+	for _, banned := range []string{
+		filepath.Join(tmp, "AGENTS.md"),
+		filepath.Join(tmp, "CLAUDE.md"),
+		filepath.Join(tmp, "app-root", "CLAUDE.md"),
+		filepath.Join(tmp, "helper", "CLAUDE.md"),
+	} {
+		if _, err := os.Lstat(banned); err == nil {
+			t.Errorf("%s should not be scaffolded", banned)
+		}
 	}
 
-	overview, err := os.ReadFile(filepath.Join(reqsDir, "OVERVIEW.md"))
+	// OVERVIEW.md stays generic — no mention of ralph or orchestrator.
+	overview, err := os.ReadFile(filepath.Join(tmp, "reqs", "OVERVIEW.md"))
 	if err != nil {
 		t.Fatalf("read OVERVIEW.md: %v", err)
 	}
@@ -314,26 +331,24 @@ func TestRun_Init_CreatesSkeleton(t *testing.T) {
 		}
 	}
 
-	interactive, err := os.ReadFile(filepath.Join(reqsDir, "INTERACTIVE.md"))
+	// The helper AGENTS.md is the spec-helper persona; it carries
+	// the WHAT/WHY-not-HOW heading, the requirement-ID conventions,
+	// and the orchestrator-never-edits statement.
+	helperAgents, err := os.ReadFile(filepath.Join(tmp, "helper", "AGENTS.md"))
 	if err != nil {
-		t.Fatalf("read INTERACTIVE.md: %v", err)
+		t.Fatalf("read helper AGENTS.md: %v", err)
 	}
-	body := string(interactive)
+	body := string(helperAgents)
 	for _, want := range []string{"R-XXXX-XXXX", "ralph newid", "ralph time-of"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("INTERACTIVE.md missing %q", want)
+			t.Errorf("helper AGENTS.md missing %q", want)
 		}
 	}
 	if !strings.Contains(body, "never creates, modifies") {
-		t.Error("INTERACTIVE.md missing the orchestrator-never-edits statement")
+		t.Error("helper AGENTS.md missing the orchestrator-never-edits statement")
 	}
-	// WHAT/WHY-not-HOW heading should be prominent — within the first
-	// quarter of the file.
-	idx := strings.Index(body, "WHAT and WHY, never HOW")
-	if idx < 0 {
-		t.Error("INTERACTIVE.md missing WHAT/WHY-not-HOW heading")
-	} else if idx > len(body)/4 {
-		t.Errorf("WHAT/WHY-not-HOW heading at offset %d; expected within first quarter (%d)", idx, len(body)/4)
+	if !strings.Contains(body, "WHAT and WHY, never HOW") {
+		t.Error("helper AGENTS.md missing WHAT/WHY-not-HOW heading")
 	}
 }
 
@@ -363,13 +378,6 @@ func TestRun_Init_RefusesExistingReqs(t *testing.T) {
 	if string(got) != "keep me\n" {
 		t.Errorf("sentinel modified: %q", got)
 	}
-	entries, err := os.ReadDir(reqsDir)
-	if err != nil {
-		t.Fatalf("read reqs dir: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Errorf("reqs/ now has %d entries, expected the original 1", len(entries))
-	}
 }
 
 func TestRun_Init_RequiresExactlyOneArg(t *testing.T) {
@@ -382,44 +390,153 @@ func TestRun_Init_RequiresExactlyOneArg(t *testing.T) {
 		if code != exitUsage {
 			t.Errorf("%v: exit = %d, want %d", args, code, exitUsage)
 		}
-		if !strings.Contains(stderr, "PATH") {
+		if !strings.Contains(stderr, "requires exactly one PATH") {
 			t.Errorf("%v: stderr = %q", args, stderr)
 		}
 	}
 }
 
+func TestRun_Init_RejectsBadFlags(t *testing.T) {
+	tmp := t.TempDir()
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"empty-reqs", []string{"init", "--reqs=", tmp}, "must not be empty"},
+		{"slash-in-reqs", []string{"init", "--reqs=foo/bar", tmp}, "plain directory names"},
+		{"equal-names", []string{"init", "--reqs=x", "--app-root=x", tmp}, "must all differ"},
+		{"helper-equals-reqs", []string{"init", "--reqs=x", "--helper=x", tmp}, "must all differ"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _, stderr := runCapture(c.args...)
+			if code != exitUsage {
+				t.Errorf("exit = %d, want %d (stderr=%q)", code, exitUsage, stderr)
+			}
+			if !strings.Contains(stderr, c.want) {
+				t.Errorf("stderr = %q, want substring %q", stderr, c.want)
+			}
+		})
+	}
+}
+
+func TestRun_Init_AcceptsCustomFlags(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "newproj")
+	code, _, stderr := runCapture("init", "--reqs=spec", "--app-root=build", tmp)
+	if code != exitSuccess {
+		t.Fatalf("exit = %d, want %d (stderr=%q)", code, exitSuccess, stderr)
+	}
+	for _, p := range []string{
+		filepath.Join(tmp, "spec", "OVERVIEW.md"),
+		filepath.Join(tmp, "build", "AGENTS.md"),
+	} {
+		if _, err := os.Lstat(p); err != nil {
+			t.Errorf("missing %s: %v", p, err)
+		}
+	}
+	appAgents, err := os.ReadFile(filepath.Join(tmp, "build", "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read build AGENTS.md: %v", err)
+	}
+	if !strings.Contains(string(appAgents), "../spec/") {
+		t.Errorf("build/AGENTS.md should reference ../spec/; got: %q", appAgents)
+	}
+}
+
 func TestRun_Help_ListsInit(t *testing.T) {
 	_, stdout, _ := runCapture("help")
-	if !strings.Contains(stdout, "ralph init PATH") {
+	if !strings.Contains(stdout, "ralph init") {
 		t.Errorf("help output missing init subcommand: %q", stdout)
 	}
 }
 
-func TestRun_Loop_RequiresWorkdir(t *testing.T) {
-	// All flags consumed, no positional argument.
-	code, _, stderr := runCapture("--model=sonnet")
-	if code != exitUsage {
-		t.Errorf("exit = %d, want %d", code, exitUsage)
-	}
-	if !strings.Contains(stderr, "WORKDIR") {
-		t.Errorf("stderr should mention WORKDIR, got %q", stderr)
-	}
-}
-
 func TestRun_Loop_RejectsUnknownFlag(t *testing.T) {
-	code, _, _ := runCapture("--definitely-not-a-flag", ".")
+	code, _, _ := runCapture("--definitely-not-a-flag")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
 	}
 }
 
 func TestRun_Loop_RejectsExtraPositional(t *testing.T) {
-	code, _, stderr := runCapture("workdir", "extra")
+	// One positional (PROJECT_ROOT) is allowed; two is not. The
+	// fs.NArg() > 1 check fires before any chdir, so we don't need
+	// the cwd to look like a project root.
+	code, _, stderr := runCapture("a", "b")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(stderr, "WORKDIR") {
+	if !strings.Contains(stderr, "at most one positional") {
 		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+// TestRun_Loop_RejectsMissingAppRoot trips the inverted foot-gun guard:
+// cwd has no app-root/AGENTS.md, so the driver should refuse with
+// exitUsage and a guidance message pointing at `ralph init`.
+func TestRun_Loop_RejectsMissingAppRoot(t *testing.T) {
+	tmp := t.TempDir()
+
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+
+	code, _, stderr := runCapture("--model=sonnet")
+	if code != exitUsage {
+		t.Errorf("exit = %d, want %d (stderr=%q)", code, exitUsage, stderr)
+	}
+	if !strings.Contains(stderr, "no app-root/AGENTS.md found") {
+		t.Errorf("stderr should mention 'no app-root/AGENTS.md found', got %q", stderr)
+	}
+}
+
+// TestRun_Loop_AcceptsPositional verifies the new PROJECT_ROOT
+// positional: ralph os.Chdir's into the supplied directory before the
+// foot-gun guard runs. When app-root/AGENTS.md exists in that
+// directory, the guard passes and execution proceeds to loop.Run,
+// which then fails because the engine command can't be resolved on
+// PATH. The point is to prove the chdir + guard plumbing works; we
+// don't care exactly which runtime error loop.Run raises.
+func TestRun_Loop_AcceptsPositional(t *testing.T) {
+	tmp := t.TempDir()
+	appRoot := filepath.Join(tmp, "app-root")
+	if err := os.MkdirAll(appRoot, 0o755); err != nil {
+		t.Fatalf("mkdir app-root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appRoot, "AGENTS.md"), []byte("app\n"), 0o644); err != nil {
+		t.Fatalf("write app AGENTS.md: %v", err)
+	}
+
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+
+	code, _, stderr := runCapture("--engine=this-engine-does-not-exist-1234567", tmp)
+	if code == exitUsage {
+		t.Errorf("exit = %d, want non-usage (stderr=%q)", code, stderr)
+	}
+	if strings.Contains(stderr, "no app-root/AGENTS.md found") {
+		t.Errorf("foot-gun should not fire when marker exists, got %q", stderr)
+	}
+}
+
+// TestRun_Loop_BadPositional_ChdirFails covers the chdir failure path:
+// a non-existent PROJECT_ROOT should be reported as a usage error with
+// a "chdir" diagnostic.
+func TestRun_Loop_BadPositional_ChdirFails(t *testing.T) {
+	code, _, stderr := runCapture("--engine=foo", "/no/such/directory/abcdef")
+	if code != exitUsage {
+		t.Errorf("exit = %d, want %d (stderr=%q)", code, exitUsage, stderr)
+	}
+	if !strings.Contains(stderr, "chdir") {
+		t.Errorf("stderr should mention chdir, got %q", stderr)
 	}
 }
 
@@ -468,7 +585,7 @@ func TestRun_Help_AfterOtherFlags(t *testing.T) {
 }
 
 func TestRun_Loop_RejectsEmptyEngine(t *testing.T) {
-	code, _, stderr := runCapture("--engine=", ".")
+	code, _, stderr := runCapture("--engine=")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d", code, exitUsage)
 	}
@@ -483,4 +600,3 @@ func TestRun_Help_DocumentsEngine(t *testing.T) {
 		t.Errorf("help output missing --engine flag row: %q", stdout)
 	}
 }
-

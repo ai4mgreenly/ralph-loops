@@ -1,10 +1,20 @@
 # Ralph Loops
 
-A small Go CLI that drives an iterative "ralph loop": it spawns the
-`claude` CLI as a child, feeds it an operator prompt assembled from
-your project's `reqs/` directory, parses the stream-json event flow,
-and repeats until the agent reports DONE, a wall-clock budget expires,
-or you Ctrl-C.
+A small Go CLI that drives an iterative "ralph loop": invoked from
+the project root, it spawns the `claude` CLI as a child with cwd set
+to the project's `app-root/` directory, nudges it to read the
+standing instructions in `app-root/AGENTS.md`, parses the stream-json
+event flow, and repeats until the agent reports DONE, a wall-clock
+budget expires, or you Ctrl-C.
+
+A scaffolded project ships two `AGENTS.md` files in sibling
+subdirectories: one in `helper/` for the interactive spec-helper
+persona, and one in `app-root/` for the build agent ralph drives.
+Each is auto-loaded by claude when a session starts in the matching
+directory. The spec-helper sits in its own subdirectory (rather than
+at the project root) so it stays off the build agent's walk-up path —
+claude reads every `AGENTS.md` between cwd and `/`, so a root-level
+helper would leak conflicting instructions into the agent's context.
 
 [![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -58,36 +68,45 @@ full list; the most useful targets are:
 
 ## Use
 
-Scaffold a new project with a starter spec directory:
+Scaffold a new project:
 
     ralph init my-app
 
-This creates `my-app/reqs/` with two files:
+This creates the following tree:
 
-- `OVERVIEW.md` — an empty project-shape stub for you to fill in
-  (what the project is, who uses it, hard constraints, what's out
-  of scope).
-- `INTERACTIVE.md` — a brief for an interactive helper agent that
-  knows how to help you sharpen the spec without writing code
-  itself.
+    my-app/
+      helper/
+        AGENTS.md            # spec-helper persona
+      reqs/
+        OVERVIEW.md
+      app-root/
+        AGENTS.md            # build-agent persona
 
-Both files are plain Markdown — `ralph` reads everything under
-`reqs/` each iteration but never modifies it. Only you (with the
-helper agent's assistance) edit the spec.
+`reqs/` holds the spec — read-only input as far as ralph is
+concerned. `app-root/` is where the build agent works. `helper/` is
+where the human (with an interactive `claude` session) sharpens the
+spec. All AGENTS.md files are baked at scaffold time with the right
+paths substituted in; the binary carries no runtime templating.
 
-Now `cd` into the project and start an interactive `claude`
-session, asking it to read `reqs/INTERACTIVE.md` first:
+Override the directory names with `--reqs`, `--app-root`, and
+`--helper`:
 
-    cd my-app
+    ralph init --reqs=spec --app-root=src --helper=designer my-app
+
+To sharpen the spec, `cd` into the `helper/` subdirectory and start
+an interactive `claude` session. The spec-helper `AGENTS.md` is
+auto-loaded:
+
+    cd my-app/helper
     claude
-    > read reqs/INTERACTIVE.md and help me build out the spec
+    > help me build out the spec
 
-The helper will interview you about goals, audience, constraints,
-and out-of-scope items, then propose a file layout and start
-writing requirements with you. **You need at least a rough spec
-before `ralph` has anything to build from** — the bare scaffold
-produced by `ralph init` is just a stub. Spend time here first; a
-sharper spec makes for a tighter ralph run.
+The helper interviews you about goals, audience, constraints, and
+out-of-scope items, then proposes a file layout and starts writing
+requirements with you. **You need at least a rough spec before
+`ralph` has anything to build from** — the scaffold is just a
+stub. Spend time here first; a sharper spec makes for a tighter
+ralph run.
 
 **A split-terminal setup is the most ergonomic way to work.** Put
 the interactive `claude` session in one pane and a plain shell in
@@ -95,24 +114,34 @@ the other. Sharpen the spec on the left until it describes
 something the build agent can actually start on, then kick off
 `ralph` in the right pane:
 
-    ralph .
+    cd my-app
+    ralph
 
-`ralph` reads `./reqs/`, treats the current directory as the
-workdir, and calls sonnet at high effort with the 1M-token context
-window enabled, iterating until the agent reports DONE or you
-interrupt. Each iteration is bracketed by a banner so you can see
-the cadence; per-event stream output appears underneath, with a
-`waiting for claude (Xs)` spinner during long pauses. At the end of
-the run a summary panel reports start/end times, per-event counts,
-tokens, cost, and time spent in LLM vs. tools. The same data is
-appended as one JSON line per run to `~/.ralph-loops/results.jsonl`
-for later inspection.
+`ralph` is run from the project root (the directory containing
+`helper/`, `reqs/`, and `app-root/`). An optional `PROJECT_ROOT`
+positional lets you point it at a project without `cd`'ing first —
+`ralph /path/to/proj` is equivalent to `cd /path/to/proj && ralph`.
+Layout
+flags `--reqs=PATH` (default `reqs`) and `--app-root=PATH` (default
+`app-root`) override the subdirectory names; both are project-root
+relative. ralph itself stays at the project root and spawns the
+agent with cwd set to `app-root/`, so the agent reads the spec from
+`../reqs/` and writes state to `./.ralph/`. The default model is
+sonnet at high effort with the
+1M-token context window enabled, iterating until the agent reports
+DONE or you interrupt. Each iteration is bracketed by a banner so
+you can see the cadence; per-event stream output appears
+underneath, with a `waiting for claude (Xs)` spinner during long
+pauses. At the end of the run a summary panel reports start/end
+times, per-event counts, tokens, cost, and time spent in LLM vs.
+tools. The same data is appended as one JSON line per run to
+`~/.ralph-loops/results.jsonl` for later inspection.
 
 To tune the run:
 
-    ralph --model=opus --duration=2h .
-    ralph --1m-context=false --reqs=../shared-spec ./app
-    ralph --effort=high --tools=Bash,Read,Write,Edit .
+    ralph --model=opus --duration=2h
+    ralph --1m-context=false --reqs=../shared-spec
+    ralph --effort=high --tools=Bash,Read,Write,Edit
 
 See `ralph help` for the full flag list.
 
@@ -122,14 +151,15 @@ ralph is designed to be one half of a two-loop workflow.
 
 The **outer loop** is you and an interactive agent (Claude Code or
 similar) iterating on the spec under `reqs/`. After `ralph init`,
-you point the helper agent at `reqs/INTERACTIVE.md` and have a
-conversation: the helper interviews you about goals, audience,
-hard constraints, and what's out of scope, then proposes a file
-layout and writes individual requirements. The discipline it
-holds to is **WHAT-and-WHY, not HOW** — every requirement
-describes an observable property of the finished system and,
-when useful, the reason it matters. Implementation choices belong
-to the build agent on the inside loop.
+you start a `claude` session in `helper/` and `helper/AGENTS.md`
+(the spec-helper persona) auto-loads. The helper
+interviews you about goals, audience, hard constraints, and what's
+out of scope, then proposes a file layout and writes individual
+requirements. The discipline it holds to is **WHAT-and-WHY, not
+HOW** — every requirement describes an observable property of the
+finished system and, when useful, the reason it matters.
+Implementation choices belong to the build agent on the inside
+loop.
 
 The **inner loop** is ralph driving claude against that spec,
 iteration after iteration. Each invocation reads the whole `reqs/`
@@ -165,8 +195,12 @@ just to drive toward whatever the spec currently says.
 this section mirrors them for readers landing here first.
 
 ```
-cmd/ralph/         Entry point and embedded prompt.md. Thin: parses
-                   flags, constructs loop.Config, calls loop.Run.
+cmd/ralph/         Entry point and embedded skel templates
+                   (OVERVIEW.md, AGENTS-helper.md, AGENTS-app.md) used
+                   by `ralph init`. Thin: parses flags, constructs
+                   loop.Config, calls loop.Run. The per-iteration
+                   kickoff is a one-liner pointing the agent at
+                   AGENTS.md; no runtime templating.
 internal/loop/     The driver. Split by concern:
                      loop.go       Config, Run, signal plumbing
                      iteration.go  One iteration: kickoff, event pump
@@ -220,12 +254,16 @@ iteration:
 3. **Spawn the agent.** Each iteration calls `Spawner.Spawn`
    (`internal/agent/claude.go:Spawner.Spawn`) to fork a fresh
    `claude` process in its own process group, with stdin/stdout
-   pipes wired for the stream-json protocol.
+   pipes wired for the stream-json protocol. ralph itself stays at
+   the project root; the child's working directory is set to
+   `app-root/` via `cmd.Dir` so the build-agent `AGENTS.md`
+   auto-loads.
 4. **Send the kickoff.** `Session.Send` writes a single
    user-message envelope to the child's stdin (see
-   `stream.WriteUserMessage`). The envelope carries the operator
-   prompt assembled from `cmd/ralph/prompt.md` plus the per-run
-   path substitutions (`{{REQS}}`, `{{WORKDIR}}`).
+   `stream.WriteUserMessage`). The envelope carries a brief nudge —
+   "Read AGENTS.md if you haven't, then perform one iteration of
+   work." The standing operator instructions live in
+   `app-root/AGENTS.md`, which claude auto-loads from the child's cwd.
 5. **Read events.** `internal/loop/iteration.go` pumps
    `Session.Events()` (a `*stream.Reader`) until a terminal
    `result` event arrives. Each line is decoded into a typed
@@ -259,7 +297,7 @@ Following Unix CLI convention. Source of truth:
 |------|-------------------------------------------------|
 | 0    | Success — the agent reported DONE.              |
 | 1    | Runtime error — invalid config, subprocess failure, I/O error, etc. |
-| 2    | Usage error — bad flags, missing WORKDIR, unknown subcommand. |
+| 2    | Usage error — bad flags, unknown subcommand, or no `app-root/AGENTS.md` found at the project root. |
 
 A second SIGINT during shutdown maps to `130` (the conventional
 "terminated by SIGINT" status), via the second-Ctrl-C escape hatch in
@@ -275,9 +313,10 @@ A second SIGINT during shutdown maps to `130` (the conventional
   ralph's perspective; the operator (with help from an interactive
   agent) edits it between runs.
 - **Kickoff** — the first user-message ralph sends after spawning
-  a claude session each iteration. Carries the operator prompt
-  assembled from `prompt.md` with `{{REQS}}` / `{{WORKDIR}}`
-  substituted in.
+  a claude session each iteration. The standing operator
+  instructions live in `app-root/AGENTS.md` (auto-loaded by
+  claude); the kickoff itself is a brief "Read AGENTS.md, perform
+  one iteration" nudge.
 - **stream-json** — the newline-delimited JSON event protocol
   spoken by `claude --output-format stream-json`. Each line
   carries a `type` discriminator; ralph decodes them into the

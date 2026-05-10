@@ -323,7 +323,7 @@ func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner
 	}
 
 	ui.Header(w, o.version, o.engine, o.model, o.effort, formatBudget(o.duration))
-	fmt.Fprintf(w, "reqs=%s\nworkdir=%s\n\n", cfg.ReqsDir, cfg.WorkDir)
+	fmt.Fprintf(w, "reqs=%s\n\n", cfg.ReqsDir)
 
 	s := newStats(o.engine, o.model, o.effort, now, resultsHome)
 	e := render.NewEmitter(

@@ -95,4 +95,3 @@ func TestRun_Blackbox_RejectsUnpricedModel(t *testing.T) {
 		t.Errorf("expected error to mention pricing, got %v", err)
 	}
 }
-

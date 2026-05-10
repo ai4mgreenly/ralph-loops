@@ -17,9 +17,13 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintf(w, `ralph %s — iterative build-agent driver
 
 USAGE
-  ralph [flags] WORKDIR        Run the iteration loop against WORKDIR.
-  ralph init PATH              Scaffold PATH/reqs/ with a starter spec
-                               and a brief for an interactive helper agent.
+  ralph [flags] [PROJECT_ROOT] Run the iteration loop. Run from the
+                               project root (the directory containing
+                               helper/, reqs/, and app-root/). The
+                               optional PROJECT_ROOT positional
+                               defaults to "." and ralph chdirs there
+                               before doing anything else.
+  ralph init [flags] PATH      Scaffold a new project tree under PATH.
   ralph newid [--number=N|-n N]
                                Print N fresh requirement IDs (R-XXXX-XXXX),
                                one per line. Default N=1. Each ID is
@@ -28,7 +32,7 @@ USAGE
   ralph time-of ID             Print the UTC instant from which ID was minted.
   ralph unverified             Print a JSON report of the IDs in --reqs not
                                yet recorded in ./.ralph/requirements-verified.jsonl.
-                               The current directory is treated as the workdir.
+                               Invoked from inside the app-root.
   ralph version                Print version.
   ralph help                   Print this manual.
 
@@ -37,28 +41,41 @@ DESCRIPTION
   implements claude's stream-json wire contract — by default the
   claude CLI itself, or any drop-in replacement passed via --engine.
   Each iteration the agent reads the spec under --reqs, inspects the
-  source tree at WORKDIR, makes one focused change, runs whatever tests
-  the project defines, and reports back DONE or CONTINUE. The loop ends
+  current app-root, makes one focused change, runs whatever tests the
+  project defines, and reports back DONE or CONTINUE. The loop ends
   when the agent reports DONE or the wall-clock budget set by
   --duration expires.
 
-  The minimal invocation
+PROJECT LAYOUT
+  `+"`ralph init my-app`"+` produces:
 
-      ralph .
+      my-app/
+      ├── helper/                spec helper's workspace
+      │   └── AGENTS.md          spec-helper instructions
+      ├── reqs/                  the spec (operator-authored)
+      │   └── OVERVIEW.md
+      └── app-root/              the build root
+          ├── AGENTS.md          build-agent instructions
+          └── .ralph/            created on first run
 
-  uses every default below: it reads the spec from ./reqs/, builds in
-  the current directory, drives claude (sonnet, high effort) with the
-  1M-token context window enabled and permission prompts skipped, and
-  runs until DONE with no time cap.
+  The two AGENTS.md files are the standing personas — the spec helper
+  in my-app/helper/ and the build agent in my-app/app-root/. Each is
+  auto-loaded by claude (and other AGENTS.md-aware engines) when a
+  session starts in the matching directory. ralph itself runs from
+  the project root and spawns the agent with cwd set to app-root/.
 
 CONTRACT WITH THE AGENT
   --reqs is read-only to the agent. It is the operator's input; only
-  the operator edits it (see the IDS section). WORKDIR is where the
-  agent reads and writes — source, tests, build artifacts, scratch
-  files. ralph never edits either tree itself.
+  the operator edits it (see the IDS section). The app-root
+  subdirectory is where the agent reads and writes — source, tests,
+  build artifacts, scratch files. ralph never edits either tree itself.
 
 FLAGS (loop subcommand)
-  --reqs=PATH                          requirements directory
+  --reqs=PATH                          spec directory, relative to the
+                                       project root
+                                       (default: %q)
+  --app-root=PATH                      application source subdirectory,
+                                       relative to the project root
                                        (default: %q)
   --engine=COMMAND                     engine command (claude drop-in
                                        replacement) resolved via $PATH;
@@ -114,18 +131,35 @@ FLAGS (loop subcommand)
   Boolean flags accept --flag, --flag=true, --flag=false. To turn off a
   default-true flag, write e.g. --1m-context=false.
 
+FLAGS (init subcommand)
+  --reqs=NAME                          name of the spec subdirectory
+                                       (default: "reqs")
+  --app-root=NAME                      name of the application source
+                                       subdirectory (default: "app-root")
+  --helper=NAME                        name of the spec-helper
+                                       subdirectory (default: "helper")
+
+  All three names are baked into the templated AGENTS.md files at
+  scaffold time. After init, the layout is fixed; ralph at runtime
+  infers everything from the cwd.
+
 EXAMPLES
-  Build the app in the current directory, defaults:
-      ralph .
+  Scaffold and run with defaults:
+      ralph init my-app
+      cd my-app
+      ralph
 
   Custom budget and a different model:
-      ralph --model=opus --duration=2h .
-
-  Spec lives elsewhere, code in ./app:
-      ralph --reqs=../shared-spec ./app
+      ralph --model=opus --duration=2h
 
   Disable a default-on flag:
-      ralph --1m-context=false .
+      ralph --1m-context=false
+
+  Run against a project without cd'ing into it first:
+      ralph --duration=2h /path/to/project
+
+  Custom subdir names at scaffold time:
+      ralph init --reqs=spec --app-root=build --helper=designer my-app
 
 REQUIREMENT IDS
   Spec bullets carry IDs of the form R-XXXX-XXXX. Each ID encodes the
@@ -146,6 +180,7 @@ REQUIREMENT IDS
 `,
 		version,
 		defaultReqs,
+		defaultAppRoot,
 		defaultEngine,
 		defaultModel,
 		defaultEffort,

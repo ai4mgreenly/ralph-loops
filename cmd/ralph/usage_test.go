@@ -25,6 +25,11 @@ func TestWriteUsage_ContainsVersionAndDefaults(t *testing.T) {
 		`"` + defaultReqs + `"`,
 		`"` + defaultModel + `"`,
 		`"` + defaultEffort + `"`,
+		// The new project-layout section mentions the app-root
+		// subdirectory by name.
+		"app-root",
+		// The --app-root flag is documented in the FLAGS section.
+		"--app-root",
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
