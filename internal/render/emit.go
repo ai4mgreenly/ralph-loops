@@ -34,15 +34,16 @@ const (
 // clears the pending-tool ledger and re-anchors the timer at the
 // start of each new iteration.
 type Emitter struct {
-	out         io.Writer
-	rec         Recorder
-	theme       *ui.Theme
-	tools       map[string]toolRef
-	lastAt      time.Time
-	now         func() time.Time
-	verbose     bool
-	spinner     *ui.Spinner
-	outputLines int
+	out          io.Writer
+	rec          Recorder
+	theme        *ui.Theme
+	tools        map[string]toolRef
+	lastAt       time.Time
+	now          func() time.Time
+	verbose      bool
+	spinner      *ui.Spinner
+	spinnerLabel string
+	outputLines  int
 }
 
 // EmitterOption configures one knob on an [Emitter] at construction
@@ -75,6 +76,15 @@ func WithSpinner(s *ui.Spinner) EmitterOption {
 	return func(e *Emitter) { e.spinner = s }
 }
 
+// WithSpinnerLabel customises the "waiting for X" prefix the default
+// spinner paints between event reads. Production callers thread the
+// model name in so the operator sees what's actually being waited on
+// (the engine is just a router; the model is what's billing). Has no
+// effect when [WithSpinner] supplied a pre-built spinner.
+func WithSpinnerLabel(label string) EmitterOption {
+	return func(e *Emitter) { e.spinnerLabel = label }
+}
+
 // toolRef is the input to a not-yet-completed tool call, retained so
 // the eventual tool_result can show the same parameter formatting as
 // the original call.
@@ -97,19 +107,27 @@ const defaultOutputLines = 10
 // [WithVerbose], [WithOutputLines], and [WithSpinner].
 func NewEmitter(out io.Writer, rec Recorder, theme *ui.Theme, opts ...EmitterOption) *Emitter {
 	e := &Emitter{
-		out:         out,
-		rec:         rec,
-		theme:       theme,
-		tools:       make(map[string]toolRef),
-		now:         time.Now,
-		spinner:     ui.NewSpinner(out, "waiting for claude", theme.UseColor()),
-		outputLines: defaultOutputLines,
+		out:          out,
+		rec:          rec,
+		theme:        theme,
+		tools:        make(map[string]toolRef),
+		now:          time.Now,
+		spinnerLabel: defaultSpinnerLabel,
+		outputLines:  defaultOutputLines,
 	}
 	for _, opt := range opts {
 		opt(e)
 	}
+	if e.spinner == nil {
+		e.spinner = ui.NewSpinner(out, "waiting for "+e.spinnerLabel, theme.UseColor())
+	}
 	return e
 }
+
+// defaultSpinnerLabel is the spinner suffix when the caller does not
+// override via [WithSpinnerLabel]. It matches the bare-default engine
+// so a `ralph .` invocation with no flags reads naturally.
+const defaultSpinnerLabel = "claude"
 
 // Spinner returns the [ui.Spinner] the emitter brackets each event
 // read with. Exposed so the loop driver can toggle the rotator on

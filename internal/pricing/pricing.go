@@ -7,11 +7,13 @@
 //     the claude CLI accepts (the latest model in each family). Refresh
 //     from https://platform.claude.com/docs/en/docs/about-claude/pricing
 //     when a new family ships.
-//   - Vendor-specific model IDs — e.g. "gpt-5.5" — match what alternate
-//     engines forward verbatim. OpenAI rates source from
-//     https://developers.openai.com/api/docs/pricing. OpenAI bills
-//     "cached input" but not cache creation, so CacheCreate is 0 for
-//     OpenAI rows.
+//   - Vendor-specific model IDs — e.g. "gpt-5.5",
+//     "gemini-3.1-pro-preview" — match what alternate engines forward
+//     verbatim. OpenAI rates source from
+//     https://developers.openai.com/api/docs/pricing; Google rates
+//     from https://ai.google.dev/gemini-api/docs/pricing. Both vendors
+//     bill cache reads but not per-token cache creation (Google bills
+//     storage by hour instead), so CacheCreate is 0 for those rows.
 //
 // Unknown aliases are not an error: callers see ok=false from [Lookup]
 // and skip cost accounting for that run.
@@ -40,10 +42,11 @@ type Pricing struct {
 // [Lookup] to resolve aliases; the map itself is unexported so that
 // callers cannot mutate the table at runtime.
 var models = map[string]Pricing{
-	"haiku":   {Input: 1_000_000, Output: 5_000_000, CacheRead: 100_000, CacheCreate: 1_250_000},
-	"sonnet":  {Input: 3_000_000, Output: 15_000_000, CacheRead: 300_000, CacheCreate: 3_750_000},
-	"opus":    {Input: 5_000_000, Output: 25_000_000, CacheRead: 500_000, CacheCreate: 6_250_000},
-	"gpt-5.5": {Input: 5_000_000, Output: 30_000_000, CacheRead: 500_000, CacheCreate: 0},
+	"haiku":                  {Input: 1_000_000, Output: 5_000_000, CacheRead: 100_000, CacheCreate: 1_250_000},
+	"sonnet":                 {Input: 3_000_000, Output: 15_000_000, CacheRead: 300_000, CacheCreate: 3_750_000},
+	"opus":                   {Input: 5_000_000, Output: 25_000_000, CacheRead: 500_000, CacheCreate: 6_250_000},
+	"gpt-5.5":                {Input: 5_000_000, Output: 30_000_000, CacheRead: 500_000, CacheCreate: 0},
+	"gemini-3.1-pro-preview": {Input: 2_000_000, Output: 12_000_000, CacheRead: 200_000, CacheCreate: 0},
 }
 
 // Lookup resolves a model alias to its [Pricing]. The match is
@@ -68,7 +71,7 @@ func HasModel(alias string) bool {
 // Hand-maintained alongside the [models] map so the help text and
 // flag-allow-list iterate in the documented order rather than map-
 // iteration order.
-var modelOrder = []string{"haiku", "sonnet", "opus", "gpt-5.5"}
+var modelOrder = []string{"haiku", "sonnet", "opus", "gpt-5.5", "gemini-3.1-pro-preview"}
 
 // Models returns the set of known model aliases in cheapest-first
 // order. Callers (notably the CLI flag layer) use it to keep their

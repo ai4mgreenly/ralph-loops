@@ -4,7 +4,7 @@ import "testing"
 
 func TestLookup_KnownAliases(t *testing.T) {
 	t.Parallel()
-	for _, alias := range []string{"haiku", "sonnet", "opus", "gpt-5.5"} {
+	for _, alias := range []string{"haiku", "sonnet", "opus", "gpt-5.5", "gemini-3.1-pro-preview"} {
 		if _, ok := Lookup(alias); !ok {
 			t.Errorf("Lookup missing alias %q", alias)
 		}

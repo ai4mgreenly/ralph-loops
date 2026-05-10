@@ -330,6 +330,7 @@ func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner
 		w, s, cfg.Theme,
 		render.WithVerbose(o.verbose),
 		render.WithOutputLines(o.outputLines),
+		render.WithSpinnerLabel(o.model),
 	)
 
 	exit, runErr := drive(runCtx, cfg, o, sp, e, s)

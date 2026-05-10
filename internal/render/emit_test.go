@@ -408,6 +408,44 @@ func TestEmitter_BashEmptyResultRendersNothing(t *testing.T) {
 	}
 }
 
+// TestEmitter_BashResultFallsBackToBlockContent pins the
+// alternate-engine path: when the user event carries no
+// `tool_use_result` sidecar (the claude-CLI-specific extension), the
+// renderer must fall back to the tool_result block's `content` field.
+// Fixture mirrors what ikigai-cli emits when driving Google: a short
+// alphanumeric tool_use ID and the joined output as a JSON string.
+func TestEmitter_BashResultFallsBackToBlockContent(t *testing.T) {
+	e, buf, _ := newTestEmitter(t)
+
+	e.OnAssistant(stream.Assistant{Message: stream.Message{Content: []stream.Block{
+		{
+			Type:  stream.BlockToolUse,
+			ID:    "v7vo5hw6",
+			Name:  "Bash",
+			Input: json.RawMessage(`{"command":"./test.sh"}`),
+		},
+	}}})
+	buf.Reset()
+
+	contentJSON, err := json.Marshal("ok  \tralph-scoops\t(cached)\n\n[exit: 0]")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	e.OnUser(stream.User{Message: stream.Message{Content: []stream.Block{
+		{Type: stream.BlockToolResult, ToolUseID: "v7vo5hw6", Content: contentJSON},
+	}}})
+
+	got := buf.String()
+	for _, want := range []string{"ok", "ralph-scoops", "[exit: 0]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in fallback bash output:\n%s", want, got)
+		}
+	}
+	if _, ok := e.tools["v7vo5hw6"]; ok {
+		t.Errorf("short-ID tool entry should have been removed from ledger after result")
+	}
+}
+
 // TestEmitter_ReadResultStripsLineNumbers exercises emitReadResult by
 // pairing a Read tool_use with a tool_result whose `content` is the
 // agent's `cat -n`-style line-numbered text. The result block must
