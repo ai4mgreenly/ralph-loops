@@ -208,8 +208,12 @@ func wrapVisible(s string, max int) []string {
 // Header writes the run banner. duration may be any pre-formatted
 // string (for example "unlimited" or "4h 0m 0s"). engine is the
 // command name of the agent CLI being driven (typically "claude").
+//
+// version is printed verbatim — it already carries any prefix the
+// build wants ("v0.1.0", "v0.1.0-3-gabc1234", "dev"). Adding our own
+// "v" here would double-prefix tag-derived strings into "vv0.1.0".
 func Header(w io.Writer, version, engine, model, effort, duration string) {
-	fmt.Fprintf(w, "ralph v%s\n", version)
+	fmt.Fprintf(w, "ralph %s\n", version)
 	fmt.Fprintf(w, "engine=%s model=%s effort=%s duration=%s\n\n", engine, model, effort, duration)
 }
 
