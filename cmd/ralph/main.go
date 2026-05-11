@@ -93,6 +93,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "init":
 		return runInit(args[1:], stdout, stderr)
+	case "reset":
+		return runReset(args[1:], stdout, stderr)
 	case "newid":
 		return runNewID(args[1:], stdout, stderr)
 	case "time-of":

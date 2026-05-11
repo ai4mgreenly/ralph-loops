@@ -51,6 +51,15 @@ subcommand is unchanged: it is invoked by the agent from inside
 `app-root/`, so its `--reqs` default stays `../reqs`. Missing
 `app-root/AGENTS.md` is rejected at the project-root check.
 
+The `reset` subcommand is the inverse of init for `app-root/` only:
+run from the project root, it removes every entry inside `app-root/`
+(including `.ralph/` state and any nested `.git`) and rewrites the
+templated build-agent `AGENTS.md`. It accepts the same `--reqs` /
+`--app-root` / `--helper` flags as `init` and the same optional
+`PROJECT_ROOT` positional as the loop. There is no prompt and no
+`--force` — project-level git is the safety net. Refuses unless all
+three subdirectories are present so it can't nuke a random cwd.
+
 ## Layout
 
 ```

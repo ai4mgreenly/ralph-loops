@@ -24,6 +24,16 @@ USAGE
                                defaults to "." and ralph chdirs there
                                before doing anything else.
   ralph init [flags] PATH      Scaffold a new project tree under PATH.
+  ralph reset [flags] [PROJECT_ROOT]
+                               Wipe the app-root subdirectory back to
+                               virgin init state: remove every entry
+                               inside it (including .ralph/ state and
+                               any nested .git), then rewrite the
+                               templated build-agent AGENTS.md. Run
+                               from the project root, or pass that
+                               directory as PROJECT_ROOT. Project-level
+                               git is the safety net — there is no
+                               prompt and no --force.
   ralph newid [--number=N|-n N]
                                Print N fresh requirement IDs (R-XXXX-XXXX),
                                one per line. Default N=1. Each ID is
@@ -131,7 +141,7 @@ FLAGS (loop subcommand)
   Boolean flags accept --flag, --flag=true, --flag=false. To turn off a
   default-true flag, write e.g. --1m-context=false.
 
-FLAGS (init subcommand)
+FLAGS (init and reset subcommands)
   --reqs=NAME                          name of the spec subdirectory
                                        (default: "reqs")
   --app-root=NAME                      name of the application source
@@ -139,9 +149,10 @@ FLAGS (init subcommand)
   --helper=NAME                        name of the spec-helper
                                        subdirectory (default: "helper")
 
-  All three names are baked into the templated AGENTS.md files at
-  scaffold time. After init, the layout is fixed; ralph at runtime
-  infers everything from the cwd.
+  At scaffold time the three names are baked into the templated
+  AGENTS.md files. ralph reset accepts the same flags so the rewritten
+  AGENTS.md matches whatever names the project was scaffolded with —
+  pass the same values you passed to ralph init.
 
 EXAMPLES
   Scaffold and run with defaults:

@@ -30,6 +30,19 @@ const (
 	defaultInitHelperName  = "helper"
 )
 
+// renderSkel substitutes the operator-chosen subdirectory names into a
+// scaffold template. Shared by `ralph init` (which writes the initial
+// AGENTS.md files) and `ralph reset` (which restores the build-agent
+// AGENTS.md to its virgin state). Keeping the substitution in one
+// place keeps both paths in lockstep.
+func renderSkel(template, reqsName, appRootName, helperName string) string {
+	return strings.NewReplacer(
+		"{{REQS}}", reqsName,
+		"{{APP_ROOT}}", appRootName,
+		"{{HELPER}}", helperName,
+	).Replace(template)
+}
+
 // runInit parses `ralph init`'s flags, validates the positional, and
 // hands off to scaffoldProject. Subcommand-specific so it can carry its
 // own --reqs / --app-root / --helper surface without polluting the loop
@@ -120,18 +133,13 @@ func scaffoldProject(root, reqsName, appRootName, helperName string) error {
 		return fmt.Errorf("create %q: %w", helperDir, err)
 	}
 
-	subst := strings.NewReplacer(
-		"{{REQS}}", reqsName,
-		"{{APP_ROOT}}", appRootName,
-		"{{HELPER}}", helperName,
-	)
 	writes := []struct {
 		path    string
 		content string
 	}{
 		{overview, skelOverview},
-		{helperAgents, subst.Replace(skelAgentsHelper)},
-		{appAgents, subst.Replace(skelAgentsApp)},
+		{helperAgents, renderSkel(skelAgentsHelper, reqsName, appRootName, helperName)},
+		{appAgents, renderSkel(skelAgentsApp, reqsName, appRootName, helperName)},
 	}
 	for _, w := range writes {
 		if err := os.WriteFile(w.path, []byte(w.content), 0o644); err != nil {
