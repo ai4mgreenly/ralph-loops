@@ -135,19 +135,32 @@ Tag a requirement by placing the ID at the start of the line, e.g.
 
     - R-052Y-EKE0: anonymous visitors cannot post comments.
 
-Treat each ID as a stable handle on one specific claim. The rules:
+**The rule has no exceptions: if the text of a requirement changes by
+even one character, the ID changes too.** Treat the ID as a hash of
+the wording, not a name for the idea. The two stay locked together —
+edit one, you edit the other, in the same change. If you find
+yourself reasoning about whether a particular edit is "small enough"
+to keep the ID, stop: the answer is always no.
 
-- **Trivial edits keep the ID.** Wording, grammar, clarification that
-  doesn't change the observable behavior — same ID.
-- **Material changes get a new ID.** If the requirement's meaning
-  changes — different behavior, different scope, different
-  acceptance — mint a fresh ID with `ralph newid` and replace the
-  old one. This signals the build agent to re-evaluate the
-  requirement from scratch on the next iteration. Old code or tests
-  that referenced the previous ID will surface as stale references
-  and the build agent will reconcile them.
+- **Byte-identical text keeps the ID. Anything else gets a new one.**
+  Wording, grammar, punctuation, capitalization, whitespace,
+  clarification, scope, meaning — all of these count as changes. Mint
+  the new ID with `ralph newid` and replace the old one in place, in
+  the same edit. Never edit a requirement's text without also
+  swapping its ID.
+- **There is no "trivial edit" category.** Do not weigh how
+  meaningful a change is. Do not save the ID because the change feels
+  cosmetic. The agent depends on the ID flipping to know it must
+  re-evaluate the requirement; a stable ID across a text change is a
+  silent lie to the build loop.
 - **Don't reuse a retired ID.** Once an ID has been replaced or
   removed, it stays gone.
+
+Swapping the ID signals the build agent to re-evaluate the
+requirement from scratch on the next iteration. Old code or tests
+that referenced the previous ID will surface as stale references and
+the build agent will reconcile them. Keeping the ID stable across a
+text change defeats this mechanism.
 
 ## How to work with the user
 
