@@ -214,7 +214,7 @@ func wrapVisible(s string, max int) []string {
 // "v" here would double-prefix tag-derived strings into "vv0.1.0".
 func Header(w io.Writer, version, engine, model, effort, duration string) {
 	fmt.Fprintf(w, "ralph %s\n", version)
-	fmt.Fprintf(w, "engine=%s model=%s effort=%s duration=%s\n\n", engine, model, effort, duration)
+	fmt.Fprintf(w, "engine=%s model=%s effort=%s duration=%s\n", engine, model, effort, duration)
 }
 
 // FormatBytes renders a byte count as a compact human-readable string

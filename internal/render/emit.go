@@ -148,7 +148,6 @@ func (e *Emitter) ResetIteration() {
 // terminal).
 func (e *Emitter) IterationBanner(n int) {
 	rule := e.theme.Rule()
-	fmt.Fprintln(e.out)
 	fmt.Fprintln(e.out, rule)
 	fmt.Fprintf(e.out, "iteration: %d\n", n)
 	fmt.Fprintln(e.out, rule)

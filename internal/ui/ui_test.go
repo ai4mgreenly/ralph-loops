@@ -557,7 +557,7 @@ func TestHeader(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
 	Header(&buf, "v1.2.3", "claude", "opus", "medium", "unlimited")
-	want := "ralph v1.2.3\nengine=claude model=opus effort=medium duration=unlimited\n\n"
+	want := "ralph v1.2.3\nengine=claude model=opus effort=medium duration=unlimited\n"
 	if got := buf.String(); got != want {
 		t.Errorf("Header:\ngot  %q\nwant %q", got, want)
 	}
