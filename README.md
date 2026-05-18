@@ -1,20 +1,24 @@
 # Ralph Loops
 
 A small Go CLI that drives an iterative "ralph loop": invoked from
-the project root, it spawns the `claude` CLI as a child with cwd set
-to the project's `app-root/` directory, nudges it to read the
-standing instructions in `app-root/AGENTS.md`, parses the stream-json
-event flow, and repeats until the agent reports DONE, a wall-clock
-budget expires, or you Ctrl-C.
+the project root, it spawns `pi`
+(`@earendil-works/pi-coding-agent`) one-shot per iteration
+(`pi -p --mode json`) with cwd set to the project's `app-root/`
+directory, injects the standing instructions from `app-root/AGENTS.md`
+as pi's system prompt, parses pi's native JSONL event stream, and
+repeats until the agent reports DONE, a wall-clock budget expires, or
+you Ctrl-C.
 
 A scaffolded project ships two `AGENTS.md` files in sibling
 subdirectories: one in `helper/` for the interactive spec-helper
 persona, and one in `app-root/` for the build agent ralph drives.
-Each is auto-loaded by claude when a session starts in the matching
-directory. The spec-helper sits in its own subdirectory (rather than
-at the project root) so it stays off the build agent's walk-up path —
-claude reads every `AGENTS.md` between cwd and `/`, so a root-level
-helper would leak conflicting instructions into the agent's context.
+ralph injects the build-agent persona explicitly via
+`--append-system-prompt` and runs pi with `--no-context-files`, so pi
+does no AGENTS.md/CLAUDE.md discovery or parent-directory walk-up. The
+two personas have opposite jobs — the helper authors specs under
+`reqs/`, the build agent implements them under `app-root/` — so each
+lives in its own directory as plain role separation, not isolation
+engineering.
 
 [![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -47,7 +51,7 @@ anywhere:
 
 Make sure `$HOME/.local/bin` is on your `$PATH`. If you prefer not to
 install, `make build` produces `bin/ralph` and you can invoke it
-directly. Requires Go 1.26+ and the `claude` CLI on `$PATH`.
+directly. Requires Go 1.26+ and the `pi` CLI on `$PATH`.
 
 ### Build, test, lint
 
@@ -84,7 +88,7 @@ This creates the following tree:
 
 `reqs/` holds the spec — read-only input as far as ralph is
 concerned. `app-root/` is where the build agent works. `helper/` is
-where the human (with an interactive `claude` session) sharpens the
+where the human (with an interactive `pi` session) sharpens the
 spec. All AGENTS.md files are baked at scaffold time with the right
 paths substituted in; the binary carries no runtime templating.
 
@@ -94,11 +98,11 @@ Override the directory names with `--reqs`, `--app-root`, and
     ralph init --reqs=spec --app-root=src --helper=designer my-app
 
 To sharpen the spec, `cd` into the `helper/` subdirectory and start
-an interactive `claude` session. The spec-helper `AGENTS.md` is
-auto-loaded:
+an interactive `pi` session. The spec-helper `AGENTS.md` is
+auto-loaded by pi from that directory:
 
     cd my-app/helper
-    claude
+    pi
     > help me build out the spec
 
 The helper interviews you about goals, audience, constraints, and
@@ -109,7 +113,7 @@ stub. Spend time here first; a sharper spec makes for a tighter
 ralph run.
 
 **A split-terminal setup is the most ergonomic way to work.** Put
-the interactive `claude` session in one pane and a plain shell in
+the interactive `pi` session in one pane and a plain shell in
 the other. Sharpen the spec on the left until it describes
 something the build agent can actually start on, then kick off
 `ralph` in the right pane:
@@ -126,22 +130,23 @@ flags `--reqs=PATH` (default `reqs`) and `--app-root=PATH` (default
 `app-root`) override the subdirectory names; both are project-root
 relative. ralph itself stays at the project root and spawns the
 agent with cwd set to `app-root/`, so the agent reads the spec from
-`../reqs/` and writes state to `./.ralph/`. The default model is
-sonnet at high effort with the
-1M-token context window enabled, iterating until the agent reports
-DONE or you interrupt. Each iteration is bracketed by a banner so
-you can see the cadence; per-event stream output appears
-underneath, with a `waiting for claude (Xs)` spinner during long
-pauses. At the end of the run a summary panel reports start/end
-times, per-event counts, tokens, cost, and time spent in LLM vs.
-tools. The same data is appended as one JSON line per run to
-`~/.ralph-loops/results.jsonl` for later inspection.
+`../reqs/` and writes state to `./.ralph/`. ralph carries no
+provider/model/thinking defaults of its own — with no flags set, pi
+uses its own `~/.pi/agent/settings.json` configuration — and it
+iterates until the agent reports DONE or you interrupt. Each
+iteration is bracketed by a banner so you can see the cadence;
+per-event stream output appears underneath, with a `waiting for pi
+(Xs)` spinner during long pauses. At the end of the run a summary
+panel reports start/end times, per-event counts, tokens, pi's
+authoritative cost (broken down by provider/model), and time spent
+in LLM vs. tools. The same data is appended as one JSON line per run
+to `~/.ralph-loops/results.jsonl` for later inspection.
 
-To tune the run:
+To tune the run (all pass-throughs to pi; ralph sets no defaults):
 
     ralph --model=opus --duration=2h
-    ralph --1m-context=false --reqs=../shared-spec
-    ralph --effort=high --tools=Bash,Read,Write,Edit
+    ralph --provider=anthropic --reqs=../shared-spec
+    ralph --thinking=high --tools=read,bash,edit,write
 
 See `ralph help` for the full flag list.
 
@@ -149,9 +154,9 @@ See `ralph help` for the full flag list.
 
 ralph is designed to be one half of a two-loop workflow.
 
-The **outer loop** is you and an interactive agent (Claude Code or
+The **outer loop** is you and an interactive agent (`pi` or
 similar) iterating on the spec under `reqs/`. After `ralph init`,
-you start a `claude` session in `helper/` and `helper/AGENTS.md`
+you start a `pi` session in `helper/` and `helper/AGENTS.md`
 (the spec-helper persona) auto-loads. The helper
 interviews you about goals, audience, hard constraints, and what's
 out of scope, then proposes a file layout and writes individual
@@ -161,7 +166,7 @@ finished system and, when useful, the reason it matters.
 Implementation choices belong to the build agent on the inside
 loop.
 
-The **inner loop** is ralph driving claude against that spec,
+The **inner loop** is ralph driving pi against that spec,
 iteration after iteration. Each invocation reads the whole `reqs/`
 tree, inspects the current state of the workdir, picks the
 smallest meaningful unit of work, makes one focused change, and
@@ -199,34 +204,41 @@ cmd/ralph/         Entry point and embedded skel templates
                    (OVERVIEW.md, AGENTS-helper.md, AGENTS-app.md) used
                    by `ralph init`. Thin: parses flags, constructs
                    loop.Config, calls loop.Run. The per-iteration
-                   kickoff is a one-liner pointing the agent at
-                   AGENTS.md; no runtime templating.
+                   kickoff is a one-liner nudge ("perform one
+                   iteration, then end with the RALPH-STATUS line") —
+                   the persona is delivered via --append-system-prompt,
+                   so the kickoff does not tell the agent to read a
+                   file; no runtime templating.
 internal/loop/     The driver. Split by concern:
                      loop.go       Config, Run, signal plumbing
-                     iteration.go  One iteration: kickoff, event pump
+                     iteration.go  One iteration: kickoff, event pump,
+                                   RALPH-STATUS parse (no correction
+                                   retry — pi runs one-shot)
                      stats.go      Token/cost tallies, panel rendering
+                                   from pi's per-turn usage
                      agent.go      Spawner/Session interfaces consumed here
                    Subprocess mechanics live in internal/agent; output
                    rendering lives in internal/render. loop owns lifecycle.
-internal/agent/    Wraps the claude CLI behind Spawner/Session interfaces.
-                   Owns os/exec, the user-message envelope, process-group
-                   plumbing, and a typed ExitError. Production code uses
-                   agent.NewSpawner(); tests inject fakes.
-internal/render/   Output layer: emit/format/diff/highlight. Couples to
-                   stats via a 4-method Recorder interface defined here
-                   (consumer-side). The Emitter is split into emit_bash,
-                   emit_read, emit_edit, emit_write to keep tool-family
-                   rendering isolated.
-internal/stream/   Typed model of the claude stream-json event flow.
-                   Two-pass decode: a small head struct routes on the
-                   "type" discriminator, then the line is decoded into
-                   the matching concrete type (Assistant, User, Result,
-                   System, RateLimit, UnknownEvent).
+internal/agent/    Wraps the pi CLI behind Spawner/Session interfaces.
+                   Owns os/exec, the one-shot `pi -p --mode json` argv,
+                   /dev/null stdin, process-group plumbing, and a typed
+                   ExitError. Production code uses agent.NewSpawner();
+                   tests inject fakes.
+internal/render/   Output layer: emit/format/diff/highlight. One generic
+                   tool renderer plus the edit diff. Couples to stats
+                   via a Recorder interface defined here (consumer-side).
+internal/stream/   Typed model of pi's native `-p --mode json` event
+                   flow. Two-pass decode: a small head struct routes on
+                   the "type" discriminator, then the line is decoded
+                   into the matching concrete type (Session, MessageEnd,
+                   ToolExecutionStart, ToolExecutionEnd, TurnEnd,
+                   AgentEnd, UnknownEvent). The DONE/CONTINUE control is
+                   a text sentinel parsed from the terminal agent_end.
+internal/reqs/     Reads spec requirement IDs and the agent's verified
+                   ledger and computes the unverified set difference
+                   (the read side of `ralph unverified`).
 internal/idgen/    Mints/inverts R-XXXX-XXXX requirement IDs from
                    wall-clock ms via an affine bijection mod 36^8.
-internal/pricing/  Per-token USD cost table keyed by model alias
-                   (haiku/sonnet/opus). Refresh from the Anthropic
-                   pricing page when a new family ships.
 internal/ui/       Output primitives: ANSI-aware status lines, byte/
                    time/number formatters, the spinner, and the Theme
                    that owns colour and width. No dependency on loop
@@ -235,7 +247,7 @@ examples/          Example reqs/ trees (e.g. ralph-scoops).
 ```
 
 The dependency arrows in the package graph all point inward:
-`cmd/ralph -> loop -> {agent, render, stream, pricing, ui}`,
+`cmd/ralph -> loop -> {agent, render, stream, ui}`,
 `render -> {stream, ui}`, `agent -> stream`. Nothing in `internal/*`
 imports another internal package upward, and nothing depends on
 `cmd/ralph`.
@@ -252,34 +264,36 @@ iteration:
    run; a second SIGINT triggers a hard exit via the
    `installForceQuit` helper.
 3. **Spawn the agent.** Each iteration calls `Spawner.Spawn`
-   (`internal/agent/claude.go:Spawner.Spawn`) to fork a fresh
-   `claude` process in its own process group, with stdin/stdout
-   pipes wired for the stream-json protocol. ralph itself stays at
-   the project root; the child's working directory is set to
-   `app-root/` via `cmd.Dir` so the build-agent `AGENTS.md`
-   auto-loads.
-4. **Send the kickoff.** `Session.Send` writes a single
-   user-message envelope to the child's stdin (see
-   `stream.WriteUserMessage`). The envelope carries a brief nudge —
-   "Read AGENTS.md if you haven't, then perform one iteration of
-   work." The standing operator instructions live in
-   `app-root/AGENTS.md`, which claude auto-loads from the child's cwd.
+   (`internal/agent/engine.go:Spawner.Spawn`) to fork a fresh
+   one-shot `pi -p --mode json` process in its own process group,
+   with stdin set to `/dev/null` and stdout wired for pi's native
+   JSONL event stream. The build-agent persona from
+   `app-root/AGENTS.md` is injected via `--append-system-prompt`
+   (with `--no-context-files`, so pi does no file discovery). ralph
+   itself stays at the project root; the child's working directory
+   is set to `app-root/` via `cmd.Dir`.
+4. **Deliver the kickoff.** The kickoff nudge ("perform one
+   iteration of work, then end with the RALPH-STATUS line") is the
+   trailing positional argument to `pi -p`; pi has no stdin
+   user-message protocol, so `Session.Send` is a no-op (the prompt
+   was already baked into the argv at spawn).
 5. **Read events.** `internal/loop/iteration.go` pumps
-   `Session.Events()` (a `*stream.Reader`) until a terminal
-   `result` event arrives. Each line is decoded into a typed
+   `Session.Events()` (a `*stream.Reader`) until the terminal
+   `agent_end` event arrives. Each line is decoded into a typed
    `stream.Event` and dispatched to the `render.Emitter`.
 6. **Render and tally.** The emitter pretty-prints each event
    (`internal/render/emit*.go`) and updates the loop's stats
-   accumulator through the four-method `render.Recorder`
-   interface (block counts, LLM time, tool time, token usage).
-7. **Inspect the result.** When the `result` event lands the loop
-   reads its schema-constrained `status` field via
-   `stream.ParseStatus`. `DONE` ends the run; `CONTINUE` (or any
-   non-terminal value) loops back to step 3.
-8. **Reap the session.** Either way, `Session.Close` shuts down
-   stdin, drains stdout to EOF (with a 5-second backstop), and
-   waits for the child to exit. A non-zero exit becomes a typed
-   `agent.ExitError`.
+   accumulator through the `render.Recorder` interface (block
+   counts, LLM time, tool time, pi's per-turn token/cost usage).
+7. **Inspect the result.** When `agent_end` lands the loop reads
+   the `RALPH-STATUS` text sentinel from the last assistant
+   message via `stream.StatusFromAgentEnd`. `DONE` ends the run;
+   `CONTINUE` (or a missing/garbled sentinel, which defaults to
+   CONTINUE) loops back to step 3.
+8. **Reap the session.** Either way, `Session.Close` drains
+   stdout to EOF (with a 5-second backstop) and waits for the
+   child to exit; there is no stdin pipe to close (pi's stdin is
+   `/dev/null`). A non-zero exit becomes a typed `agent.ExitError`.
 9. **Repeat or exit.** The driver loops until DONE, the wall-clock
    budget exhausts (`ErrTimedOut`), the operator interrupts
    (`ErrInterrupted`), or a runtime error bubbles up.
@@ -305,22 +319,22 @@ A second SIGINT during shutdown maps to `130` (the conventional
 
 ## Glossary
 
-- **Ralph loop** — the outer iteration: spawn claude, feed it the
+- **Ralph loop** — the outer iteration: spawn pi, feed it the
   spec and the current workdir, observe a single focused change,
   ask CONTINUE or DONE, repeat. Named after the cadence rather
   than any particular component.
 - **`reqs/`** — the project's spec directory. Read-only from
   ralph's perspective; the operator (with help from an interactive
   agent) edits it between runs.
-- **Kickoff** — the first user-message ralph sends after spawning
-  a claude session each iteration. The standing operator
-  instructions live in `app-root/AGENTS.md` (auto-loaded by
-  claude); the kickoff itself is a brief "Read AGENTS.md, perform
-  one iteration" nudge.
-- **stream-json** — the newline-delimited JSON event protocol
-  spoken by `claude --output-format stream-json`. Each line
-  carries a `type` discriminator; ralph decodes them into the
-  typed `stream.Event` family.
+- **Kickoff** — the trailing positional prompt ralph passes to
+  `pi -p` each iteration. The build-agent persona lives in
+  `app-root/AGENTS.md`, injected as pi's system prompt via
+  `--append-system-prompt`; the kickoff itself is a brief "perform
+  one iteration, then end with the RALPH-STATUS line" nudge.
+- **pi event stream** — the newline-delimited JSON event protocol
+  pi emits in `pi -p --mode json`. Each line carries a `type`
+  discriminator; ralph decodes them into the typed `stream.Event`
+  family, terminating in `agent_end`.
 - **R-XXXX-XXXX requirement ID** — eight-character base-36
   identifier derived from the wall-clock minute via an affine
   bijection. Minted by `ralph newid`, decoded back to its instant

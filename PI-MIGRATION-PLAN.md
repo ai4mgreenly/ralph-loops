@@ -36,6 +36,18 @@ is package-local (`go build`/`go test ./internal/<pkg>/...`,
 decoupling pre-rewrite would need a throwaway `stream.Result` cost
 shim the principles reject).
 
+## ✅ MIGRATION COMPLETE — 2026-05-17
+
+All goals **G1–G6 done-verified**. ralph-loops drives `pi`
+exclusively; the claude/Anthropic/ikigai/stream-json stack and
+`internal/pricing` are gone. Repo green: `gofmt`/`go vet` clean,
+`make build` + `make test` pass (8/8 packages). Commits `2c45fc3`
+(G1) … `bae6731` (G5) + the G6 commit. The three `PI-MIGRATION-*.md`
+files are now safely removable at the operator's discretion (they
+remain as the migration record). The loop's autonomous stop
+condition ("migration complete and verified") is reached — no
+further goals.
+
 ## Roadmap
 
 ### G1 — Stream-pipeline spine (the keystone) — `done-verified` (2026-05-17)
@@ -224,7 +236,31 @@ fixture corpus from live pi; remaining fixture cases (tool error,
 multi-turn w/ tools, `edit` call). Acceptance: build+test green;
 gated test skips cleanly without auth.
 
-### G6 — Final sweep & migration close — `pending`
+### G6 — Final sweep & migration close — `done-verified` (2026-05-17)
+
+Verified independently: gofmt/vet clean, `make build`/`make test`
+green (8/8). Whole-tree residual audit (341 matches classified): 3
+genuine stale-claude DEFECTs found and surgically fixed —
+`internal/ui/ui.go` doc comment ("typically claude"→"pi"), `README.md`
+(stale claude/stream-json/pricing/`--effort` prose → pi reality),
+`.github/workflows/ci.yml` comment (claude_unix.go→engine_unix.go).
+All other in-scope residuals are legitimate: the locked
+`claude-restore` rollback-tag version string, the `CLAUDE.md`
+filename + correct "pi does not read it" assertions, the Q13
+lowercase `{"status":"done|pending"}` tool vocabulary (deliberately
+retained — the devlogged trap), `anthropic/…` as opaque
+provider/model pass-through test values proving provider-neutrality,
+and migration-documenting negative-assertion tests/why-comments.
+`PI-MIGRATION-*.md` confirmed safely removable (no build/test/runtime
+artifact references them; one historical prose comment only, stays
+accurate post-deletion) — left in place as the migration record;
+operator's call to delete. **Adjudicated:** `examples/ralph-scoops/`
+(150 matches) left untouched — independently confirmed it carries NO
+ralph loop-control `{"status":…}`/`RALPH-STATUS` contamination and
+never names claude as *ralph's* engine; it is a demo target app whose
+own design uses claude as an AI backend, orthogonal to ralph's engine
+and out of migration scope (a separate optional future effort).
+Original spec below (kept for provenance):
 
 Whole-tree grep for residual `claude`/`anthropic`/`ikigai`/
 `stream-json`/`structured_output`/`pricing`/`CLAUDE_`/`--effort`/
@@ -303,3 +339,10 @@ this is done-verified.
   (violates `rules`: never cd); re-verified from repo root with
   absolute paths — all green. Henceforth absolute paths only. Next:
   G6 (final sweep & migration close).
+- `2026-05-17` — **G6 done-verified — MIGRATION COMPLETE.** Residual
+  audit: 3 stale-claude defects surgically fixed (ui.go comment,
+  README.md, ci.yml comment); all remaining residuals legitimate;
+  `examples/ralph-scoops/` adjudicated out-of-scope (no ralph
+  loop/engine coupling, independently confirmed); `PI-MIGRATION-*.md`
+  confirmed removable. Final independent verify: gofmt/vet clean,
+  `make build` + `make test` 8/8 green. Loop stop condition reached.

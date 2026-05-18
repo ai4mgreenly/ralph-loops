@@ -35,8 +35,8 @@ jobs:
   cross-vet:
     # Compile-checks the build-tag branches that the matrix above would
     # otherwise only exercise from the matching host. Runs on Linux but
-    # cross-compiles for both targets so internal/agent/claude_unix.go +
-    # claude_other.go and internal/ui/theme_unix.go + theme_other.go all
+    # cross-compiles for both targets so internal/agent/engine_unix.go +
+    # engine_other.go and internal/ui/theme_unix.go + theme_other.go all
     # get type-checked on every push.
     runs-on: ubuntu-latest
     steps:

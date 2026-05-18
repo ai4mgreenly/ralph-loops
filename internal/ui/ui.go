@@ -207,7 +207,7 @@ func wrapVisible(s string, max int) []string {
 
 // Header writes the run banner. duration may be any pre-formatted
 // string (for example "unlimited" or "4h 0m 0s"). engine is the
-// command name of the agent CLI being driven (typically "claude").
+// command name of the agent CLI being driven (typically "pi").
 //
 // version is printed verbatim — it already carries any prefix the
 // build wants ("v0.1.0", "v0.1.0-3-gabc1234", "dev"). Adding our own
