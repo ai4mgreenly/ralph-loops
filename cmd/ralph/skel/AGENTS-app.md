@@ -35,13 +35,13 @@ application root. All paths below are relative to it.
    If anything fails, this iteration's job is to fix **exactly one**
    failing test — pick the smallest or most foundational failure,
    repair it, re-run the suite to confirm that one is now green
-   (others may still be red), overwrite `handoff.md`, and return
-   `{"status":"CONTINUE"}`. Do not pick a new requirement, do not
+   (others may still be red), overwrite `handoff.md`, and end with
+   `RALPH-STATUS: CONTINUE`. Do not pick a new requirement, do not
    append to `requirements-verified.jsonl`, and do not touch
    unrelated code. Only proceed past this step when the full suite
    is green (or no tests exist yet).
 3. Compute the unverified set (see "Tracking verified requirements"
-   below). If it is empty, return `{"status":"DONE"}`.
+   below). If it is empty, end with `RALPH-STATUS: DONE`.
 4. Pick one ID from the unverified set — the smallest meaningful unit
    of work that advances the application toward the spec. One
    iteration should make a focused, verifiable change — not a sweep.
@@ -51,8 +51,64 @@ application root. All paths below are relative to it.
 6. On success: append a line for the ID to
    `.ralph/requirements-verified.jsonl` (see procedure below),
    overwrite `.ralph/handoff.md` with a fresh note for the next
-   iteration (see "Handoff" below), and return
-   `{"status":"CONTINUE"}`.
+   iteration (see "Handoff" below), and end with
+   `RALPH-STATUS: CONTINUE`.
+
+## The RALPH-STATUS signal
+
+ralph runs you one iteration at a time and decides whether to invoke
+you again by reading **the last line of your final reply**. That line
+must be **exactly** one of:
+
+```
+RALPH-STATUS: DONE
+RALPH-STATUS: CONTINUE
+```
+
+`DONE` means every requirement in the spec is implemented and verified
+— ralph stops the loop. `CONTINUE` means there is more to do — ralph
+spawns a fresh iteration. The contract is strict:
+
+- The sentinel must be the **bare last line** of your final message:
+  uppercase `RALPH-STATUS:`, one space, then `DONE` or `CONTINUE`, and
+  **nothing after it** — no trailing prose, punctuation, code fence, or
+  blank-then-text. Anything following the sentinel line breaks the
+  parse.
+- Emit it **once**, at the very end, outside any tool call. Do not
+  print it mid-iteration or inside narration.
+- If you finish an iteration without a parseable sentinel, ralph
+  defaults to `CONTINUE` (it assumes more work and re-runs you). A
+  missing `DONE` therefore only costs a wasted iteration; a stray line
+  *after* a `DONE` can hide it and loop forever. End cleanly.
+
+Every iteration ends with exactly one such line. There is no JSON
+status object, no tool call, and no other signal — just this line.
+
+### Two "status" vocabularies — do not conflate them
+
+There are **two distinct** things called "status" in this workflow and
+they use **different words**. Keep them straight:
+
+1. **The `ralph unverified` tool's output** is JSON with a **lowercase**
+   `"status"` field whose value is `"done"` or `"pending"`. This is the
+   *tool* reporting requirement coverage (is the unverified set empty?).
+2. **The loop sentinel** is the line `RALPH-STATUS: DONE` or
+   `RALPH-STATUS: CONTINUE` (**uppercase**, the literal token
+   `RALPH-STATUS:`). This is the *iteration* signal ralph parses to
+   decide whether to run you again.
+
+You are the bridge between them. **Map the tool's result to the
+sentinel:**
+
+| `ralph unverified` prints | You end the iteration with |
+| ------------------------- | -------------------------- |
+| `{"status":"done", ...}`    | `RALPH-STATUS: DONE`       |
+| `{"status":"pending", ...}` | `RALPH-STATUS: CONTINUE`   |
+
+Never emit `RALPH-STATUS: done` / `RALPH-STATUS: pending` (wrong case,
+wrong vocabulary) and never emit a JSON `{"status":...}` object as your
+loop signal — that is the tool's output shape, not yours. The tool says
+`done`/`pending` (lowercase); you say `DONE`/`CONTINUE` (uppercase).
 
 ## Tracking verified requirements
 
@@ -79,9 +135,14 @@ Each iteration:
    **Use it instead of grepping the spec yourself or reading the
    ledger directly** — one tool call beats three, the answer is
    deterministic, and your context budget thanks you.
-   - `status:"done"` means every spec ID is already verified — return
-     `{"status":"DONE"}` and stop.
-   - `status:"pending"` means there is more to do; continue with `list`.
+   - `status:"done"` means every spec ID is already verified — end the
+     iteration with `RALPH-STATUS: DONE` and stop.
+   - `status:"pending"` means there is more to do; continue with
+     `list` and end the iteration with `RALPH-STATUS: CONTINUE`.
+
+   (This `done`/`pending` is the tool's lowercase output; the line you
+   end with is the uppercase `RALPH-STATUS: DONE|CONTINUE` sentinel.
+   See "Two 'status' vocabularies" above — they are not the same thing.)
 
 2. Pick one ID from `list`. Search this directory for any existing
    reference to it — comments use dashes, Go test names use
@@ -115,7 +176,8 @@ Each iteration:
 Maintain `.ralph/handoff.md` — a short note (a paragraph or a few
 bullets) telling the next iteration where to pick up: what you just
 did, what to start on next, what to watch out for. Read it before
-anything else. Overwrite it before returning `CONTINUE`. It is not
+anything else. Overwrite it before ending an iteration with
+`RALPH-STATUS: CONTINUE`. It is not
 history — the operator's stream is the audit, and the previous note
 is gone the moment you rewrite the file. If `handoff.md` doesn't
 exist, this is the first iteration; proceed without one.

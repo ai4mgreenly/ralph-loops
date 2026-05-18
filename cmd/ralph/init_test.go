@@ -41,11 +41,10 @@ func TestScaffoldProject_CreatesFullTree(t *testing.T) {
 	mustExist(t, filepath.Join(dir, "reqs", "OVERVIEW.md"))
 	mustExist(t, filepath.Join(dir, "app-root", "AGENTS.md"))
 
-	// No AGENTS.md or CLAUDE.md should exist at the project root —
-	// see scaffoldProject's doc comment for why (claude's walk-up
-	// would otherwise leak the spec-helper persona into the build
-	// agent's context). Same reason no CLAUDE.md is scaffolded inside
-	// app-root/.
+	// No AGENTS.md or CLAUDE.md should exist at the project root, and
+	// none inside the subdirectories beyond the two scaffolded
+	// AGENTS.md files — see scaffoldProject's doc comment. (pi does no
+	// walk-up; the split is plain role separation.)
 	for _, banned := range []string{
 		filepath.Join(dir, "AGENTS.md"),
 		filepath.Join(dir, "CLAUDE.md"),

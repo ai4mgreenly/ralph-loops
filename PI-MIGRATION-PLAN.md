@@ -154,7 +154,23 @@ rewrite `kickoffPrompt` to the pure RALPH-STATUS nudge. Update
 `main_test.go`. Acceptance: build+test green; flag presence/absence
 asserted.
 
-### G3 — Scaffold / templates / docs purge — `pending`
+### G3 — Scaffold / templates / docs purge — `done-verified` (2026-05-17)
+
+Verified independently: 8/8 tests green; scaffolded a fresh project
+and confirmed the old uppercase `{"status":"DONE|CONTINUE"}` control
+protocol is GONE, no `claude`/`stream-json`/`structured_output` in
+generated files, and project `CLAUDE.md` has no stale
+claude-CLI/`internal/pricing`/`stream-json` assertions. AGENTS-app.md
+now uses the RALPH-STATUS bare-final-line sentinel + an explicit Q13
+dual-vocabulary mapping (tool's lowercase `done/pending` →
+sentinel's uppercase `DONE/CONTINUE`); AGENTS-helper.md walk-up
+rationale dropped; CLAUDE.md walk-up paragraph collapsed to plain
+role separation; `ralph unverified` workflow retained unchanged.
+**Trap recorded (devlog):** a "purge JSON status" sweep must NOT
+delete the retained lowercase `{"status":"done|pending"}` — that is
+the Q13 `ralph unverified` tool contract, deliberately kept; only the
+uppercase JSON *loop control* protocol was removed.
+Original spec below (kept for provenance):
 
 Q8 (+ Q13 dual-vocabulary hazard note). `skel/AGENTS-app.md`
 (RALPH-STATUS bare-final-line replacing the `{"status":…}` protocol;
@@ -237,3 +253,11 @@ this is done-verified.
   Independent verify: gofmt/vet clean, `make build`/`make test` 8/8
   green, `--engine`/`--effort` rejected as undefined flags. Next: G3
   (scaffold/templates/docs purge).
+- `2026-05-17` — **G3 done-verified** (commit follows). Templates +
+  CLAUDE.md purged of claude/stream-json/walk-up; RALPH-STATUS
+  sentinel + Q13 dual-vocabulary mapping in AGENTS-app.md. My
+  acceptance regex was over-broad (`"status":` matched the
+  legitimately-retained Q13 tool vocabulary); subagent correctly
+  prioritized locked Q13 over the check and flagged it; independent
+  sharper grep confirmed only the old *uppercase* control protocol
+  was removed. Next: G4 (stats panel enrichment).

@@ -36,16 +36,16 @@ ask the user.
 
 ## Why this layout
 
-Your AGENTS.md lives in a sibling directory rather than at the project
-root for one reason: when the build agent runs with cwd
-`../{{APP_ROOT}}/`, claude walks the directory tree upward reading
-every AGENTS.md and CLAUDE.md it finds. If the spec-helper persona sat
-at the project root, that walk would concatenate it into the build
-agent's context — leaking conflicting instructions ("don't write code",
-"stay out of app-root/") into the agent whose entire job is to write
-code in app-root/. The sibling placement also keeps this file out of
-the build agent's `../{{REQS}}/` read sweep. Each persona stays in its
-own silo.
+The two personas have opposite jobs, so they get separate workspaces.
+You (the spec helper) author and refine the spec under `../{{REQS}}/`
+and never touch application code. The build agent runs in
+`../{{APP_ROOT}}/`, implements the spec, and never edits the spec.
+Putting your persona in its own sibling directory keeps that role
+separation clean: this file is your standing instructions, the build
+agent's `../{{APP_ROOT}}/AGENTS.md` is its standing instructions, and
+ralph injects each one only into the matching session. The sibling
+placement also keeps this file out of the build agent's
+`../{{REQS}}/` read sweep. Each persona stays in its own lane.
 
 ## Write WHAT and WHY, never HOW
 

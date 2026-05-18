@@ -88,19 +88,15 @@ func runInit(args []string, _, stderr io.Writer) int {
 //	root/<appRootName>/AGENTS.md  build-agent instructions (templated)
 //
 // No AGENTS.md or CLAUDE.md is scaffolded at the project root itself,
-// and no CLAUDE.md is scaffolded inside any of the subdirectories. The
-// reason is claude's CLAUDE.md / AGENTS.md auto-discovery: when ralph
-// spawns the build agent with cwd set to <appRootName>/, claude walks
-// the directory tree upward from there, reading every AGENTS.md and
-// CLAUDE.md it finds. If the spec-helper persona sat at the project
-// root, that walk would concatenate it into the build agent's context
-// — leaking conflicting instructions ("don't write code", "stay out of
-// app-root/") into the agent whose entire job is to write code under
-// app-root/. Keeping the spec-helper in its own sibling directory
-// (<helperName>/) takes it off the walk-up path entirely; the human
-// spec-author session is invoked from that directory (e.g.
-// `cd my-app/helper && claude`) so the helper AGENTS.md auto-loads
-// there.
+// and no CLAUDE.md is scaffolded inside any of the subdirectories.
+// ralph drives pi with --no-context-files and injects the build-agent
+// persona explicitly via --append-system-prompt <appRootName>/AGENTS.md,
+// so pi does no parent-directory AGENTS.md/CLAUDE.md walk-up — a stray
+// root-level file could not leak into the build agent regardless. The
+// directory split is plain role separation: the spec-helper persona
+// lives in its own sibling directory (<helperName>/) where the human
+// spec-author session is invoked (e.g. `cd my-app/helper && pi`),
+// keeping it out of the build agent's <reqsName>/ read sweep.
 //
 // If any of those paths already exists the call refuses without
 // modifying anything — partial scaffolds are worse than no scaffold,
