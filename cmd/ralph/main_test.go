@@ -498,10 +498,11 @@ func TestRun_Loop_RejectsMissingAppRoot(t *testing.T) {
 // TestRun_Loop_AcceptsPositional verifies the new PROJECT_ROOT
 // positional: ralph os.Chdir's into the supplied directory before the
 // foot-gun guard runs. When app-root/AGENTS.md exists in that
-// directory, the guard passes and execution proceeds to loop.Run,
-// which then fails because the engine command can't be resolved on
-// PATH. The point is to prove the chdir + guard plumbing works; we
-// don't care exactly which runtime error loop.Run raises.
+// directory, the guard passes and execution proceeds to loop.Run.
+// PATH is emptied so loop.Run's up-front `pi` LookPath fails
+// deterministically (a non-usage runtime error) instead of spawning a
+// real pi process — the point is to prove the chdir + guard plumbing
+// works, not which runtime error loop.Run raises.
 func TestRun_Loop_AcceptsPositional(t *testing.T) {
 	tmp := t.TempDir()
 	appRoot := filepath.Join(tmp, "app-root")
@@ -518,7 +519,11 @@ func TestRun_Loop_AcceptsPositional(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(prev) })
 
-	code, _, stderr := runCapture("--engine=this-engine-does-not-exist-1234567", tmp)
+	// Make the pi binary unresolvable so loop.Run fails fast at its
+	// PATH check rather than forking a real one-shot pi.
+	t.Setenv("PATH", "")
+
+	code, _, stderr := runCapture(tmp)
 	if code == exitUsage {
 		t.Errorf("exit = %d, want non-usage (stderr=%q)", code, stderr)
 	}
@@ -529,9 +534,10 @@ func TestRun_Loop_AcceptsPositional(t *testing.T) {
 
 // TestRun_Loop_BadPositional_ChdirFails covers the chdir failure path:
 // a non-existent PROJECT_ROOT should be reported as a usage error with
-// a "chdir" diagnostic.
+// a "chdir" diagnostic. The chdir is attempted before any loop.Run, so
+// no engine/PATH setup is needed.
 func TestRun_Loop_BadPositional_ChdirFails(t *testing.T) {
-	code, _, stderr := runCapture("--engine=foo", "/no/such/directory/abcdef")
+	code, _, stderr := runCapture("/no/such/directory/abcdef")
 	if code != exitUsage {
 		t.Errorf("exit = %d, want %d (stderr=%q)", code, exitUsage, stderr)
 	}
@@ -549,7 +555,7 @@ func TestRun_Version_AfterOtherFlags(t *testing.T) {
 	cases := [][]string{
 		{"--reqs=foo", "--version"},
 		{"--reqs=foo", "-v"},
-		{"--model=sonnet", "--effort=high", "--version"},
+		{"--model=gpt-5.3-codex", "--verbose", "--version"},
 	}
 	for _, args := range cases {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -584,19 +590,24 @@ func TestRun_Help_AfterOtherFlags(t *testing.T) {
 	}
 }
 
-func TestRun_Loop_RejectsEmptyEngine(t *testing.T) {
-	code, _, stderr := runCapture("--engine=")
+// TestRun_Loop_RejectsUnknownEngineFlag confirms the --engine knob was
+// removed under the pi migration: passing it is now an unknown-flag
+// usage error, not a recognised option.
+func TestRun_Loop_RejectsUnknownEngineFlag(t *testing.T) {
+	code, _, _ := runCapture("--engine=anything")
 	if code != exitUsage {
-		t.Errorf("exit = %d, want %d", code, exitUsage)
-	}
-	if !strings.Contains(stderr, "--engine") {
-		t.Errorf("stderr should mention --engine, got %q", stderr)
+		t.Errorf("exit = %d, want %d (--engine should be an unknown flag now)", code, exitUsage)
 	}
 }
 
-func TestRun_Help_DocumentsEngine(t *testing.T) {
+// TestRun_Help_IsPiExclusive pins the pi-exclusive manual: it documents
+// --model and pi, and no longer carries the removed --engine row.
+func TestRun_Help_IsPiExclusive(t *testing.T) {
 	_, stdout, _ := runCapture("help")
-	if !strings.Contains(stdout, "--engine=COMMAND") {
-		t.Errorf("help output missing --engine flag row: %q", stdout)
+	if !strings.Contains(stdout, "--model=NAME") {
+		t.Errorf("help output missing --model flag row: %q", stdout)
+	}
+	if strings.Contains(stdout, "--engine=COMMAND") {
+		t.Errorf("help output still documents the removed --engine flag: %q", stdout)
 	}
 }

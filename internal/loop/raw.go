@@ -6,17 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 )
 
 // runRaw executes the debug passthrough enabled by [WithRaw]. It spawns
-// one session, writes a kickoff envelope describing the prompt ralph is
-// about to send, sends that prompt, then drains the event stream to EOF
-// while the spawner's tap mirrors raw stdout bytes onto w. No
-// rendering, retry, structured-output check, stats, or results.jsonl
-// happens here — the goal is a verbatim wire trace fit to feed to an
-// agent diagnosing an alternate engine.
+// one one-shot pi session (the kickoff prompt is already baked into
+// pi's argv via [agent.Config.Prompt]), writes a self-describing
+// kickoff envelope onto w so the trace records its own input, then
+// drains pi's event stream to EOF while the spawner's stdout tap
+// mirrors raw bytes onto w. No rendering, stats, status decode, or
+// results.jsonl happens here — the goal is a verbatim pi wire trace.
+//
+// Per Q9 the iteration outcome is event-driven, so raw mode no longer
+// tolerates a 0/1 exit specially: it simply drains to EOF and lets
+// Close surface whatever it surfaces. A non-zero exit (always advisory
+// — see [agent.ExitError]) is not propagated as a run error here
+// because raw mode has no parsed outcome to gate on; the verbatim trace
+// is the deliverable, and the operator reads it directly.
 func runRaw(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner) error {
 	sess, err := sp.Spawn(ctx, agentConfig(cfg, o))
 	if err != nil {
@@ -24,31 +29,17 @@ func runRaw(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner)
 	}
 
 	// Defer Close so a panic during the drain doesn't leak the child.
-	// Close errors with a 0/1 exit are swallowed (matching the typed
-	// iteration's tolerance window): the engine often exits 1 even after
-	// a well-formed result, and in raw mode we have no parsed result to
-	// gate that judgment on.
-	defer func() {
-		closeErr := sess.Close()
-		if closeErr == nil || err != nil {
-			return
-		}
-		var ee *agent.ExitError
-		if errors.As(closeErr, &ee) && !ee.Signaled && (ee.Code == 0 || ee.Code == 1) {
-			return
-		}
-		err = fmt.Errorf("engine exited: %w", closeErr)
-	}()
+	// The Close result is intentionally discarded: under the
+	// event-driven outcome model (Q9) pi's exit code is advisory only,
+	// and raw mode parses nothing it could gate that judgment on.
+	defer func() { _ = sess.Close() }()
 
 	if kErr := writeKickoff(w, cfg.Prompt); kErr != nil {
 		return fmt.Errorf("write kickoff: %w", kErr)
 	}
-	if sErr := sess.Send(cfg.Prompt); sErr != nil {
-		return fmt.Errorf("send kickoff: %w", sErr)
-	}
 
 	// Drain events to EOF. The reader's bytes flow through the spawner's
-	// stdout tap, so we discard the parsed events themselves; decode
+	// stdout tap, so the parsed events themselves are discarded; decode
 	// errors are equally uninteresting in raw mode (the malformed line
 	// has already been teed verbatim).
 	r := sess.Events()
@@ -69,9 +60,8 @@ func runRaw(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner)
 
 // writeKickoff prefixes the trace with a self-describing envelope so a
 // downstream consumer of the JSONL stream can see exactly what prompt
-// produced the engine output that follows. The leading underscore on
-// the `type` keeps the envelope from colliding with any real engine
-// event kind.
+// produced the pi output that follows. The leading underscore on the
+// `type` keeps the envelope from colliding with any real pi event kind.
 func writeKickoff(w io.Writer, prompt string) error {
 	env := struct {
 		Type   string `json:"type"`

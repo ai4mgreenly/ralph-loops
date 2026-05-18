@@ -16,33 +16,29 @@ import (
 // values, so we discard the events.
 type nullRecorder struct{}
 
+func (nullRecorder) TallyEvent(string)         {}
 func (nullRecorder) TallyBlock(string)         {}
 func (nullRecorder) AddLLMTime(time.Duration)  {}
 func (nullRecorder) AddToolTime(time.Duration) {}
-func (nullRecorder) TrackUsage(*stream.Usage)  {}
+func (nullRecorder) TrackMessageUsage(*stream.Usage, string, string, string) {
+}
+func (nullRecorder) TrackToolOutcome(string, bool) {}
 
-// ExampleEmitter shows a single bash assistant event being rendered
-// to a [bytes.Buffer]. The emitter's tool-call header lands on the
-// first line in the canonical "←  <command>" shape; in colour mode
-// chroma escapes would wrap each segment, but the non-colour theme
-// keeps the // Output: block deterministic.
+// ExampleEmitter shows a single bash tool-execution start being
+// rendered to a [bytes.Buffer]. The B-lite header lands on the first
+// line in the canonical "←  <toolName>  <primary arg>" shape; the
+// non-colour theme keeps the // Output: block deterministic.
 func ExampleEmitter() {
 	var buf bytes.Buffer
 	theme := ui.NewThemeWith(false, 0) // no color, no wrap
 	em := render.NewEmitter(&buf, nullRecorder{}, theme)
 
-	input, _ := json.Marshal(map[string]string{"command": "echo hello"})
-	em.OnAssistant(stream.Assistant{
-		Message: stream.Message{
-			Role: "assistant",
-			Content: []stream.Block{{
-				Type:  stream.BlockToolUse,
-				Name:  stream.ToolBash,
-				ID:    "t1",
-				Input: input,
-			}},
-		},
+	args, _ := json.Marshal(map[string]string{"command": "echo hello"})
+	em.OnEvent(stream.ToolExecutionStart{
+		ToolCallID: "t1",
+		ToolName:   "bash",
+		Args:       args,
 	})
 	fmt.Print(buf.String())
-	// Output: ←  echo hello
+	// Output: ←  bash  echo hello
 }

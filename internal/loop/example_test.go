@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 	"github.com/ai4mgreenly/ralph-loops/internal/loop"
@@ -14,9 +15,10 @@ import (
 )
 
 // ExampleRun_withFakeSpawner drives a complete [loop.Run] against a
-// hand-rolled fake spawner whose first iteration ends with DONE. This
-// is the smallest end-to-end shape the package supports: no
-// subprocess, no real claude binary, no on-disk results log.
+// hand-rolled fake spawner feeding the real captured-pi `done` fixture
+// (its terminal agent_end carries RALPH-STATUS: DONE). This is the
+// smallest end-to-end shape the package supports: no subprocess, no
+// real pi binary, no on-disk results log.
 //
 // Run writes its banner and stats panel to os.Stdout, so the example
 // briefly redirects stdout to a pipe to keep the // Output: block
@@ -51,15 +53,17 @@ func ExampleRun_withFakeSpawner() {
 	// Output: ok
 }
 
-// exampleSpawner is a one-shot Spawner that yields a single Session
-// returning a DONE result on its first event read. The interface
-// alignment with [loop.Spawner] is what makes the example portable
-// across test files.
+// exampleSpawner is a one-shot Spawner that yields a Session replaying
+// the real captured-pi `done` fixture. The interface alignment with
+// [loop.Spawner] is what makes the example portable across test files.
 type exampleSpawner struct{}
 
 func (exampleSpawner) Spawn(_ context.Context, _ agent.Config) (loop.Session, error) {
-	const script = `{"type":"result","is_error":false,"structured_output":{"status":"DONE"}}` + "\n"
-	return &exampleSession{r: stream.NewReader(bytes.NewReader([]byte(script)))}, nil
+	b, err := os.ReadFile(filepath.Join("..", "stream", "testdata", "done.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	return &exampleSession{r: stream.NewReader(bytes.NewReader(b))}, nil
 }
 
 type exampleSession struct{ r *stream.Reader }

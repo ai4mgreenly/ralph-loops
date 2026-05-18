@@ -2,161 +2,95 @@ package render
 
 import (
 	"encoding/json"
-	"fmt"
-	"sort"
-	"strconv"
 	"strings"
-
-	"github.com/ai4mgreenly/ralph-loops/internal/stream"
-	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
-// paramTruncate is the maximum width of a tool-call parameter value
-// before it is shortened with an ellipsis. The Ruby driver uses 60.
+// paramTruncate is the maximum width of a tool-call primary-argument
+// value before it is shortened with an ellipsis, so a header stays one
+// readable line even when the agent passes a long command or path.
 const paramTruncate = 60
 
-// formatToolCallParam summarises one tool's input arguments for the
-// activity log. Each tool has a "primary" key worth showing in line —
-// for Bash that's command, for Read/Write/Edit it's the file path,
-// for Glob/Grep it's the pattern. For unknown tools the first key in
-// the input object is used.
-//
-// The result is either an empty string (no input) or "key=\"value\"",
-// with whitespace collapsed and over-long values truncated.
-func formatToolCallParam(name string, rawInput json.RawMessage) string {
-	input := decodeObject(rawInput)
-	if len(input) == 0 {
+// toolEdit is pi's `edit` tool name. It is the only tool that gets
+// special rendering (a reconstructed diff); every other tool flows
+// through the single generic renderer. Held as a constant so the
+// dispatch in [Emitter.onToolEnd] reads intentionally.
+const toolEdit = "edit"
+
+// primaryArgKeys is the ordered set of argument keys the B-lite header
+// surfaces, first-present-wins. pi's tools key their salient input on
+// one of these: `path` (read/edit/write/ls), `command` (bash), or
+// `pattern` (grep/find). The order encodes precedence when a tool
+// happens to carry more than one.
+var primaryArgKeys = []string{"path", "command", "pattern"}
+
+// primaryArg returns the B-lite header suffix for a
+// [stream.ToolExecutionStart]'s args: the value of the first present
+// key among path/command/pattern, with whitespace collapsed to single
+// spaces and the result truncated to [paramTruncate] runes. Returns the
+// empty string when args is absent, unparseable, or carries none of the
+// primary keys (the header then degrades to a bare tool name rather
+// than crash).
+func primaryArg(rawArgs json.RawMessage) string {
+	if len(rawArgs) == 0 {
 		return ""
 	}
-
-	key := primaryParamKey(name, input)
-	val, ok := input[key]
-	if !ok {
-		// The selected key isn't present (e.g. a Bash call with no
-		// command field). Surface the first key (in sorted order, so
-		// output stays deterministic) with a placeholder so the
-		// operator at least sees something was passed.
-		if k := firstSortedKey(input); k != "" {
-			return fmt.Sprintf("%s=…", k)
-		}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(rawArgs, &m); err != nil {
 		return ""
 	}
-
-	return fmt.Sprintf("%s=%s", key, strconv.Quote(truncateRunes(collapseWhitespace(stringify(val)), paramTruncate)))
-}
-
-// primaryParamKey returns the input field worth showing in line for
-// tool name. Falls back to the first key in input (sorted, so the
-// fallback is deterministic) if the tool is unknown.
-func primaryParamKey(name string, input map[string]any) string {
-	switch name {
-	case stream.ToolBash:
-		return "command"
-	case stream.ToolRead, stream.ToolWrite, stream.ToolEdit, stream.ToolNotebookEdit:
-		return "file_path"
-	case stream.ToolGlob, stream.ToolGrep:
-		return "pattern"
-	}
-	return firstSortedKey(input)
-}
-
-// firstSortedKey returns the lexicographically smallest key of m, or
-// "" when m is empty. Used by the formatter to make "first key" fallbacks
-// deterministic — Go's map iteration order is randomized, so a naïve
-// `for k := range m { return k }` made formatter output flap between
-// equivalent inputs.
-func firstSortedKey(m map[string]any) string {
-	if len(m) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys[0]
-}
-
-// formatToolResult summarises a tool result. For Bash calls the
-// claude CLI ships a parsed `tool_use_result` object alongside the
-// content array; we surface stdout/stderr byte counts and the
-// interrupted flag from there. For every other tool we fall back to
-// the size of the content array.
-func formatToolResult(name string, block stream.Block, structured json.RawMessage) string {
-	if name == stream.ToolBash && len(structured) > 0 {
-		var s struct {
-			Stdout      string `json:"stdout"`
-			Stderr      string `json:"stderr"`
-			Interrupted bool   `json:"interrupted"`
+	for _, k := range primaryArgKeys {
+		raw, ok := m[k]
+		if !ok {
+			continue
 		}
-		if err := json.Unmarshal(structured, &s); err == nil {
-			var bits []string
-			if n := len(s.Stdout); n > 0 {
-				bits = append(bits, "stdout="+ui.FormatBytes(n))
-			}
-			if n := len(s.Stderr); n > 0 {
-				bits = append(bits, "stderr="+ui.FormatBytes(n))
-			}
-			if s.Interrupted {
-				bits = append(bits, "interrupted")
-			}
-			return strings.Join(bits, " ")
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			// Non-string primary arg (unexpected); fall back to its raw
+			// JSON so the operator still sees something was passed.
+			s = string(raw)
 		}
+		return truncateRunes(collapseWhitespace(s), paramTruncate)
 	}
-	return "size=" + ui.FormatBytes(contentBytes(block))
+	return ""
 }
 
-// contentBytes returns the total UTF-8 byte length of all text in a
-// tool-result block's content. The content is either a JSON string or
-// a JSON array of {type, text} objects; both are tolerated.
-func contentBytes(block stream.Block) int {
-	if len(block.Content) == 0 {
-		return 0
-	}
-	var s string
-	if err := json.Unmarshal(block.Content, &s); err == nil {
-		return len(s)
-	}
-	var arr []struct {
+// piResult is pi's tool-result envelope:
+// `{"content":[{"type":"text","text":"…"}], "details":{…optional…}}`.
+// Only the text content is surfaced by the generic renderer; details
+// are tool-specific and intentionally not interpreted (the locked
+// B-lite decision renders the text channel alone).
+type piResult struct {
+	Content []struct {
+		Type string `json:"type"`
 		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(block.Content, &arr); err == nil {
-		total := 0
-		for _, item := range arr {
-			total += len(item.Text)
-		}
-		return total
-	}
-	return 0
+	} `json:"content"`
 }
 
-// decodeObject best-effort decodes a JSON object into a map. Returns
-// an empty map on any failure so callers can iterate without nil
-// checks.
-func decodeObject(raw json.RawMessage) map[string]any {
+// resultContentText concatenates the text of every content element in
+// a pi tool result. A non-text element contributes nothing. An absent
+// or unparseable result yields the empty string so the renderer can
+// fall through to "no body" rather than panic on malformed input.
+func resultContentText(raw json.RawMessage) string {
 	if len(raw) == 0 {
-		return nil
+		return ""
 	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil
+	var r piResult
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return ""
 	}
-	return m
-}
-
-// stringify returns a string representation of an arbitrary JSON
-// value. Strings come through unquoted; everything else is rendered
-// via the default Sprint formatting.
-func stringify(v any) string {
-	if s, ok := v.(string); ok {
-		return s
+	var b strings.Builder
+	for _, c := range r.Content {
+		if c.Type != "" && c.Type != "text" {
+			continue
+		}
+		b.WriteString(c.Text)
 	}
-	return fmt.Sprint(v)
+	return b.String()
 }
 
 // collapseWhitespace replaces every run of whitespace with a single
-// space and trims the result. Mirrors the Ruby driver's `gsub(/\s+/,
-// ' ').strip` so multi-line tool inputs become one clean line.
+// space and trims the result, so a multi-line tool argument becomes one
+// clean header line.
 func collapseWhitespace(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -177,13 +111,12 @@ func collapseWhitespace(s string) string {
 }
 
 // truncateRunes shortens s to at most limit runes, replacing the last
-// rune with an ellipsis when truncation occurs. The Ruby driver uses
-// 60 chars + a single Unicode ellipsis byte, which happens to align
-// here too.
+// retained rune with an ellipsis when truncation occurs. Operates on
+// runes, not bytes, so multi-byte input is never split mid-character.
 func truncateRunes(s string, limit int) string {
-	if len([]rune(s)) <= limit {
+	r := []rune(s)
+	if len(r) <= limit {
 		return s
 	}
-	r := []rune(s)
 	return string(r[:limit-1]) + "…"
 }

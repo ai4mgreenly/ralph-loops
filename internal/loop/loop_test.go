@@ -170,6 +170,11 @@ func (blockingSpawner) Spawn(ctx context.Context, _ agent.Config) (Session, erro
 	}, nil
 }
 
+// pipe-backed blocking session: when ctx fires, pw closes and the
+// reader observes EOF with no agent_end. drive then sees ctx.Err() and
+// returns the ctx exit, so the run reports timeout/interrupt rather
+// than the bare missing-agent_end iteration error.
+
 func TestRun_TimeoutReturnsErrTimedOut(t *testing.T) {
 	cfg := minimalValidConfig()
 	tmp := t.TempDir()
@@ -207,7 +212,7 @@ func TestRun_CancelReturnsErrInterrupted(t *testing.T) {
 func TestRun_WritesResultsJSONL(t *testing.T) {
 	cfg := minimalValidConfig()
 	tmp := t.TempDir()
-	sp := &fakeSpawner{scripts: [][]byte{[]byte(doneScript)}}
+	sp := &fakeSpawner{scripts: [][]byte{readFixture(t, "done")}}
 	err := Run(context.Background(), cfg,
 		WithSpawner(sp),
 		WithResultsHome(tmp),

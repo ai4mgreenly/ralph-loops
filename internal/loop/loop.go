@@ -1,18 +1,22 @@
 // Package loop drives the ralph iteration loop: it asks a [Spawner] for
-// a fresh agent session per iteration, feeds it the operator prompt,
-// parses the stream-json event flow, and repeats until the agent
-// reports DONE, the wall-clock budget is exhausted, or the operator
-// presses Ctrl-C.
+// a fresh one-shot pi session per iteration, feeds it the kickoff
+// prompt (baked into pi's argv at spawn), parses pi's native JSONL
+// event flow, and repeats until the agent's terminal `agent_end`
+// carries a DONE sentinel, the wall-clock budget is exhausted, or the
+// operator presses Ctrl-C.
 //
-// The package is split across three files:
+// The package is split across these files:
 //
 //   - loop.go      Config, Run, the outer loop and signal plumbing.
-//   - iteration.go One agent invocation: kickoff, event pump, retry.
-//   - stats.go     Run-wide counters, token/cost tallies, panel renderer.
+//   - iteration.go One pi invocation: spawn, single event pump (no
+//     correction retry — pi is one-shot), Q3 status decode.
+//   - stats.go     Run-wide counters; the agent_end-driven token/cost
+//     tally and panel renderer.
+//   - raw.go       The de-decorated `--raw` passthrough.
 //
-// Subprocess mechanics (os/exec, the user-message envelope, process
-// groups) live in the sibling [internal/agent] package; per-event
-// rendering lives in [internal/render]. loop owns lifecycle.
+// Subprocess mechanics (os/exec, process groups) live in the sibling
+// [internal/agent] package; per-event rendering lives in
+// [internal/render]. loop owns lifecycle and outcome interpretation.
 package loop
 
 import (
@@ -28,18 +32,18 @@ import (
 	"time"
 
 	"github.com/ai4mgreenly/ralph-loops/internal/agent"
-	"github.com/ai4mgreenly/ralph-loops/internal/pricing"
 	"github.com/ai4mgreenly/ralph-loops/internal/render"
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 	"github.com/ai4mgreenly/ralph-loops/internal/ui"
 )
 
-// Default values for every [Option]. The CLI surfaces the same set
+// piBinary is the engine command ralph spawns each iteration. Under the
+// pi migration ralph is pi-exclusive: there is no --engine knob.
+const piBinary = "pi"
+
+// Default values for the loop's options. The CLI surfaces the same set
 // (with the same defaults) at the flag layer.
 const (
-	defaultEngine      = "claude"
-	defaultModel       = "sonnet"
-	defaultEffort      = "high"
 	defaultVersion     = "dev"
 	defaultOutputLines = 0 // 0 means "let the emitter pick"
 )
@@ -57,9 +61,16 @@ type Config struct {
 	// (with any missing parents) before the first iteration.
 	WorkDir string
 
-	// Prompt is the operator prompt fed to the agent at the start of
-	// each iteration. Path placeholders should already be substituted.
+	// Prompt is the kickoff message fed to pi at the start of each
+	// iteration. It rides on pi's trailing positional argv.
 	Prompt string
+
+	// SystemPromptFile is the ABSOLUTE path to the build-agent
+	// AGENTS.md (under app-root). It is forwarded to pi as
+	// --append-system-prompt; an empty value omits the flag (pi then
+	// uses only its base system prompt). The caller computes the
+	// absolute path; the loop does not do AGENTS.md walk-up.
+	SystemPromptFile string
 
 	// Theme owns the colour and width state shared by every rendering
 	// helper in this run. Construct via [ui.NewTheme] (or
@@ -71,28 +82,24 @@ type Config struct {
 // [Run] rather than mutating fields after the fact.
 type Option func(*options)
 
-// options is the private bag of resolved option values. It collects
-// the model/effort knobs, behaviour switches, and seams (clock,
-// results path) so the run kernel can see them as a single struct.
+// options is the private bag of resolved option values: the
+// model/tooling knobs ralph forwards to pi, behaviour switches, and
+// test seams (clock, results path, spawner).
 type options struct {
-	engine          string
-	model           string
-	effort          string
-	version         string
-	tools           string
-	configDir       string
-	duration        time.Duration
-	oneMContext     bool
-	claudeAIMCP     bool
-	skipPermissions bool
-	verbose         bool
-	raw             bool
-	outputLines     int
-	now             func() time.Time
-	resultsHome     string
+	model       string
+	provider    string
+	thinking    string
+	version     string
+	tools       string
+	duration    time.Duration
+	verbose     bool
+	raw         bool
+	outputLines int
+	now         func() time.Time
+	resultsHome string
 	// spawner, when non-nil, overrides the production [Spawner] inside
 	// [Run]. Set via [WithSpawner]; production callers leave it nil so
-	// [defaultSpawner] supplies the real engine-backed implementation.
+	// [defaultSpawner] supplies the real pi-backed implementation.
 	spawner Spawner
 }
 
@@ -100,66 +107,52 @@ type options struct {
 // defaults; option functions then layer on top.
 func defaultOptions() options {
 	return options{
-		engine:      defaultEngine,
-		model:       defaultModel,
-		effort:      defaultEffort,
 		version:     defaultVersion,
 		outputLines: defaultOutputLines,
 	}
 }
 
-// WithEngine sets the engine command — the agent CLI ralph spawns each
-// iteration. The named binary is resolved via $PATH at [Run] time and
-// must implement claude's stream-json wire contract. Default: "claude".
-func WithEngine(s string) Option { return func(o *options) { o.engine = s } }
-
-// WithModel sets the claude model alias (one of "haiku", "sonnet",
-// "opus"). Default: "sonnet".
+// WithModel forwards a model identifier to pi as --model. ralph does
+// not parse it: pi's provider/id and model:thinking forms pass through
+// opaque. Empty (the default) omits the flag so pi uses its own
+// configured default.
 func WithModel(m string) Option { return func(o *options) { o.model = m } }
 
-// WithEffort sets the effort level (one of "low", "medium", "high",
-// "xhigh", "max"). Default: "high".
-func WithEffort(e string) Option { return func(o *options) { o.effort = e } }
+// WithProvider forwards a provider id to pi as --provider. Empty (the
+// default) omits the flag so pi falls back to its own settings. Plumbed
+// for a later slice to surface as a cmd flag.
+func WithProvider(p string) Option { return func(o *options) { o.provider = p } }
+
+// WithThinking forwards a thinking level to pi as --thinking. pi
+// validates the level itself. Empty (the default) omits the flag.
+// Plumbed for a later slice to surface as a cmd flag.
+func WithThinking(t string) Option { return func(o *options) { o.thinking = t } }
 
 // WithVersion sets the version string included in the run banner.
 // Default: "dev".
 func WithVersion(v string) Option { return func(o *options) { o.version = v } }
 
-// WithTools forwards a comma-separated tool list to the agent.
-// Empty (the default) lets claude expose its full built-in toolset.
+// WithTools forwards a comma-separated tool list to pi as --tools.
+// Empty (the default) lets the agent layer apply pi's built-in
+// allowlist.
 func WithTools(t string) Option { return func(o *options) { o.tools = t } }
-
-// WithConfigDir exports the given path as CLAUDE_CONFIG_DIR for the
-// child process. Empty (the default) leaves the env var unset so
-// claude falls back to its own ~/.claude.
-func WithConfigDir(p string) Option { return func(o *options) { o.configDir = p } }
 
 // WithDuration sets the wall-clock cap for the run. Zero (the default)
 // means unlimited; negative values are rejected by [Run].
 func WithDuration(d time.Duration) Option { return func(o *options) { o.duration = d } }
 
-// WithOneMContext toggles the 1M-token context window.
-func WithOneMContext(v bool) Option { return func(o *options) { o.oneMContext = v } }
-
-// WithClaudeAIMCP toggles the Claude.ai-managed MCP servers.
-func WithClaudeAIMCP(v bool) Option { return func(o *options) { o.claudeAIMCP = v } }
-
-// WithSkipPermissions passes --dangerously-skip-permissions to claude.
-func WithSkipPermissions(v bool) Option { return func(o *options) { o.skipPermissions = v } }
-
-// WithVerbose toggles the rendering of low-signal stream events
-// (system init, rate_limit) into the operator log.
+// WithVerbose toggles the rendering of low-signal stream events (the
+// pi session banner and known-but-unused carriers) into the operator
+// log.
 func WithVerbose(v bool) Option { return func(o *options) { o.verbose = v } }
 
 // WithRaw enables debug passthrough: the loop suppresses every
 // rendering decorator (banner, iteration headers, spinner, formatted
-// events, stats panel, results.jsonl) and instead taps the engine's
-// stdout, copying every byte the engine emits to the run writer
-// verbatim. The session sends the kickoff prompt — first prefixed onto
-// the wire as a `{"type":"_ralph_kickoff","prompt":"..."}` envelope so
-// the trace records its own input — and then drains the stream to EOF.
-// Exactly one iteration runs; structured-output retries are off because
-// nothing is parsed. Intended for diagnosing alternate-engine traces.
+// events, stats panel, results.jsonl) and instead taps pi's stdout,
+// copying every byte pi emits to the run writer verbatim. The trace is
+// prefixed with a `{"type":"_ralph_kickoff","prompt":"..."}` envelope
+// so it records its own input. Exactly one iteration runs; nothing is
+// parsed. Intended for diagnosing pi wire traces.
 func WithRaw(v bool) Option { return func(o *options) { o.raw = v } }
 
 // WithOutputLines caps the number of tool-output lines replayed per
@@ -176,7 +169,7 @@ func WithNow(now func() time.Time) Option { return func(o *options) { o.now = no
 func WithResultsHome(p string) Option { return func(o *options) { o.resultsHome = p } }
 
 // WithSpawner installs a custom [Spawner] in place of the production
-// one backed by the claude CLI. Intended for tests: it lets a [Run]
+// one backed by the pi CLI. Intended for tests: it lets a [Run]
 // invocation be driven by a fake spawner so the entire loop —
 // validation, signal handling, results-JSONL log — can be exercised
 // without forking a subprocess. Production code should leave this
@@ -200,7 +193,6 @@ var ErrTimedOut = errors.New("duration budget exhausted")
 // mid-run can omit the `exit:` line entirely.
 type exitReason int
 
-//go:generate stringer -type=exitReason -trimprefix=exit
 const (
 	exitNone exitReason = iota
 	exitDone
@@ -210,8 +202,8 @@ const (
 )
 
 // String returns the human-readable label for r used in the panel and
-// the results.jsonl record. The lowercase strings match the legacy
-// panel format and the JSON wire shape.
+// the results.jsonl record. The lowercase strings are the JSON wire
+// shape.
 func (r exitReason) String() string {
 	switch r {
 	case exitNone:
@@ -259,30 +251,27 @@ func Run(ctx context.Context, cfg Config, opts ...Option) error {
 	}
 	sp := o.spawner
 	if sp == nil {
-		// Resolve the engine binary against $PATH up front so a missing
-		// or misspelled command crashes loudly before we print the
-		// banner or open the results log. The default "claude" is
-		// validated through the same path; an operator who has not
-		// installed claude (or whose PATH is wrong) gets a clear error
-		// rather than an opaque failure on the first iteration.
-		if _, err := exec.LookPath(o.engine); err != nil {
-			return fmt.Errorf("engine %q not found in PATH: %w", o.engine, err)
+		// Resolve pi against $PATH up front so a missing or unreachable
+		// binary crashes loudly before we print the banner or open the
+		// results log, rather than failing opaquely on the first
+		// iteration.
+		if _, err := exec.LookPath(piBinary); err != nil {
+			return fmt.Errorf("engine %q not found in PATH: %w", piBinary, err)
 		}
-		sp = defaultSpawner(o.engine, o.raw, os.Stdout)
+		sp = defaultSpawner(o.raw, os.Stdout)
 	}
 	return runWith(ctx, cfg, o, os.Stdout, sp)
 }
 
-// defaultSpawner returns the production [Spawner] backed by the named
-// engine CLI. *agent.Spawner satisfies the consumer-side interface in
-// this package directly because [agent.Spawner.Spawn] returns the
-// [agent.Session] interface, not a concrete type.
+// defaultSpawner returns the production [Spawner] backed by the pi CLI.
+// *agent.Spawner satisfies the consumer-side [Spawner] interface
+// directly because [agent.Spawner.Spawn] returns the [agent.Session]
+// interface, not a concrete type.
 //
-// When raw is true, the spawner taps the engine's stdout into tap so
-// every byte the engine emits is mirrored verbatim — the substrate
-// for [WithRaw].
-func defaultSpawner(engine string, raw bool, tap io.Writer) Spawner {
-	sp := agent.NewSpawner(engine)
+// When raw is true, the spawner taps pi's stdout into tap so every byte
+// pi emits is mirrored verbatim — the substrate for [WithRaw].
+func defaultSpawner(raw bool, tap io.Writer) Spawner {
+	sp := agent.NewSpawner(piBinary)
 	if raw {
 		sp.Stdout = tap
 	}
@@ -294,8 +283,7 @@ func defaultSpawner(engine string, raw bool, tap io.Writer) Spawner {
 // seam lets tests drive a full run with no subprocess.
 func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner) error {
 	// First SIGINT/SIGTERM cancels the context, giving the run a chance
-	// to wind down gracefully. signal.NotifyContext (Go 1.16+) replaces
-	// the hand-rolled goroutine that used to live here.
+	// to wind down gracefully.
 	sigCtx, stopSig := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSig()
 
@@ -322,15 +310,18 @@ func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner
 		resultsHome = defaultResultsHomePath()
 	}
 
-	ui.Header(w, o.version, o.engine, o.model, o.effort, formatBudget(o.duration))
+	// The banner reuses ui.Header's existing shape; under pi-exclusive
+	// operation the engine column is always "pi" and there is no
+	// effort knob, so that slot is left blank.
+	ui.Header(w, o.version, piBinary, o.model, "", formatBudget(o.duration))
 	fmt.Fprintf(w, "reqs=%s\n", cfg.ReqsDir)
 
-	s := newStats(o.engine, o.model, o.effort, now, resultsHome)
+	s := newStats(o.model, now, resultsHome)
 	e := render.NewEmitter(
 		w, s, cfg.Theme,
 		render.WithVerbose(o.verbose),
 		render.WithOutputLines(o.outputLines),
-		render.WithSpinnerLabel(o.model),
+		render.WithSpinnerLabel(spinnerLabel(o.model)),
 	)
 
 	exit, runErr := drive(runCtx, cfg, o, sp, e, s)
@@ -341,9 +332,20 @@ func runWith(ctx context.Context, cfg Config, o options, w io.Writer, sp Spawner
 	return runErr
 }
 
-// drive runs successive iterations until ctx is cancelled or claude
-// returns DONE. It returns the exit reason for the panel and either
-// nil, [ErrInterrupted], [ErrTimedOut], or a wrapped runtime error.
+// spinnerLabel picks the "waiting for X" suffix: the model name when an
+// operator pinned one, otherwise the engine name so a bare invocation
+// still reads naturally.
+func spinnerLabel(model string) string {
+	if model != "" {
+		return model
+	}
+	return piBinary
+}
+
+// drive runs successive iterations until ctx is cancelled or pi's
+// terminal agent_end carries a DONE sentinel. It returns the exit
+// reason for the panel and either nil, [ErrInterrupted], [ErrTimedOut],
+// or a wrapped runtime error.
 func drive(ctx context.Context, cfg Config, o options, sp Spawner, e *render.Emitter, s *stats) (exitReason, error) {
 	for {
 		// Check for cancellation between iterations as well as during
@@ -357,11 +359,19 @@ func drive(ctx context.Context, cfg Config, o options, sp Spawner, e *render.Emi
 		e.IterationBanner(s.iterationCount())
 		status, err := runIteration(ctx, cfg, o, sp, e, s)
 		if err != nil {
+			// ctx-cancelled takes precedence over an iteration error
+			// (Q3): a run aborted by timeout/interrupt is reported as
+			// such, not as a generic failure. The missing-agent_end
+			// case (errStreamEnded) reaches here as a plain iteration
+			// error only when ctx is NOT cancelled.
 			if cErr := ctx.Err(); cErr != nil {
 				return ctxExit(cErr)
 			}
 			return exitErrored, err
 		}
+		// DONE stops the loop; CONTINUE (explicit, or the safe default
+		// StatusFromAgentEnd applies when agent_end carries no parseable
+		// sentinel) falls through to the next iteration.
 		if status == stream.StatusDone {
 			return exitDone, nil
 		}
@@ -468,6 +478,9 @@ func formatBudget(d time.Duration) string {
 
 // validate returns nil if cfg/o have every required field populated,
 // or a joined error listing each missing/invalid field otherwise.
+// There is no longer a pricing-table gate on --model: pi reports its
+// own authoritative per-provider cost, so an unknown model name can no
+// longer silently produce a $0.0000 report.
 func validate(cfg Config, o options) error {
 	required := []struct {
 		name  string
@@ -488,19 +501,6 @@ func validate(cfg Config, o options) error {
 	}
 	if o.duration < 0 {
 		errs = append(errs, fmt.Errorf("duration must be non-negative (got %v)", o.duration))
-	}
-	// --model is gated against the pricing table — not against an
-	// engine-specific allowlist. The gate exists so an operator who
-	// runs a model ralph can't price for is told up front, instead of
-	// discovering after the fact that a multi-hour run reported
-	// $0.0000. Add new entries to internal/pricing/pricing.go (it is
-	// additive: alternate engines like gpt-5.5 live alongside the
-	// haiku/sonnet/opus rows). --effort stays pass-through: the engine
-	// owns its vocabulary and effort has no pricing implication.
-	if !pricing.HasModel(o.model) {
-		errs = append(errs, fmt.Errorf(
-			"model %q has no pricing entry; add it to internal/pricing/pricing.go (known: %v)",
-			o.model, pricing.Models()))
 	}
 	return errors.Join(errs...)
 }

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,25 +16,44 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
-// fakeSpawner returns one [Session] per Spawn call, each backed by
-// the next entry in scripts. Spawns past the end of scripts return an
-// error so a runaway loop fails fast rather than hanging. The Send
-// hook records each user message — kickoff prompt on the first
-// iteration, correction text on retries — so tests can assert on the
-// exact text that crossed the boundary.
+// fixturesDir is the real captured-pi fixture tree, shared with the
+// stream package. The loop tests drive the same bytes through the real
+// [stream.Reader] so the Q3 control flow is exercised end-to-end.
+const fixturesDir = "../stream/testdata"
+
+// readFixture loads a captured-pi JSONL fixture by base name (without
+// the .jsonl suffix).
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(fixturesDir, name+".jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return b
+}
+
+// fakeSpawner returns one [Session] per Spawn call, each backed by the
+// next entry in scripts. Spawns past the end of scripts return an error
+// so a runaway loop fails fast rather than hanging. The Send hook
+// records each text passed through it — pi is one-shot so production
+// never calls Send, but the seam is retained so a fake can assert what
+// (if anything) crossed the boundary.
 type fakeSpawner struct {
 	scripts [][]byte
 	// closeErrs, when non-nil and aligned with scripts, controls the
 	// error returned by the i-th session's Close(). A nil entry means
 	// Close returns nil (clean exit).
 	closeErrs []error
+	// configs records the agent.Config each Spawn was handed, so tests
+	// can assert the kickoff prompt and persona path were forwarded.
+	configs []agent.Config
 
 	mu       sync.Mutex
 	spawnIdx int
 	sent     []string
 }
 
-func (f *fakeSpawner) Spawn(_ context.Context, _ agent.Config) (Session, error) {
+func (f *fakeSpawner) Spawn(_ context.Context, cfg agent.Config) (Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	idx := f.spawnIdx
@@ -40,6 +61,7 @@ func (f *fakeSpawner) Spawn(_ context.Context, _ agent.Config) (Session, error) 
 		return nil, errFakeOutOfScripts
 	}
 	f.spawnIdx++
+	f.configs = append(f.configs, cfg)
 	var closeErr error
 	if idx < len(f.closeErrs) {
 		closeErr = f.closeErrs[idx]
@@ -65,6 +87,12 @@ func (f *fakeSpawner) spawnCount() int {
 	return f.spawnIdx
 }
 
+func (f *fakeSpawner) configAt(i int) agent.Config {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.configs[i]
+}
+
 var errFakeOutOfScripts = errors.New("fake spawner: ran out of scripts")
 
 type fakeSession struct {
@@ -88,25 +116,8 @@ func (s *fakeSession) Close() error {
 	return s.closeErr
 }
 
-// canned stream-json that ends with a DONE result. The system event
-// in front mirrors the real claude flow.
-const doneScript = `{"type":"system","subtype":"init","model":"sonnet"}
-{"type":"result","is_error":false,"structured_output":{"status":"DONE"}}
-`
-
-// continueScript ends in CONTINUE so the driver loops to the next
-// spawn. Useful when stitching multi-iteration tests.
-const continueScript = `{"type":"result","is_error":false,"structured_output":{"status":"CONTINUE"}}
-`
-
-// badStructuredOutputScript has a result event whose structured output
-// fails the DONE/CONTINUE schema check, so the iteration loops back
-// for a correction.
-const badStructuredOutputScript = `{"type":"result","is_error":false,"structured_output":{"status":"BOGUS"}}
-`
-
-func TestRunWith_DrivenByFakeSpawner(t *testing.T) {
-	sp := &fakeSpawner{scripts: [][]byte{[]byte(doneScript)}}
+func TestRunWith_DrivenByDoneFixture(t *testing.T) {
+	sp := &fakeSpawner{scripts: [][]byte{readFixture(t, "done")}}
 
 	var out bytes.Buffer
 	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), &out, sp)
@@ -114,13 +125,19 @@ func TestRunWith_DrivenByFakeSpawner(t *testing.T) {
 		t.Fatalf("runWith: %v", err)
 	}
 
-	// Kickoff prompt must reach the agent on the first iteration.
-	sent := sp.sentMessages()
-	if len(sent) != 1 {
-		t.Fatalf("expected 1 message sent, got %d: %v", len(sent), sent)
+	// One iteration: the done fixture's agent_end carries DONE.
+	if got := sp.spawnCount(); got != 1 {
+		t.Errorf("spawnCount = %d, want 1", got)
 	}
-	if sent[0] != "operator prompt" {
-		t.Errorf("kickoff prompt mismatch: %q", sent[0])
+
+	// The kickoff prompt must reach pi via agent.Config.Prompt (pi is
+	// one-shot; the loop never calls Send).
+	cfg0 := sp.configAt(0)
+	if cfg0.Prompt != "operator prompt" {
+		t.Errorf("Config.Prompt = %q, want %q", cfg0.Prompt, "operator prompt")
+	}
+	if got := sp.sentMessages(); len(got) != 0 {
+		t.Errorf("expected no Send calls (pi is one-shot), got %v", got)
 	}
 
 	// Stats panel should report a clean exit.
@@ -129,8 +146,8 @@ func TestRunWith_DrivenByFakeSpawner(t *testing.T) {
 	}
 }
 
-// erroringSpawner fails every Spawn. It exercises the fatal-error
-// path in drive without any stream wiring.
+// erroringSpawner fails every Spawn. It exercises the fatal-error path
+// in drive without any stream wiring.
 type erroringSpawner struct{ err error }
 
 func (e erroringSpawner) Spawn(context.Context, agent.Config) (Session, error) {
@@ -145,24 +162,13 @@ func TestRunWith_PropagatesSpawnError(t *testing.T) {
 	}
 }
 
-// TestRunWith_CorrectionLoopRecoversAfterBadOutput exercises the
-// retry path in pumpStream: a bad structured_output triggers a
-// correction message, the next attempt returns CONTINUE so the loop
-// advances to a new iteration, and the third spawn returns DONE.
-func TestRunWith_CorrectionLoopRecoversAfterBadOutput(t *testing.T) {
-	// Scripts:
-	//   1. Bad structured output → correction sent on same session.
-	//      Reader then EOFs (errStreamEnded) — but the retry loop
-	//      catches the correction first and re-reads. We need the
-	//      bad output followed by a recoverable next read on the
-	//      same session, so we glue a CONTINUE result onto the same
-	//      script.
-	//   2. The driver advances to a new iteration.
-	//   3. DONE.
-	const script1 = badStructuredOutputScript + continueScript
+// TestRunWith_ContinueThenDone proves the Q3 multi-iteration control
+// flow: a CONTINUE agent_end advances to a fresh spawn, the next of
+// which returns DONE and stops the loop.
+func TestRunWith_ContinueThenDone(t *testing.T) {
 	sp := &fakeSpawner{scripts: [][]byte{
-		[]byte(script1),
-		[]byte(doneScript),
+		readFixture(t, "continue"),
+		readFixture(t, "done"),
 	}}
 
 	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
@@ -172,50 +178,30 @@ func TestRunWith_CorrectionLoopRecoversAfterBadOutput(t *testing.T) {
 	if got := sp.spawnCount(); got != 2 {
 		t.Errorf("spawnCount = %d, want 2", got)
 	}
-
-	sent := sp.sentMessages()
-	if len(sent) < 3 {
-		t.Fatalf("expected >= 3 messages (kickoff, correction, kickoff), got %d: %v", len(sent), sent)
-	}
-	if sent[0] != "operator prompt" {
-		t.Errorf("first sent must be kickoff, got %q", sent[0])
-	}
-	// The second message is the correction text.
-	if !strings.Contains(sent[1], "structured output") {
-		t.Errorf("second message should be correction, got %q", sent[1])
-	}
-	if sent[2] != "operator prompt" {
-		t.Errorf("third sent should be next-iteration kickoff, got %q", sent[2])
-	}
 }
 
-// TestRunWith_RetryCapExhausts confirms that after maxRetriesPerIteration
-// consecutive bad outputs the iteration aborts with the wrapped retry
-// error and the run terminates with that error.
-func TestRunWith_RetryCapExhausts(t *testing.T) {
-	// One script with cap+1 bad results back-to-back. The retry loop
-	// reads each bad result, sends a correction, and on the
-	// (cap+1)-th attempt returns the wrapped error.
-	bad := strings.Repeat(badStructuredOutputScript, maxRetriesPerIteration+2)
-	sp := &fakeSpawner{scripts: [][]byte{[]byte(bad)}}
+// TestRunWith_TruncatedIsIterationError proves the Q3 missing-agent_end
+// path: a stream that EOFs with no agent_end is an iteration error and
+// the run terminates with that error (ctx is not cancelled here).
+func TestRunWith_TruncatedIsIterationError(t *testing.T) {
+	sp := &fakeSpawner{scripts: [][]byte{readFixture(t, "truncated")}}
 
 	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
 	if err == nil {
-		t.Fatal("expected error from retry-cap exhaustion, got nil")
+		t.Fatal("expected an iteration error from a truncated stream, got nil")
 	}
-	if !errors.Is(err, errBadStructuredOutput) {
-		t.Errorf("err should wrap errBadStructuredOutput, got %v", err)
+	if !errors.Is(err, errStreamEnded) {
+		t.Errorf("err should wrap errStreamEnded, got %v", err)
 	}
 }
 
-// TestRunWith_DecodeErrorContinues asserts that a malformed JSON
-// line surfaces through the emitter (visible in the writer) without
-// halting the iteration: the next event continues to be processed.
+// TestRunWith_DecodeErrorContinues asserts that a malformed JSON line
+// surfaces through the emitter (visible in the writer) without halting
+// the iteration: the real done fixture that follows still drives the
+// loop to a DONE.
 func TestRunWith_DecodeErrorContinues(t *testing.T) {
-	// Malformed line, then a DONE result. The reader's
-	// errBadStructuredOutput / decode-error paths must be transparent.
-	script := "not valid json\n" + doneScript
-	sp := &fakeSpawner{scripts: [][]byte{[]byte(script)}}
+	script := append([]byte("not valid json\n"), readFixture(t, "done")...)
+	sp := &fakeSpawner{scripts: [][]byte{script}}
 
 	var out bytes.Buffer
 	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), &out, sp)
@@ -230,24 +216,45 @@ func TestRunWith_DecodeErrorContinues(t *testing.T) {
 	}
 }
 
-// TestRunWith_NonZeroExitWrapsExitError confirms the loop surfaces a
-// >1 exit code from the agent process as a wrapped *agent.ExitError.
-func TestRunWith_NonZeroExitWrapsExitError(t *testing.T) {
+// TestRunWith_NonZeroExitIsAdvisory confirms the Q9 contract: a
+// non-zero *agent.ExitError from Close does NOT override a committed
+// DONE — the iteration outcome is event-driven, the exit code is
+// advisory only, so the run still succeeds.
+func TestRunWith_NonZeroExitIsAdvisory(t *testing.T) {
 	exitErr := &agent.ExitError{Code: 2}
 	sp := &fakeSpawner{
-		scripts:   [][]byte{[]byte(doneScript)},
+		scripts:   [][]byte{readFixture(t, "done")},
 		closeErrs: []error{exitErr},
 	}
 
 	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
-	if err == nil {
-		t.Fatal("expected non-nil error from non-zero exit, got nil")
+	if err != nil {
+		t.Fatalf("non-zero exit must be advisory under Q9, got err: %v", err)
 	}
-	var ee *agent.ExitError
-	if !errors.As(err, &ee) {
-		t.Fatalf("err = %v, want errors.As *agent.ExitError", err)
+}
+
+// TestRunWith_NonExitCloseErrorSurfaces confirms that a Close failure
+// that is NOT an *agent.ExitError (an I/O fault) is still surfaced, so
+// real plumbing breakage is not swallowed by the advisory-exit rule.
+func TestRunWith_NonExitCloseErrorSurfaces(t *testing.T) {
+	ioErr := errors.New("pipe reaper exploded")
+	sp := &fakeSpawner{
+		scripts:   [][]byte{readFixture(t, "done")},
+		closeErrs: []error{ioErr},
 	}
-	if ee.Code != 2 {
-		t.Errorf("ExitError.Code = %d, want 2", ee.Code)
+
+	err := runWith(context.Background(), minimalValidConfig(), withDuration(5*time.Second), io.Discard, sp)
+	if !errors.Is(err, ioErr) {
+		t.Fatalf("expected the non-ExitError Close failure to surface, got %v", err)
+	}
+}
+
+// fixtureExists is a guard: the four Q3 fixtures must be present in the
+// shared stream testdata tree for the loop tests to be meaningful.
+func TestFixturesPresent(t *testing.T) {
+	for _, name := range []string{"done", "continue", "no-sentinel", "truncated"} {
+		if _, err := os.Stat(filepath.Join(fixturesDir, name+".jsonl")); err != nil {
+			t.Fatalf("required fixture %s missing: %v", name, err)
+		}
 	}
 }

@@ -47,12 +47,11 @@ USAGE
   ralph help                   Print this manual.
 
 DESCRIPTION
-  ralph spawns an engine CLI in a loop. The engine is the binary that
-  implements claude's stream-json wire contract — by default the
-  claude CLI itself, or any drop-in replacement passed via --engine.
-  Each iteration the agent reads the spec under --reqs, inspects the
-  current app-root, makes one focused change, runs whatever tests the
-  project defines, and reports back DONE or CONTINUE. The loop ends
+  ralph spawns the pi coding agent in a loop. Each iteration runs pi
+  once in one-shot print mode: pi reads the spec under --reqs, inspects
+  the current app-root, makes one focused change, runs whatever tests
+  the project defines, and ends its final reply with a
+  "RALPH-STATUS: DONE" or "RALPH-STATUS: CONTINUE" line. The loop ends
   when the agent reports DONE or the wall-clock budget set by
   --duration expires.
 
@@ -69,10 +68,11 @@ PROJECT LAYOUT
           └── .ralph/            created on first run
 
   The two AGENTS.md files are the standing personas — the spec helper
-  in my-app/helper/ and the build agent in my-app/app-root/. Each is
-  auto-loaded by claude (and other AGENTS.md-aware engines) when a
-  session starts in the matching directory. ralph itself runs from
-  the project root and spawns the agent with cwd set to app-root/.
+  in my-app/helper/ and the build agent in my-app/app-root/. ralph
+  forwards the build-agent AGENTS.md to pi as an absolute-path
+  --append-system-prompt; the helper AGENTS.md auto-loads when a human
+  starts a session in my-app/helper/. ralph itself runs from the
+  project root and spawns pi with cwd set to app-root/.
 
 CONTRACT WITH THE AGENT
   --reqs is read-only to the agent. It is the operator's input; only
@@ -87,59 +87,39 @@ FLAGS (loop subcommand)
   --app-root=PATH                      application source subdirectory,
                                        relative to the project root
                                        (default: %q)
-  --engine=COMMAND                     engine command (claude drop-in
-                                       replacement) resolved via $PATH;
-                                       must implement claude's
-                                       stream-json contract
-                                       (default: %q)
-  --model=NAME                         model alias forwarded to the
-                                       engine. Must have a pricing
-                                       entry in internal/pricing —
-                                       ralph rejects unknown models at
-                                       startup so operators are not
-                                       surprised by a $0.0000 cost
-                                       report on an untracked model.
-                                       Adding a new model is one row
-                                       in pricing.go (default: %q).
-  --effort=NAME                        effort level forwarded to the
-                                       engine. Engine-specific
-                                       (e.g. low|medium|high|xhigh|max
-                                       for claude); ralph does not
-                                       validate (default: %q).
+  --model=NAME                         model identifier forwarded to pi
+                                       verbatim (pi's provider/id and
+                                       model:thinking forms pass through
+                                       opaque). Empty uses pi's own
+                                       configured default. Cost comes
+                                       from pi itself, so any model is
+                                       accepted (default: %q).
   --duration=DURATION                  wall-clock budget, Go duration
                                        syntax: 30s, 90m, 4h, 1h30m.
                                        Empty = unlimited (default).
-  --config-dir=PATH                    exported as CLAUDE_CONFIG_DIR.
-                                       Empty inherits ~/.claude (default).
-  --1m-context[=BOOL]                  1M-token context window
-                                       (default: %t)
-  --dangerously-skip-permissions[=BOOL]
-                                       pass --dangerously-skip-permissions
-                                       through to the engine (default: %t)
-  --enable-claudeai-mcp-servers[=BOOL]
-                                       enable Claude.ai-managed MCP
-                                       servers (default: %t)
-  --tools=LIST                         pass --tools through to the engine.
-                                       Empty = all built-ins (default).
+  --tools=LIST                         comma-separated tool list
+                                       forwarded to pi as --tools.
+                                       Empty = pi's built-in allowlist
+                                       (default).
   --verbose[=BOOL]                     echo low-signal stream events
-                                       (system init, rate_limit) (default: false)
-  --raw[=BOOL]                         debug passthrough: dump the
-                                       engine's stdout verbatim as
-                                       JSONL (prefixed with a
-                                       _ralph_kickoff envelope describing
-                                       the prompt), suppress every
-                                       decorator, run exactly one
-                                       iteration. Use to capture a
-                                       diagnosable wire trace from an
-                                       alternate engine (default: false).
+                                       (the pi session banner and the
+                                       known-but-unused carriers)
+                                       (default: false)
+  --raw[=BOOL]                         debug passthrough: dump pi's
+                                       stdout verbatim as JSONL
+                                       (prefixed with a _ralph_kickoff
+                                       envelope describing the prompt),
+                                       suppress every decorator, run
+                                       exactly one iteration. Use to
+                                       capture a diagnosable pi wire
+                                       trace (default: false).
   --output-lines=N                     max lines of tool output (Bash
                                        stdout/stderr, Read contents,
                                        Edit/Write hunks) replayed per
                                        result before a '...' truncation
                                        marker (default: %d)
 
-  Boolean flags accept --flag, --flag=true, --flag=false. To turn off a
-  default-true flag, write e.g. --1m-context=false.
+  Boolean flags accept --flag, --flag=true, --flag=false.
 
 FLAGS (init and reset subcommands)
   --reqs=NAME                          name of the spec subdirectory
@@ -192,12 +172,7 @@ REQUIREMENT IDS
 		version,
 		defaultReqs,
 		defaultAppRoot,
-		defaultEngine,
 		defaultModel,
-		defaultEffort,
-		defaultOneMContext,
-		defaultSkipPermissions,
-		defaultClaudeAIMCP,
 		defaultOutputLines,
 	)
 }

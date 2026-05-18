@@ -23,8 +23,9 @@ func TestWriteUsage_ContainsVersionAndDefaults(t *testing.T) {
 		"FLAGS",
 		"REQUIREMENT IDS",
 		`"` + defaultReqs + `"`,
-		`"` + defaultModel + `"`,
-		`"` + defaultEffort + `"`,
+		// ralph is pi-exclusive: the manual names pi, not claude, and
+		// carries no --engine/--effort rows.
+		"pi",
 		// The new project-layout section mentions the app-root
 		// subdirectory by name.
 		"app-root",

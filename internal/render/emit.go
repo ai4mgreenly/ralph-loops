@@ -1,7 +1,6 @@
 package render
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -13,31 +12,29 @@ import (
 
 // Markers used by the activity log. Held as named constants so the
 // success/error variants stay visually distinct and consistent across
-// every emit path. Tool calls (assistant → operator) lead with
-// [markerCall]; tool results (operator → assistant) lead with
-// [markerResult] on success or [markerError] on failure. The terminal
-// "result" event uses [markerSummary] / [markerSummaryError].
+// every emit path. Assistant prose and tool-call headers lead with
+// [markerCall]; tool results lead with [markerResult] on success or
+// [markerError] on failure.
 const (
-	markerCall         = "←"
-	markerResult       = "→"
-	markerError        = "✗"
-	markerSummary      = "←"
-	markerSummaryError = "✗"
+	markerCall   = "←"
+	markerResult = "→"
+	markerError  = "✗"
 )
 
-// Emitter renders one stream of claude events. It owns the
-// per-iteration ledger of pending tool calls (so a tool_result block
-// can be printed alongside the call that produced it) and the
-// per-event timer that splits wall time into LLM / tool / other.
+// Emitter renders one stream of pi settled events. It owns the
+// per-iteration ledger of in-flight tool calls (so a
+// tool_execution_end can be timed against its tool_execution_start and
+// the `edit` diff reconstructed from the start's args) and the
+// per-event timer that splits wall time into LLM / tool work.
 //
-// One Emitter instance is reused across iterations: [Emitter.ResetIteration]
-// clears the pending-tool ledger and re-anchors the timer at the
-// start of each new iteration.
+// One Emitter instance is reused across iterations:
+// [Emitter.ResetIteration] clears the pending-tool ledger and
+// re-anchors the timer at the start of each new pi invocation.
 type Emitter struct {
 	out          io.Writer
 	rec          Recorder
 	theme        *ui.Theme
-	tools        map[string]toolRef
+	tools        map[string]pendingTool
 	lastAt       time.Time
 	now          func() time.Time
 	verbose      bool
@@ -51,16 +48,17 @@ type Emitter struct {
 // fields after the fact.
 type EmitterOption func(*Emitter)
 
-// WithVerbose toggles the rendering of low-signal events ("system",
-// "rate_limit"). Defaults to false: those events are suppressed and
-// only diagnostic kinds reach the operator.
+// WithVerbose toggles the rendering of low-signal events (the
+// [stream.Session] banner and the known-but-unused carriers). Defaults
+// to false: those are tallied but not painted, so only assistant
+// prose, tool activity, and the terminal summary reach the operator.
 func WithVerbose(v bool) EmitterOption {
 	return func(e *Emitter) { e.verbose = v }
 }
 
-// WithOutputLines caps the number of tool-output lines replayed in
-// the activity log per result. A value <= 0 leaves the built-in
-// default ([defaultOutputLines]) in place.
+// WithOutputLines caps the number of tool-output lines replayed in the
+// activity log per result. A value <= 0 leaves the built-in default
+// ([defaultOutputLines]) in place.
 func WithOutputLines(n int) EmitterOption {
 	return func(e *Emitter) {
 		if n > 0 {
@@ -78,39 +76,47 @@ func WithSpinner(s *ui.Spinner) EmitterOption {
 
 // WithSpinnerLabel customises the "waiting for X" prefix the default
 // spinner paints between event reads. Production callers thread the
-// model name in so the operator sees what's actually being waited on
+// model name in so the operator sees what is actually being waited on
 // (the engine is just a router; the model is what's billing). Has no
 // effect when [WithSpinner] supplied a pre-built spinner.
 func WithSpinnerLabel(label string) EmitterOption {
 	return func(e *Emitter) { e.spinnerLabel = label }
 }
 
-// toolRef is the input to a not-yet-completed tool call, retained so
-// the eventual tool_result can show the same parameter formatting as
-// the original call.
-type toolRef struct {
-	name  string
-	input json.RawMessage
+// pendingTool is the bookkeeping retained between a
+// [stream.ToolExecutionStart] and its matching
+// [stream.ToolExecutionEnd]: the start time (so the execution span can
+// be attributed to tool wall-time) and the raw start args (so the
+// `edit` tool's diff can be reconstructed when the end arrives).
+type pendingTool struct {
+	startedAt time.Time
+	args      []byte
 }
 
-// defaultOutputLines bounds how many lines of tool output we replay
-// in the activity log when [Config.OutputLines] is unset. Bash, Read,
-// and Edit output can be enormous; ten lines covers the common case
-// (a build's tail end, the top of a file, a small edit hunk) without
-// flooding the operator. Operators override via `--output-lines`.
+// defaultOutputLines bounds how many lines of tool output we replay in
+// the activity log when [WithOutputLines] is unset. A read of a large
+// file or a noisy command can be enormous; ten lines covers the common
+// case without flooding the operator. Operators override via
+// `--output-lines`.
 const defaultOutputLines = 10
 
+// defaultSpinnerLabel is the spinner suffix when the caller does not
+// override via [WithSpinnerLabel]. It names the engine (pi) so a bare
+// `ralph .` invocation with no flags reads naturally.
+const defaultSpinnerLabel = "pi"
+
 // NewEmitter constructs an Emitter writing to out and updating rec,
-// using theme for colour and width decisions. The wall-clock source
-// is taken indirectly through `time.Now` so tests can install a
+// using theme for colour and width decisions. The wall-clock source is
+// taken indirectly through `time.Now` so tests can install a
 // deterministic clock. opts override the documented defaults; see
-// [WithVerbose], [WithOutputLines], and [WithSpinner].
+// [WithVerbose], [WithOutputLines], [WithSpinner], and
+// [WithSpinnerLabel].
 func NewEmitter(out io.Writer, rec Recorder, theme *ui.Theme, opts ...EmitterOption) *Emitter {
 	e := &Emitter{
 		out:          out,
 		rec:          rec,
 		theme:        theme,
-		tools:        make(map[string]toolRef),
+		tools:        make(map[string]pendingTool),
 		now:          time.Now,
 		spinnerLabel: defaultSpinnerLabel,
 		outputLines:  defaultOutputLines,
@@ -124,18 +130,13 @@ func NewEmitter(out io.Writer, rec Recorder, theme *ui.Theme, opts ...EmitterOpt
 	return e
 }
 
-// defaultSpinnerLabel is the spinner suffix when the caller does not
-// override via [WithSpinnerLabel]. It matches the bare-default engine
-// so a `ralph .` invocation with no flags reads naturally.
-const defaultSpinnerLabel = "claude"
-
 // Spinner returns the [ui.Spinner] the emitter brackets each event
 // read with. Exposed so the loop driver can toggle the rotator on
 // either side of a blocking stream read.
 func (e *Emitter) Spinner() *ui.Spinner { return e.spinner }
 
 // ResetIteration prepares the Emitter for a fresh iteration: drop any
-// in-flight tool-call references (they cannot survive a new claude
+// in-flight tool-call references (they cannot survive a new pi
 // invocation) and re-anchor the per-event timer.
 func (e *Emitter) ResetIteration() {
 	clear(e.tools)
@@ -143,9 +144,8 @@ func (e *Emitter) ResetIteration() {
 }
 
 // IterationBanner prints a rule-bracketed "iteration: N" header to
-// mark the start of a new claude invocation. The rule spans the
-// terminal width (or the panel fallback width when stdout is not a
-// terminal).
+// mark the start of a new pi invocation. The rule spans the terminal
+// width (or the panel fallback width when stdout is not a terminal).
 func (e *Emitter) IterationBanner(n int) {
 	rule := e.theme.Rule()
 	fmt.Fprintln(e.out, rule)
@@ -153,142 +153,215 @@ func (e *Emitter) IterationBanner(n int) {
 	fmt.Fprintln(e.out, rule)
 }
 
-// OnAssistant handles the "assistant" event: indented plain text for
-// model output, decorated lines for tool_use and thinking blocks.
-// The wall-clock gap since the last event is attributed to LLM time.
-func (e *Emitter) OnAssistant(a stream.Assistant) {
-	now := e.now()
-	e.rec.AddLLMTime(now.Sub(e.lastAt))
-	e.lastAt = now
+// OnEvent is the single dispatch entry point: it tallies the event by
+// kind (so stats count every pi event type, including the
+// known-but-unused carriers) and routes the rich types to their
+// renderer. Unrendered kinds — the known-but-unused carriers, an
+// [stream.UnknownEvent], a [stream.TurnEnd] — are tallied and dropped:
+// pi's authoritative per-iteration accounting comes from
+// [stream.AgentEnd], which the loop reads directly.
+//
+// Callers pass every [stream.Event] from [stream.Reader.Next] here,
+// including the [stream.UnknownEvent] returned alongside a decode
+// error.
+func (e *Emitter) OnEvent(ev stream.Event) {
+	if ev == nil {
+		return
+	}
+	e.rec.TallyEvent(ev.Kind())
+	switch v := ev.(type) {
+	case stream.Session:
+		e.onSession(v)
+	case stream.MessageEnd:
+		e.onMessageEnd(v)
+	case stream.ToolExecutionStart:
+		e.onToolStart(v)
+	case stream.ToolExecutionEnd:
+		e.onToolEnd(v)
+	}
+}
 
-	blocks := a.Message.Content
+// onSession renders pi's opening [stream.Session] banner — protocol
+// version, session id, cwd — but only in verbose mode: it carries no
+// build signal, just provenance for a saved log.
+func (e *Emitter) onSession(s stream.Session) {
+	if !e.verbose {
+		return
+	}
+	var bits []string
+	if s.Version != 0 {
+		bits = append(bits, fmt.Sprintf("version=%d", s.Version))
+	}
+	if s.ID != "" {
+		bits = append(bits, "id="+s.ID)
+	}
+	if s.Cwd != "" {
+		bits = append(bits, "cwd="+s.Cwd)
+	}
+	content := "session"
+	if len(bits) > 0 {
+		content += "  " + strings.Join(bits, "  ")
+	}
+	e.theme.Decorate(e.out, markerCall, content)
+}
+
+// onMessageEnd renders one settled message. Assistant messages get
+// their text/thinking blocks painted and their usage captured for the
+// partial fallback; toolCall blocks are tallied but not rendered here
+// (the tool channel is the [stream.ToolExecutionStart]/End pair, per
+// the locked de-dupe decision). The "toolResult" role is dropped
+// entirely — pi emits a redundant toolResult message_end alongside
+// every tool_execution_end and rendering both would double-print. User
+// messages (the kickoff replay) are rendered as a tucked-under block.
+//
+// The wall-clock gap since the previous event is attributed to LLM
+// time when an assistant message settles.
+func (e *Emitter) onMessageEnd(m stream.MessageEnd) {
+	msg := m.Message
+	switch msg.Role {
+	case stream.RoleToolResult:
+		// Redundant with the tool_execution_* channel; drop without
+		// rendering or counting (the de-dupe decision).
+		return
+	case stream.RoleAssistant:
+		now := e.now()
+		e.rec.AddLLMTime(now.Sub(e.lastAt))
+		e.lastAt = now
+		e.rec.TrackMessageUsage(msg.Usage, msg.Provider, effectiveModel(msg), msg.StopReason)
+		e.renderAssistantBlocks(msg.Content)
+	case stream.RoleUser:
+		e.renderUserBlocks(msg.Content)
+	default:
+		e.renderUserBlocks(msg.Content)
+	}
+}
+
+// effectiveModel is the Q6 "effective model": the model the provider
+// actually served the request with (ResponseModel) when pi reports it,
+// otherwise the requested Model.
+func effectiveModel(m stream.PiMessage) string {
+	if m.ResponseModel != "" {
+		return m.ResponseModel
+	}
+	return m.Model
+}
+
+// renderAssistantBlocks paints an assistant message's content: prose
+// in a lead block, a thinking marker (its body is encrypted noise pi
+// cannot replay, so only the presence is signalled), and a tally for
+// toolCall blocks (whose rendering is the tool_execution channel's
+// job). Each block type is counted on the recorder.
+func (e *Emitter) renderAssistantBlocks(blocks []stream.ContentBlock) {
 	if len(blocks) == 0 {
 		e.theme.Decorate(e.out, markerCall, "assistant (empty)")
 		return
 	}
-
 	for _, b := range blocks {
 		e.rec.TallyBlock(b.Type)
 		switch b.Type {
 		case stream.BlockText:
 			e.theme.Lead(e.out, markerCall, e.capLines(strings.TrimRight(b.Text, " \t\r\n")))
-		case stream.BlockToolUse:
-			e.tools[b.ID] = toolRef{name: b.Name, input: b.Input}
-			e.emitToolCall(b)
 		case stream.BlockThinking:
-			// Skip the noise from "… thinking (0 chars)" preludes that
-			// claude emits before some tool calls; they carry no signal.
 			if n := len(b.Thinking); n > 0 {
 				e.theme.Decorate(e.out, markerCall, fmt.Sprintf("thinking (%d chars)", n))
 			}
+		case stream.BlockToolCall:
+			// The tool channel is tool_execution_start/end; the toolCall
+			// block here would double-render. Tally only.
 		default:
 			e.theme.Decorate(e.out, markerCall, "assistant ["+b.Type+"]")
 		}
 	}
 }
 
-// OnUser handles the "user" event: typically a tool_result block
-// matched against the call recorded in [Emitter.tools], or a replayed
-// kickoff text. The wall-clock gap since the last event is attributed
-// to tool time.
-func (e *Emitter) OnUser(u stream.User) {
-	now := e.now()
-	e.rec.AddToolTime(now.Sub(e.lastAt))
-	e.lastAt = now
-
-	blocks := u.Message.Content
-	if len(blocks) == 0 {
-		e.theme.Decorate(e.out, markerResult, "user (empty)")
-		return
-	}
-
+// renderUserBlocks paints a settled user message — in practice the
+// iteration's kickoff prompt replayed back — as a tucked-under output
+// block so it reads like any other result body.
+func (e *Emitter) renderUserBlocks(blocks []stream.ContentBlock) {
 	for _, b := range blocks {
-		e.rec.TallyBlock(b.Type)
-		switch b.Type {
-		case stream.BlockToolResult:
-			e.emitToolResult(b, u.ToolUseResult)
-		case stream.BlockText:
+		if b.Type == stream.BlockText {
 			e.emitUserText(b.Text)
-		default:
-			e.theme.Decorate(e.out, markerResult, "user ["+b.Type+"]")
 		}
 	}
 }
 
-func (e *Emitter) emitToolResult(b stream.Block, structured json.RawMessage) {
-	ref, ok := e.tools[b.ToolUseID]
-	delete(e.tools, b.ToolUseID)
-	if !ok {
-		ref = toolRef{name: "unknown"}
+// onToolStart records the tool's start (for timing and, for `edit`,
+// for diff reconstruction at end) and prints the B-lite header:
+// toolName plus its primary argument (the first present of
+// path/command/pattern in the decoded args object).
+func (e *Emitter) onToolStart(s stream.ToolExecutionStart) {
+	e.tools[s.ToolCallID] = pendingTool{
+		startedAt: e.now(),
+		args:      append([]byte(nil), s.Args...),
 	}
 
-	switch ref.name {
-	case stream.ToolBash:
-		e.emitBashResult(b, structured)
-		return
-	case stream.ToolRead:
-		e.emitReadResult(b, ref)
-		return
-	case stream.ToolEdit:
-		e.emitEditResult(b, ref)
-		return
-	case stream.ToolWrite:
-		e.emitWriteResult(b, ref)
-		return
+	header := s.ToolName
+	if param := primaryArg(s.Args); param != "" {
+		header += "  " + param
 	}
-
-	status := "ok"
-	if b.IsError {
-		status = "ERR"
-	}
-
-	parts := []string{ref.name}
-	if param := formatToolCallParam(ref.name, ref.input); param != "" {
-		parts = append(parts, param)
-	}
-	parts = append(parts, status)
-	if summary := formatToolResult(ref.name, b, structured); summary != "" {
-		parts = append(parts, summary)
-	}
-	marker := markerResult
-	if b.IsError {
-		marker = markerError
-	}
-	e.theme.Decorate(e.out, marker, strings.Join(parts, "  "))
+	e.theme.Tool(e.out, markerCall, e.capLines(header), true)
 }
 
-// emitToolCall renders one assistant tool_use block. Every tool call
-// is followed by a blank separator so the `→` response sits one line
-// below its `←` call — the visual gap, plus the subdued background
-// fill on the call line, makes call/response pairs easy to scan. All
-// shapes flow through [ui.Tool] so the gutter and soft-wrap behaviour
-// stay consistent across every tool-call line in the UI.
-func (e *Emitter) emitToolCall(b stream.Block) {
-	switch b.Name {
-	case stream.ToolBash:
-		e.theme.Tool(e.out, markerCall, e.capLines(bashCommand(b.Input)), true)
-		return
-	case stream.ToolRead:
-		e.theme.Tool(e.out, markerCall, "Read  "+readTarget(b.Input), true)
-		return
-	case stream.ToolEdit, stream.ToolWrite:
-		e.theme.Tool(e.out, markerCall, b.Name+"  "+filePathOf(b.Input), true)
+// onToolEnd closes a tool execution: attribute the start→end span to
+// tool wall-time, record the outcome for the tool/error counts, then
+// render the result. For `edit` the locked decision is to reconstruct
+// a colorized diff from the start args' edits[] through the existing
+// diff+highlight code; every other tool prints its result.content[]
+// text, error-styled when isError.
+func (e *Emitter) onToolEnd(end stream.ToolExecutionEnd) {
+	ref, ok := e.tools[end.ToolCallID]
+	delete(e.tools, end.ToolCallID)
+	if ok {
+		e.rec.AddToolTime(e.now().Sub(ref.startedAt))
+	}
+	e.rec.TrackToolOutcome(end.ToolName, end.IsError)
+
+	marker := markerResult
+	if end.IsError {
+		marker = markerError
+	}
+
+	if end.ToolName == toolEdit {
+		e.emitEditDiff(marker, ref.args)
 		return
 	}
-	content := b.Name
-	if param := formatToolCallParam(b.Name, b.Input); param != "" {
-		content += "  " + param
+
+	text := strings.TrimRight(resultContentText(end.Result), "\n")
+	if text == "" {
+		// A bare marker line carries no signal; an error with no body
+		// still earns a marker so the failure is visible.
+		if end.IsError {
+			e.theme.Decorate(e.out, marker, end.ToolName+" error")
+		}
+		return
 	}
-	e.theme.Tool(e.out, markerCall, content, true)
+	lines := make([]ui.Line, 0, strings.Count(text, "\n")+1)
+	color := ui.Plain
+	if end.IsError {
+		color = ui.DimRed
+	}
+	for _, l := range strings.Split(text, "\n") {
+		lines = append(lines, ui.Line{Text: strings.TrimRight(l, " \t\r"), Color: color})
+	}
+	e.emitOutputBlock(marker, lines)
+}
+
+// OnDecodeError surfaces a [stream.DecodeError] through the emitter's
+// configured writer so the operator sees the offending raw line in the
+// same activity log as every other event. The line is rendered with %q
+// to escape non-printable or non-UTF-8 bytes, since malformed event
+// lines may contain arbitrary garbage from the wire.
+func (e *Emitter) OnDecodeError(de stream.DecodeError) {
+	e.theme.Decorate(e.out, markerError, fmt.Sprintf("decode error: line %d: %q", de.Line, de.Bytes))
 }
 
 // capLines truncates s to at most [Emitter.outputLines] lines (falling
-// back to [defaultOutputLines] when unset), appending a `...` marker
-// on truncation. Single-line and short multi-line bodies pass through
-// unchanged. The cap exists to keep call-side decorators —
-// [theme.Tool] for Bash heredocs, [theme.Lead] for assistant prose —
-// from leaking unbounded payloads into the operator log; result-side
-// blocks already get the same treatment via [Emitter.emitOutputBlock].
+// back to [defaultOutputLines] when unset), appending a `...` marker on
+// truncation. Single-line and short multi-line bodies pass through
+// unchanged. The cap keeps call-side decorators — [ui.Theme.Tool] for
+// tool headers, [ui.Theme.Lead] for assistant prose — from leaking
+// unbounded payloads into the operator log; result-side blocks already
+// get the same treatment via [Emitter.emitOutputBlock].
 func (e *Emitter) capLines(s string) string {
 	maxLines := e.outputLines
 	if maxLines <= 0 {
@@ -305,13 +378,12 @@ func (e *Emitter) capLines(s string) string {
 }
 
 // emitOutputBlock renders the shared terminal-style result block used
-// by Bash, Read, Edit, Write, and any future tool that prefers raw
-// output to a one-line summary. The first input line gets marker
-// padded to [ui.Gutter] columns; later lines and soft-wrap
-// continuations get [ui.Gutter] spaces, giving the whole block one
-// clean left edge. Per-line colour is applied after wrapping so ANSI
-// escapes do not count toward the wrap budget. When more than
-// [Emitter.OutputLines] input lines are supplied the overflow is
+// by the generic tool renderer and the edit diff. The first input line
+// gets its marker padded to [ui.Gutter] columns; later lines and
+// soft-wrap continuations get [ui.Gutter] spaces, giving the whole
+// block one clean left edge. Per-line colour is applied after wrapping
+// so ANSI escapes do not count toward the wrap budget. When more than
+// [Emitter.outputLines] input lines are supplied the overflow is
 // dropped and a `...` line is appended. An empty lines slice emits
 // nothing — a bare marker line carries no signal for the operator.
 func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
@@ -322,35 +394,18 @@ func (e *Emitter) emitOutputBlock(marker string, lines []ui.Line) {
 	if maxLines <= 0 {
 		maxLines = defaultOutputLines
 	}
-	truncated := false
 	if len(lines) > maxLines {
 		lines = lines[:maxLines]
-		truncated = true
-	}
-	if truncated {
 		lines = append(lines, ui.Line{Text: "..."})
 	}
 	e.theme.WriteBlock(e.out, marker, lines, true)
 }
 
-// filePathOf pulls the `file_path` field from a tool_use input.
-// Shared by the Read, Edit, and Write renderers (and any other tool
-// that keys on a single path). Same fail-soft semantics as
-// [bashCommand].
-func filePathOf(input json.RawMessage) string {
-	var s struct {
-		FilePath string `json:"file_path"`
-	}
-	_ = json.Unmarshal(input, &s)
-	return s.FilePath
-}
-
 // emitUserText renders a replayed user-text block (typically the
-// iteration's kickoff prompt) as a tucked-under output block — same
-// shape a Read tool response uses. Content is split on `\n`, capped
-// at [Emitter.OutputLines] visible lines with a `...` truncation marker
-// when the body runs longer, and shares the same gutter/wrap rules
-// as every other block.
+// iteration's kickoff prompt) as a tucked-under output block. Content
+// is split on `\n`, capped at [Emitter.outputLines] visible lines with
+// a `...` truncation marker when the body runs longer, and shares the
+// same gutter/wrap rules as every other block.
 func (e *Emitter) emitUserText(text string) {
 	body := strings.TrimRight(text, "\n")
 	var lines []ui.Line
@@ -360,125 +415,4 @@ func (e *Emitter) emitUserText(text string) {
 		}
 	}
 	e.emitOutputBlock(markerResult, lines)
-}
-
-// OnResult handles the iteration's terminal "result" event: it
-// records token usage and prints the result line with status, turn
-// count, claude's own duration estimate and self-reported cost.
-func (e *Emitter) OnResult(r stream.Result) {
-	e.rec.TrackUsage(r.Usage)
-
-	var bits []string
-	if status := DecodeStatus(r.StructuredOutput); status != "" {
-		bits = append(bits, "status="+status)
-	}
-	if r.NumTurns > 0 {
-		bits = append(bits, fmt.Sprintf("turns=%d", r.NumTurns))
-	}
-	if r.DurationMS > 0 {
-		bits = append(bits, "duration="+ui.FormatMilliseconds(r.DurationMS))
-	}
-	if r.TotalCostUSD > 0 {
-		bits = append(bits, fmt.Sprintf("cost=$%.4f", r.TotalCostUSD))
-	}
-
-	marker := markerSummary
-	if r.IsError {
-		marker = markerSummaryError
-	}
-	content := "result"
-	if len(bits) > 0 {
-		content += "  " + strings.Join(bits, "  ")
-	}
-	e.theme.Decorate(e.out, marker, content)
-}
-
-// OnDecodeError surfaces a [stream.DecodeError] through the emitter's
-// configured writer so the operator sees the offending raw line in the
-// same activity log as every other event. The line is rendered with
-// %q to escape non-printable or non-UTF-8 bytes, since malformed event
-// lines may contain arbitrary garbage from the wire.
-func (e *Emitter) OnDecodeError(de stream.DecodeError) {
-	e.theme.Decorate(e.out, markerError, fmt.Sprintf("decode error: line %d: %q", de.Line, de.Bytes))
-}
-
-// OnSystem handles "system" events: session boot, model selection,
-// permission mode, tool list, etc.
-func (e *Emitter) OnSystem(s stream.System) {
-	if !e.verbose {
-		return
-	}
-	subtype := s.Subtype
-	if subtype == "" {
-		subtype = "system"
-	}
-
-	var bits []string
-	if s.Model != "" {
-		bits = append(bits, "model="+s.Model)
-	}
-	if s.Cwd != "" {
-		bits = append(bits, "cwd="+s.Cwd)
-	}
-	if s.PermissionMode != "" {
-		bits = append(bits, "perm="+s.PermissionMode)
-	}
-	if n := len(s.Tools); n > 0 {
-		bits = append(bits, fmt.Sprintf("tools=%d", n))
-	}
-
-	content := subtype
-	if len(bits) > 0 {
-		content += "  " + strings.Join(bits, "  ")
-	}
-	e.theme.Decorate(e.out, markerCall, content)
-}
-
-// OnRateLimit reports the rate-limit envelope claude attaches to some
-// events. The fields surfaced match the Ruby driver's set.
-func (e *Emitter) OnRateLimit(r stream.RateLimit) {
-	if !e.verbose {
-		return
-	}
-	info := r.Info
-	if info == nil {
-		info = &stream.RateLimitInfo{}
-	}
-
-	var bits []string
-	if info.RateLimitType != "" {
-		bits = append(bits, "type="+info.RateLimitType)
-	}
-	if info.Status != "" {
-		bits = append(bits, "status="+info.Status)
-	}
-	if info.Utilization != 0 {
-		bits = append(bits, fmt.Sprintf("util=%.1f%%", info.Utilization*100))
-	}
-	if info.ResetsAt != 0 {
-		bits = append(bits, "resets="+time.Unix(info.ResetsAt, 0).UTC().Format(time.RFC3339))
-	}
-	if info.IsUsingOverage {
-		bits = append(bits, "overage")
-	}
-
-	content := "rate_limit"
-	if len(bits) > 0 {
-		content += "  " + strings.Join(bits, "  ")
-	}
-	e.theme.Decorate(e.out, markerCall, content)
-}
-
-// DecodeStatus extracts the schema-constrained status field from a
-// raw structured-output payload. Returns an empty string for any
-// shape that doesn't match the expected envelope.
-func DecodeStatus(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var so stream.StatusOutput
-	if err := json.Unmarshal(raw, &so); err != nil {
-		return ""
-	}
-	return so.Status
 }

@@ -11,13 +11,13 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
-// BenchmarkReader_Next replays the testdata session through
-// [stream.Reader] one full pass per iteration. We use a [bytes.Reader]
-// so the benchmark exercises only the decode path, not file I/O. The
-// reported MB/s comes from the SetBytes call.
+// BenchmarkReader_Next replays a real pi capture through
+// [stream.Reader] one full pass per iteration, then derives the Q3
+// status from the terminal [stream.AgentEnd] — the production hot path.
+// A [bytes.Reader] is used so the benchmark exercises only the decode
+// path, not file I/O. The reported MB/s comes from SetBytes.
 func BenchmarkReader_Next(b *testing.B) {
-	path := filepath.Join("testdata", "session.jsonl")
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Join("testdata", "tool-edit.jsonl"))
 	if err != nil {
 		b.Fatalf("read fixture: %v", err)
 	}
@@ -27,15 +27,17 @@ func BenchmarkReader_Next(b *testing.B) {
 	for b.Loop() {
 		r := stream.NewReader(bytes.NewReader(data))
 		for {
-			_, err := r.Next()
+			ev, err := r.Next()
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			// Decode errors are part of the production hot path
-			// (unknown event types are returned with a paired
-			// error), so we drain them and keep going.
+			// Decode errors (unknown types) are part of the production
+			// hot path; drain and keep going.
 			if err != nil {
 				continue
+			}
+			if ae, ok := ev.(stream.AgentEnd); ok {
+				_ = stream.StatusFromAgentEnd(ae)
 			}
 		}
 	}

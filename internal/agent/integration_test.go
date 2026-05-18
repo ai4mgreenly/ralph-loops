@@ -3,7 +3,6 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -19,27 +18,27 @@ import (
 	"github.com/ai4mgreenly/ralph-loops/internal/stream"
 )
 
-// These tests exercise the Spawn → Send → Events → Close lifecycle
+// These tests exercise the one-shot Spawn → Events → Close lifecycle
 // against a real subprocess. We use the canonical "re-exec the test
 // binary" pattern: each test launches the test binary itself, a
 // sentinel env var (GO_WANT_HELPER_PROCESS=1) routes execution into
 // [TestHelperProcess], and another env var (HELPER_MODE) selects the
 // behaviour the helper performs. This keeps the integration entirely
-// in-tree — no external claude binary required.
+// in-tree — no external pi binary required. (A live pi smoke test is a
+// separate, gated concern per the migration record.)
 
 // helperSpawner returns a [*Spawner] wired to re-exec the test binary
-// in helper mode. The cfg-shaped flags the engine expects are still
-// produced (so we exercise the real argv path) but the helper just
-// ignores them.
+// in helper mode. The cfg-shaped pi flags are still produced (so we
+// exercise the real argv path) but the helper just ignores them.
 func helperSpawner(t *testing.T, mode string) *Spawner {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	// "--" separates test framework flags from the production argv
-	// the spawner appends. Without the separator, Go's testing
-	// package would gobble the engine flags as unknown test flags.
+	// "--" separates test framework flags from the production argv the
+	// spawner appends. Without the separator, Go's testing package
+	// would gobble the pi flags as unknown test flags.
 	sp := newSpawnerWithExtraArgs(exe, "-test.run=TestHelperProcess", "--")
 	sp.Stderr = io.Discard
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
@@ -47,14 +46,27 @@ func helperSpawner(t *testing.T, mode string) *Spawner {
 	return sp
 }
 
+// helperConfig is a minimal valid pi Config for the helper tests. The
+// helper ignores argv, but a real Prompt/SystemPromptFile keeps
+// buildArgs on its production path.
+func helperConfig(t *testing.T) Config {
+	t.Helper()
+	return Config{
+		Prompt:           "kickoff",
+		SystemPromptFile: "/abs/AGENTS.md",
+		WorkDir:          t.TempDir(),
+	}
+}
+
 // TestHelperProcess is the re-exec target. When GO_WANT_HELPER_PROCESS
-// is set, this branches on HELPER_MODE and emulates a tiny piece of
-// the claude CLI:
+// is set, this branches on HELPER_MODE and emulates a tiny piece of pi
+// print mode. It deliberately does NOT read stdin: production pi's
+// stdin is /dev/null, and these helpers must not block on it.
 //
-//   - "happy"    : read one envelope on stdin, print system + DONE
-//     result, exit 0.
-//   - "sigtrap"  : trap SIGINT, exit 7 when received, otherwise spin.
-//   - "hang"     : print one event, then sleep until killed.
+//   - "happy"   : print a session event then an agent_end (DONE),
+//     exit 0.
+//   - "sigterm" : trap SIGTERM, exit 7 when received, otherwise spin.
+//   - "hang"    : print one event, then sleep until killed.
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
@@ -63,15 +75,15 @@ func TestHelperProcess(t *testing.T) {
 
 	switch os.Getenv("HELPER_MODE") {
 	case "happy":
-		sc := bufio.NewScanner(os.Stdin)
-		_ = sc.Scan()
-		fmt.Println(`{"type":"system","subtype":"init","model":"sonnet"}`)
-		fmt.Println(`{"type":"result","is_error":false,"structured_output":{"status":"DONE"}}`)
+		fmt.Println(`{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"."}`)
+		fmt.Println(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"RALPH-STATUS: DONE"}]}]}`)
 		os.Exit(0)
-	case "sigtrap":
+	case "sigterm":
 		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-		fmt.Println(`{"type":"system","subtype":"init"}`)
+		// pi print-mode handles SIGTERM (clean exit 143) and installs no
+		// SIGINT handler; ralph's Cancel hook sends SIGTERM to the group.
+		signal.Notify(ch, syscall.SIGTERM)
+		fmt.Println(`{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"."}`)
 		select {
 		case <-ch:
 			os.Exit(7)
@@ -79,7 +91,7 @@ func TestHelperProcess(t *testing.T) {
 			os.Exit(0)
 		}
 	case "hang":
-		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"."}`)
 		time.Sleep(60 * time.Second)
 		os.Exit(0)
 	default:
@@ -111,58 +123,70 @@ func TestSpawner_HappyPath(t *testing.T) {
 	sp := helperSpawner(t, "happy")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	sess, err := sp.Spawn(ctx, Config{Model: "opus", Effort: "medium", WorkDir: t.TempDir()})
+	sess, err := sp.Spawn(ctx, helperConfig(t))
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	if err := sess.Send("kickoff"); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if ev := drainUntil(t, sess.Events(), stream.TypeResult); ev == nil {
+	if ev := drainUntil(t, sess.Events(), stream.TypeAgentEnd); ev == nil {
 		_ = sess.Close()
-		t.Fatal("did not see result event before EOF")
+		t.Fatal("did not see agent_end event before EOF")
 	}
 	if err := sess.Close(); err != nil {
 		t.Errorf("Close: %v", err)
 	}
 }
 
+// TestSpawner_SendIsNoOp documents that the production pi Session's
+// Send is a no-op (one-shot mode: the prompt was already argv) and
+// never errors, so loop call sites that still invoke it stay harmless.
+func TestSpawner_SendIsNoOp(t *testing.T) {
+	sp := helperSpawner(t, "happy")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := sp.Spawn(ctx, helperConfig(t))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := sess.Send("ignored"); err != nil {
+		t.Errorf("production Send must be a nil-returning no-op, got %v", err)
+	}
+	drainUntil(t, sess.Events(), stream.TypeAgentEnd)
+	_ = sess.Close()
+}
+
 func TestSpawner_CloseIsIdempotent(t *testing.T) {
 	sp := helperSpawner(t, "happy")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	sess, err := sp.Spawn(ctx, Config{Model: "opus", Effort: "medium", WorkDir: t.TempDir()})
+	sess, err := sp.Spawn(ctx, helperConfig(t))
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	if err := sess.Send("kickoff"); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	drainUntil(t, sess.Events(), stream.TypeResult)
+	drainUntil(t, sess.Events(), stream.TypeAgentEnd)
 
 	first := sess.Close()
 	second := sess.Close()
-	// Both calls return the same value because closeOnce gates the
-	// real work and closeErr is never reassigned afterward.
+	// Both calls return the same value because closeOnce gates the real
+	// work and closeErr is never reassigned afterward.
 	if first != second {
 		t.Errorf("Close non-idempotent: first=%v second=%v", first, second)
 	}
 }
 
 func TestSpawner_CancelDeliversSignal(t *testing.T) {
-	sp := helperSpawner(t, "sigtrap")
+	sp := helperSpawner(t, "sigterm")
 	ctx, cancel := context.WithCancel(context.Background())
-	sess, err := sp.Spawn(ctx, Config{Model: "opus", Effort: "medium", WorkDir: t.TempDir()})
+	sess, err := sp.Spawn(ctx, helperConfig(t))
 	if err != nil {
 		cancel()
 		t.Fatalf("Spawn: %v", err)
 	}
 	// Wait for the helper to print its first event so we know its
 	// signal handler is installed before we cancel.
-	if ev := drainUntil(t, sess.Events(), stream.TypeSystem); ev == nil {
+	if ev := drainUntil(t, sess.Events(), stream.TypeSession); ev == nil {
 		cancel()
 		_ = sess.Close()
-		t.Fatal("did not observe system event before cancel")
+		t.Fatal("did not observe session event before cancel")
 	}
 
 	cancel()
@@ -176,17 +200,19 @@ func TestSpawner_CancelDeliversSignal(t *testing.T) {
 	}
 	// Two acceptable shapes:
 	//
-	//   1. Helper trapped SIGINT and exited 7 cleanly. Signaled=false,
-	//      Code=7. This is the documented happy path.
-	//   2. WaitDelay's SIGKILL escalation reached the helper before
-	//      it could exit on its own. Signaled=true, Signal=SIGKILL.
+	//   1. Helper trapped SIGTERM and exited 7 cleanly. Signaled=false,
+	//      Code=7. This is the documented happy path (pi handles
+	//      SIGTERM cleanly).
+	//   2. WaitDelay's SIGKILL escalation reached the helper before it
+	//      could exit on its own. Signaled=true, Signal=SIGKILL (or
+	//      SIGTERM if the runtime delivered it as a signal death).
 	//
-	// Either way, the cancel reached the child — which is the
-	// contract under test.
+	// Either way, the cancel reached the child via SIGTERM to the
+	// process group — which is the contract under test.
 	switch {
 	case !ee.Signaled && ee.Code == 7:
 		// canonical case
-	case ee.Signaled && (ee.Signal == syscall.SIGINT || ee.Signal == syscall.SIGKILL):
+	case ee.Signaled && (ee.Signal == syscall.SIGTERM || ee.Signal == syscall.SIGKILL):
 		// escalation case
 	default:
 		t.Errorf("unexpected exit shape: %+v", ee)
@@ -200,16 +226,13 @@ func TestSpawner_StdoutTapMirrorsBytes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	sess, err := sp.Spawn(ctx, Config{Model: "opus", Effort: "medium", WorkDir: t.TempDir()})
+	sess, err := sp.Spawn(ctx, helperConfig(t))
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	if err := sess.Send("kickoff"); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if ev := drainUntil(t, sess.Events(), stream.TypeResult); ev == nil {
+	if ev := drainUntil(t, sess.Events(), stream.TypeAgentEnd); ev == nil {
 		_ = sess.Close()
-		t.Fatal("did not see result event before EOF")
+		t.Fatal("did not see agent_end event before EOF")
 	}
 	if err := sess.Close(); err != nil {
 		t.Errorf("Close: %v", err)
@@ -217,10 +240,11 @@ func TestSpawner_StdoutTapMirrorsBytes(t *testing.T) {
 
 	got := tap.String()
 	// The "happy" helper prints exactly two lines verbatim; the tap
-	// must observe both, byte-for-byte, in order.
+	// must observe both, byte-for-byte, in order. This is the
+	// engine-neutral mechanism --raw relies on.
 	want := []string{
-		`{"type":"system","subtype":"init","model":"sonnet"}` + "\n",
-		`{"type":"result","is_error":false,"structured_output":{"status":"DONE"}}` + "\n",
+		`{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"."}` + "\n",
+		`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"RALPH-STATUS: DONE"}]}]}` + "\n",
 	}
 	for _, line := range want {
 		if !strings.Contains(got, line) {
@@ -236,7 +260,7 @@ func TestSpawner_HangingChildIsKilled(t *testing.T) {
 	sp := helperSpawner(t, "hang")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	sess, err := sp.Spawn(ctx, Config{Model: "opus", Effort: "medium", WorkDir: t.TempDir()})
+	sess, err := sp.Spawn(ctx, helperConfig(t))
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -247,9 +271,9 @@ func TestSpawner_HangingChildIsKilled(t *testing.T) {
 	pid := cs.cmd.Process.Pid
 
 	// Wait for the first event so the helper has reached its sleep.
-	if ev := drainUntil(t, sess.Events(), stream.TypeSystem); ev == nil {
+	if ev := drainUntil(t, sess.Events(), stream.TypeSession); ev == nil {
 		_ = sess.Close()
-		t.Fatal("did not observe system event")
+		t.Fatal("did not observe session event")
 	}
 
 	// Close should escalate to Kill within closeGrace; pad with

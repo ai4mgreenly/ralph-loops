@@ -47,18 +47,15 @@ const kickoffPrompt = "Read AGENTS.md if you have not already, then perform one 
 // because `ralph unverified` is called by the agent from inside the
 // app-root subdirectory, where the spec sits at "../reqs".
 const (
-	defaultReqs            = "reqs"
-	defaultAppRoot         = "app-root"
-	defaultUnverifiedReqs  = "../reqs"
-	defaultEngine          = "claude"
-	defaultModel           = "sonnet"
-	defaultEffort          = "high"
-	defaultConfigDir       = ""
-	defaultTools           = ""
-	defaultOneMContext     = true
-	defaultClaudeAIMCP     = false
-	defaultSkipPermissions = true
-	defaultOutputLines     = 10
+	defaultReqs           = "reqs"
+	defaultAppRoot        = "app-root"
+	defaultUnverifiedReqs = "../reqs"
+	// defaultModel is empty: ralph is pi-exclusive and no longer
+	// imposes a model. An empty --model omits pi's --model flag so pi
+	// uses its own configured default.
+	defaultModel       = ""
+	defaultTools       = ""
+	defaultOutputLines = 10
 )
 
 // defaultDuration is the wall-clock cap when --duration is not given.
@@ -248,17 +245,11 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	var (
 		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory, relative to the project root")
 		appRoot     = fs.String("app-root", defaultAppRoot, "path to the application source subdirectory, relative to the project root")
-		engine      = fs.String("engine", defaultEngine, "engine command (drop-in claude replacement) resolved via $PATH")
-		model       = fs.String("model", defaultModel, "model alias forwarded to the engine; must have a pricing entry in internal/pricing")
-		effort      = fs.String("effort", defaultEffort, "effort level forwarded to the engine (engine-specific; e.g. low|medium|high|xhigh|max for claude)")
+		model       = fs.String("model", defaultModel, "model identifier forwarded to pi verbatim; empty uses pi's configured default")
 		duration    time.Duration
-		configDir   = fs.String("config-dir", defaultConfigDir, "value exported as CLAUDE_CONFIG_DIR; empty inherits claude's default (~/.claude)")
-		oneM        = fs.Bool("1m-context", defaultOneMContext, "enable 1M-token context window")
-		mcp         = fs.Bool("enable-claudeai-mcp-servers", defaultClaudeAIMCP, "enable Claude.ai-managed MCP servers")
-		skipPerm    = fs.Bool("dangerously-skip-permissions", defaultSkipPermissions, "pass --dangerously-skip-permissions to claude")
-		tools       = fs.String("tools", defaultTools, "comma-separated tool list; empty means all built-ins")
-		verbose     = fs.Bool("verbose", false, "echo low-signal stream events (system init, rate_limit)")
-		raw         = fs.Bool("raw", false, "debug passthrough: dump engine stdout verbatim as JSONL, suppress all decoration, run one iteration")
+		tools       = fs.String("tools", defaultTools, "comma-separated tool list forwarded to pi; empty means pi's built-in allowlist")
+		verbose     = fs.Bool("verbose", false, "echo low-signal stream events (the pi session banner and known-but-unused carriers)")
+		raw         = fs.Bool("raw", false, "debug passthrough: dump pi stdout verbatim as JSONL, suppress all decoration, run one iteration")
 		outputLines = fs.Int("output-lines", defaultOutputLines, "max lines of tool output to replay per result before truncating with `...`")
 
 		showVersion bool
@@ -286,11 +277,6 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		return exitSuccess
 	}
 
-	if *engine == "" {
-		fmt.Fprintln(stderr, "ralph: --engine must not be empty")
-		return exitUsage
-	}
-
 	if fs.NArg() > 1 {
 		fmt.Fprintln(stderr, "ralph: at most one positional argument (PROJECT_ROOT)")
 		writeUsage(stderr)
@@ -313,23 +299,28 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	stopResize := theme.WatchResize(os.Stdout)
 	defer stopResize()
 
+	// pi receives the build-agent persona as an absolute-path
+	// --append-system-prompt (it does NOT walk up AGENTS.md), so resolve
+	// the app-root AGENTS.md to an absolute path here. The project-root
+	// guard already proved app-root/AGENTS.md exists.
+	systemPromptFile, err := filepath.Abs(filepath.Join(*appRoot, "AGENTS.md"))
+	if err != nil {
+		fmt.Fprintf(stderr, "ralph: resolve app-root AGENTS.md: %s\n", err)
+		return exitUsage
+	}
+
 	cfg := loop.Config{
-		ReqsDir: *reqs,
-		WorkDir: *appRoot,
-		Prompt:  kickoffPrompt,
-		Theme:   theme,
+		ReqsDir:          *reqs,
+		WorkDir:          *appRoot,
+		Prompt:           kickoffPrompt,
+		SystemPromptFile: systemPromptFile,
+		Theme:            theme,
 	}
 	opts := []loop.Option{
-		loop.WithEngine(*engine),
 		loop.WithModel(*model),
-		loop.WithEffort(*effort),
 		loop.WithVersion(version),
 		loop.WithDuration(duration),
-		loop.WithConfigDir(*configDir),
 		loop.WithTools(*tools),
-		loop.WithOneMContext(*oneM),
-		loop.WithClaudeAIMCP(*mcp),
-		loop.WithSkipPermissions(*skipPerm),
 		loop.WithVerbose(*verbose),
 		loop.WithRaw(*raw),
 		loop.WithOutputLines(*outputLines),
