@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -108,6 +109,16 @@ func TestStats_PartialFallback(t *testing.T) {
 	if got, want := sum.Cost, 0.03; got != want {
 		t.Errorf("partial cost = %v, want %v", got, want)
 	}
+	// Turn count and stop reason are part of the Q6 surface and must
+	// still be honestly reported from the partial fallback: two
+	// usage-bearing messages (the nil one does not count) and the
+	// last-seen stop reason.
+	if got, want := sum.Turns, 2; got != want {
+		t.Errorf("partial turns = %d, want %d", got, want)
+	}
+	if got, want := sum.StopReason, "stop"; got != want {
+		t.Errorf("partial stop_reason = %q, want %q", got, want)
+	}
 }
 
 // TestStats_CostIsCoherentJSONNumber confirms the results.jsonl cost
@@ -135,9 +146,13 @@ func TestStats_CostIsCoherentJSONNumber(t *testing.T) {
 	}
 }
 
-// TestStats_PanelLayout asserts the operator-facing panel carries the
-// expected sections under the pi schema.
-func TestStats_PanelLayout(t *testing.T) {
+// TestStats_PanelLayout_SinglePair asserts the enriched Q6 panel for
+// the common case: exactly one (provider, effectiveModel) pair drove
+// the run, so the cost section is a single concise row (no redundant
+// "by model:" breakdown), and the new turns / stop-reason headline and
+// the full labelled token breakdown all render. Volatile values are
+// pinned via pinnedClock so only structure is asserted (Q14c).
+func TestStats_PanelLayout_SinglePair(t *testing.T) {
 	s := newStats("gpt-5.3-codex", pinnedClock(), "")
 	s.iterations = 2
 	s.TallyEvent(stream.TypeMessageEnd)
@@ -148,11 +163,11 @@ func TestStats_PanelLayout(t *testing.T) {
 	s.TallyBlock(stream.BlockToolCall)
 	s.TrackToolOutcome("bash", false)
 	s.TrackToolOutcome("edit", true)
-	s.tallyAgentEnd(stream.AgentEnd{Messages: []stream.PiMessage{
-		assistantMsg("openai-codex", "gpt-5.3-codex", &stream.Usage{
-			Input: 12_345, Output: 10, TotalTokens: 12_355, Cost: stream.Cost{Total: 0.5},
-		}),
-	}})
+	m1 := assistantMsg("openai-codex", "gpt-5.3-codex", &stream.Usage{
+		Input: 12_345, Output: 10, CacheRead: 7, CacheWrite: 3, TotalTokens: 12_365, Cost: stream.Cost{Total: 0.5},
+	})
+	m1.StopReason = "stop"
+	s.tallyAgentEnd(stream.AgentEnd{Messages: []stream.PiMessage{m1}})
 	s.AddLLMTime(2 * time.Second)
 	s.AddToolTime(time.Second)
 
@@ -166,6 +181,8 @@ func TestStats_PanelLayout(t *testing.T) {
 		"model:       gpt-5.3-codex",
 		"exit:        done",
 		"iterations:  2",
+		"turns:       1",
+		"stop reason: stop",
 		"message_end        2",
 		"agent_end          1",
 		"compaction_start   1",
@@ -173,10 +190,15 @@ func TestStats_PanelLayout(t *testing.T) {
 		"toolCall           1",
 		"calls              2",
 		"errors             1",
-		"input:        12,345",
-		"cost:        $",
-		"by model:",
-		"openai-codex/gpt-5.3-codex",
+		"tokens:",
+		"  input:        12,345",
+		"  output:       10",
+		"  cache read:   7",
+		"  cache write:  3",
+		"  total:        12,365",
+		"cost:        $0.5000",
+		// Single pair -> concise row, NOT a "by model:" block.
+		"  openai-codex/gpt-5.3-codex  tokens=12,365 cost=$0.5000",
 		"  llm:    2s",
 		"  tools:  1s",
 		"  start:  ",
@@ -187,11 +209,211 @@ func TestStats_PanelLayout(t *testing.T) {
 			t.Errorf("panel missing %q\n--- panel ---\n%s", sub, out)
 		}
 	}
+	if strings.Contains(out, "by model:") {
+		t.Errorf("single (provider,model) pair must render a concise row, not a by-model block:\n%s", out)
+	}
 	if strings.Contains(out, "====") {
 		t.Errorf("panel still uses the old ASCII rule:\n%s", out)
 	}
 	if strings.Contains(out, "engine:") || strings.Contains(out, "effort:") {
 		t.Errorf("pi panel must not carry engine/effort lines:\n%s", out)
+	}
+	if strings.Contains(out, "context") {
+		t.Errorf("Q6 drops context-window %%; panel must not mention context:\n%s", out)
+	}
+}
+
+// TestStats_PanelLayout_MultiPair asserts the Q6 rule that a run
+// spanning more than one (provider, effectiveModel) pair is never
+// collapsed: the cost section renders the full per-pair breakdown, each
+// pair carrying its own labelled token breakdown and cost, and a mixed
+// set of stop reasons surfaces as a small by-value tally.
+func TestStats_PanelLayout_MultiPair(t *testing.T) {
+	s := newStats("multi", pinnedClock(), "")
+	s.iterations = 1
+
+	a := assistantMsg("openai-codex", "gpt-5.3-codex", &stream.Usage{
+		Input: 1000, Output: 200, CacheRead: 100, CacheWrite: 50, TotalTokens: 1350, Cost: stream.Cost{Total: 0.25},
+	})
+	a.API = "responses"
+	a.StopReason = "toolUse"
+
+	b := assistantMsg("anthropic", "claude-x", &stream.Usage{
+		Input: 500, Output: 400, CacheRead: 25, CacheWrite: 75, TotalTokens: 1000, Cost: stream.Cost{Total: 0.125},
+	})
+	b.ResponseModel = "claude-x-2025"
+	b.API = "messages"
+	b.StopReason = "stop"
+
+	s.tallyAgentEnd(stream.AgentEnd{Messages: []stream.PiMessage{a, b}})
+
+	var buf bytes.Buffer
+	s.snapshot("/some/reqs", exitDone).writeText(&buf, 0)
+	out := buf.String()
+
+	wantSubstrings := []string{
+		"turns:       2",
+		// Mixed reasons -> headline + by-value tally.
+		"stop reasons:",
+		"stop               1",
+		"toolUse            1",
+		"cost:        $0.3750", // 0.25 + 0.125
+		"by model:",
+		"  anthropic/claude-x-2025 (messages)  cost=$0.1250",
+		"  openai-codex/gpt-5.3-codex (responses)  cost=$0.2500",
+		// Each pair carries its own token breakdown indented one level
+		// deeper than the run total.
+		"    input:        1,000",
+		"    input:        500",
+		"    total:        1,350",
+		"    total:        1,000",
+	}
+	for _, sub := range wantSubstrings {
+		if !strings.Contains(out, sub) {
+			t.Errorf("multi-pair panel missing %q\n--- panel ---\n%s", sub, out)
+		}
+	}
+}
+
+// drainFixtureIntoStats feeds a testdata JSONL fixture through the REAL
+// [stream.Reader] (the production decode path) and the REAL stats
+// aggregation path: every event is tallied like the loop does and a
+// terminal agent_end is folded via [stats.tallyAgentEnd]. It is the
+// exact pump the loop runs, minus the subprocess and the renderer.
+func drainFixtureIntoStats(t *testing.T, s *stats, name string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name+".jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	r := stream.NewReader(bytes.NewReader(b))
+	for {
+		ev, rErr := r.Next()
+		if errors.Is(rErr, io.EOF) {
+			break
+		}
+		if rErr != nil {
+			var de *stream.DecodeError
+			if errors.As(rErr, &de) {
+				continue // forward-compat: tolerate, keep reading
+			}
+			t.Fatalf("stream read: %v", rErr)
+		}
+		s.TallyEvent(ev.Kind())
+		if ae, ok := ev.(stream.AgentEnd); ok {
+			s.tallyAgentEnd(ae)
+		}
+	}
+}
+
+// TestStats_ExactSumFromFixture is the Q14c deterministic exact-sum
+// test. It feeds the hand-authored testdata/exact-sum.jsonl fixture
+// (known fixed numbers, two distinct (provider, effectiveModel) pairs)
+// through the real stream.Reader + stats aggregation and asserts the
+// EXACT aggregated token sums, the EXACT total cost, and the EXACT
+// per-(provider,effectiveModel) grouped sums.
+//
+// Fixture numbers (4 assistant messages; a user and a toolResult
+// message are present and MUST NOT contribute):
+//
+//	A  openai-codex/gpt-5.3-codex  (api responses)  in1000 out200 cr100 cw50 tot1350 cost0.25  stop=toolUse
+//	B  openai-codex/gpt-5.3-codex  (api responses)  in2000 out300 cr0   cw0  tot2300 cost0.50  stop=stop
+//	C  anthropic/claude-x →claude-x-2025 (messages) in500  out400 cr25  cw75 tot1000 cost0.125 stop=toolUse
+//	D  anthropic/claude-x →claude-x-2025 (messages) in1500 out600 cr0   cw0  tot2100 cost0.375 stop=stop
+//
+// All cost values are dyadic rationals (quarters/eighths) so every
+// float64 sum below is EXACT — the equality assertions are honest, not
+// epsilon-fudged. Aggregates auditable by inspection:
+//
+//	input 5000  output 1500  cacheRead 125  cacheWrite 125  total 6750
+//	cost  1.25  (0.25+0.50+0.125+0.375)
+//	openai-codex/gpt-5.3-codex : in3000 out500 cr100 cw50 tot3650 cost0.75 (0.25+0.50)
+//	anthropic/claude-x-2025    : in2000 out1000 cr25 cw75 tot3100 cost0.50 (0.125+0.375)
+//	turns 4   stop reasons {toolUse:2, stop:2}   last stop = "stop"
+func TestStats_ExactSumFromFixture(t *testing.T) {
+	s := newStats("gpt-5.3-codex", pinnedClock(), "")
+	drainFixtureIntoStats(t, s, "exact-sum")
+	sum := s.snapshot("/r", exitDone)
+
+	if sum.Partial {
+		t.Fatal("fixture ends in agent_end; summary must not be partial")
+	}
+
+	// Exact aggregated token sums.
+	wantTokens := summaryTokens{Input: 5000, Output: 1500, CacheRead: 125, CacheWrite: 125, Total: 6750}
+	if sum.Tokens != wantTokens {
+		t.Errorf("tokens = %+v, want %+v", sum.Tokens, wantTokens)
+	}
+
+	// Exact total cost (dyadic rationals: this float64 equality holds).
+	if sum.Cost != 1.25 {
+		t.Errorf("cost = %v, want exactly 1.25", sum.Cost)
+	}
+
+	// Exact turn count: only the 4 assistant messages count.
+	if sum.Turns != 4 {
+		t.Errorf("turns = %d, want 4", sum.Turns)
+	}
+
+	// stopReason headline is the terminal one; mixed reasons -> tally.
+	if sum.StopReason != "stop" {
+		t.Errorf("stop_reason = %q, want %q", sum.StopReason, "stop")
+	}
+	if sum.StopReasons["toolUse"] != 2 || sum.StopReasons["stop"] != 2 {
+		t.Errorf("stop_reasons = %v, want toolUse=2 stop=2", sum.StopReasons)
+	}
+
+	// Exact per-(provider, effectiveModel) grouped sums. snapshot sorts
+	// by provider then model, so anthropic comes first.
+	if len(sum.ByModel) != 2 {
+		t.Fatalf("by_model rows = %d, want 2: %+v", len(sum.ByModel), sum.ByModel)
+	}
+	anth, oai := sum.ByModel[0], sum.ByModel[1]
+
+	if anth.Provider != "anthropic" || anth.Model != "claude-x-2025" || anth.API != "messages" {
+		t.Errorf("anthropic key = %+v", anth)
+	}
+	wantAnth := summaryTokens{Input: 2000, Output: 1000, CacheRead: 25, CacheWrite: 75, Total: 3100}
+	if anth.Tokens != wantAnth {
+		t.Errorf("anthropic tokens = %+v, want %+v", anth.Tokens, wantAnth)
+	}
+	if anth.Cost != 0.5 {
+		t.Errorf("anthropic cost = %v, want exactly 0.5", anth.Cost)
+	}
+
+	if oai.Provider != "openai-codex" || oai.Model != "gpt-5.3-codex" || oai.API != "responses" {
+		t.Errorf("openai key = %+v", oai)
+	}
+	wantOAI := summaryTokens{Input: 3000, Output: 500, CacheRead: 100, CacheWrite: 50, Total: 3650}
+	if oai.Tokens != wantOAI {
+		t.Errorf("openai tokens = %+v, want %+v", oai.Tokens, wantOAI)
+	}
+	if oai.Cost != 0.75 {
+		t.Errorf("openai cost = %v, want exactly 0.75", oai.Cost)
+	}
+
+	// The grouped costs must sum back to the authoritative total, also
+	// exactly (no rounding drift between the two views).
+	if anth.Cost+oai.Cost != sum.Cost {
+		t.Errorf("grouped cost sum %v != total %v", anth.Cost+oai.Cost, sum.Cost)
+	}
+
+	// The rendered panel must show the full per-pair breakdown (two
+	// distinct pairs) and the exact pinned cost figures.
+	var buf bytes.Buffer
+	sum.writeText(&buf, 0)
+	out := buf.String()
+	for _, want := range []string{
+		"cost:        $1.2500",
+		"by model:",
+		"  anthropic/claude-x-2025 (messages)  cost=$0.5000",
+		"  openai-codex/gpt-5.3-codex (responses)  cost=$0.7500",
+		"    total:        3,100",
+		"    total:        3,650",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("exact-sum panel missing %q\n--- panel ---\n%s", want, out)
+		}
 	}
 }
 

@@ -64,6 +64,25 @@ type stats struct {
 	toolCalls  int
 	toolErrors int
 
+	// turns counts assistant turns across the run. pi's [stream.Usage]
+	// is per-turn (one assistant message == one turn), so the count is
+	// the number of usage-bearing assistant messages folded in — from
+	// the authoritative agent_end transcripts, or from the live
+	// [stats.TrackMessageUsage] calls in the partial fallback.
+	turns        int
+	partialTurns int
+
+	// stopReasons tallies the pi turn stop reason
+	// (stop|length|toolUse|error|aborted) by value, and lastStopReason
+	// keeps the terminal/most-recent one for the headline. Both come
+	// from the authoritative agent_end assistant messages; the partial
+	// fallback fills them from [stats.TrackMessageUsage] instead so a
+	// process that dies before agent_end still reports an honest reason.
+	stopReasons       map[string]int
+	lastStopReason    string
+	partialStops      map[string]int
+	partialLastReason string
+
 	tokens tokens
 	// cost is the running total in fractional USD. pi computes this
 	// itself per provider/model; ralph no longer carries a pricing
@@ -174,13 +193,15 @@ func newStats(model string, now func() time.Time, resultsHome string) *stats {
 		now = time.Now
 	}
 	return &stats{
-		model:       model,
-		now:         now,
-		resultsHome: resultsHome,
-		startTime:   now(),
-		events:      make(map[string]int),
-		blocks:      make(map[string]int),
-		byModel:     make(map[modelKey]*modelTally),
+		model:        model,
+		now:          now,
+		resultsHome:  resultsHome,
+		startTime:    now(),
+		events:       make(map[string]int),
+		blocks:       make(map[string]int),
+		byModel:      make(map[modelKey]*modelTally),
+		stopReasons:  make(map[string]int),
+		partialStops: make(map[string]int),
 	}
 }
 
@@ -226,10 +247,11 @@ func (s *stats) AddToolTime(d time.Duration) {
 // the process-died-early partial fallback. It is NOT the authoritative
 // per-iteration tally — that comes from the terminal [stream.AgentEnd]
 // via [stats.tallyAgentEnd]. A nil usage is tolerated and ignored.
-// provider/model/stopReason are accepted to satisfy the
-// [render.Recorder] contract; the partial fallback only needs the
-// token/cost figures, so they are not retained here.
-func (s *stats) TrackMessageUsage(u *stream.Usage, _, _, _ string) {
+// provider/model are accepted to satisfy the [render.Recorder] contract
+// but the partial fallback does not group by model. stopReason IS
+// retained here: it is part of the Q6 surface and the only place a
+// stop reason can be observed when the process dies before agent_end.
+func (s *stats) TrackMessageUsage(u *stream.Usage, _, _, stopReason string) {
 	if u == nil {
 		return
 	}
@@ -237,6 +259,12 @@ func (s *stats) TrackMessageUsage(u *stream.Usage, _, _, _ string) {
 	defer s.mu.Unlock()
 	s.partialTokens.add(tokensFromUsage(u))
 	s.partialCost += u.Cost.Total
+	// One usage-bearing assistant message == one pi turn.
+	s.partialTurns++
+	if stopReason != "" {
+		s.partialStops[stopReason]++
+		s.partialLastReason = stopReason
+	}
 }
 
 // TrackToolOutcome records one completed tool execution. Part of the
@@ -272,6 +300,18 @@ func (s *stats) tallyAgentEnd(ev stream.AgentEnd) {
 
 		s.tokens.add(tk)
 		s.cost += c
+		// pi's usage is per-turn, so each usage-bearing assistant
+		// message is one turn.
+		s.turns++
+
+		// stopReason is part of the Q6 surface. Tally it by value so a
+		// run that mixes reasons across turns/iterations reports an
+		// honest distribution; keep the last one for the headline (it
+		// reflects how the terminal turn actually ended).
+		if m.StopReason != "" {
+			s.stopReasons[m.StopReason]++
+			s.lastStopReason = m.StopReason
+		}
 
 		key := modelKey{
 			Provider: m.Provider,
@@ -305,30 +345,68 @@ func formatUSD(usd float64) string {
 }
 
 // summary is the per-run record rendered both as the operator-facing
-// text panel and as one line in the JSONL results log. The JSON shape
-// mirrors the text panel's sections so a downstream tool can
-// reconstruct the report. The schema changed under the pi migration
-// (no engine/effort; cost is pi's fractional USD; a per-model
-// breakdown was added) and carries no backward-compat guarantee.
+// text panel and as one JSON line in the results.jsonl log. The JSON
+// shape is the exact machine-readable mirror of the panel's sections so
+// a downstream tool can reconstruct the report verbatim. There is no
+// backward-compat guarantee — the schema is whatever the panel needs.
+//
+// Schema (results.jsonl, one object per line):
+//
+//   - reqs        — absolute path to the reqs directory the run drove.
+//   - model       — the operator-requested model label (banner only;
+//     cost is pi's, not derived from this name). Omitted when unset.
+//   - exit        — how the run terminated (done|timeout|errored|"").
+//     Omitted when empty (no terminal classification).
+//   - iterations  — number of loop iterations attempted.
+//   - turns       — pi assistant turns across the run (one usage-bearing
+//     assistant message == one turn).
+//   - events      — wire-event type → count (mirrors the events panel).
+//   - blocks      — assistant content-block type → count.
+//   - tool_calls  — completed tool executions.
+//   - tool_errors — the subset that reported isError.
+//   - stop_reason — the terminal/most-recent pi stop reason
+//     (stop|length|toolUse|error|aborted), "" if none was observed.
+//   - stop_reasons — stop reason → count; present only when more than
+//     one distinct reason occurred (the panel shows a tally only then).
+//   - tokens      — {input,output,cache_read,cache_write,total}; pi's
+//     own per-turn token accounting summed over the run.
+//   - cost        — run cost in fractional USD, a plain JSON number,
+//     copied verbatim from pi's per-turn accounting (no pricing table).
+//   - by_model    — per-(provider,effective-model) breakdown; each row
+//     carries its own tokens object and cost number plus the secondary
+//     api attribute. Always present (>=1 row whenever any usage was
+//     folded in) so a multi-provider run is never collapsed.
+//   - partial     — true when no terminal agent_end was ever folded in,
+//     so every figure above is the best-effort partial sum of the
+//     assistant message_end usages. Omitted (false) on a clean run.
+//   - time        — ralph's own engine-agnostic wall clock:
+//     {start,end,llm_seconds,tools_seconds,other_seconds,total_seconds}.
 type summary struct {
 	Reqs       string         `json:"reqs"`
-	Model      string         `json:"model"`
+	Model      string         `json:"model,omitempty"`
 	Exit       string         `json:"exit,omitempty"`
 	Iterations int            `json:"iterations"`
+	Turns      int            `json:"turns"`
 	Events     map[string]int `json:"events"`
 	Blocks     map[string]int `json:"blocks"`
 	ToolCalls  int            `json:"tool_calls"`
 	ToolErrors int            `json:"tool_errors"`
-	Tokens     summaryTokens  `json:"tokens"`
+	// StopReason is the terminal/most-recent pi stop reason; "" when no
+	// assistant message carried one.
+	StopReason string `json:"stop_reason,omitempty"`
+	// StopReasons is the by-value tally, emitted only when the run mixed
+	// more than one distinct reason (it is redundant with StopReason for
+	// a single-reason run, which the panel and schema both elide).
+	StopReasons map[string]int `json:"stop_reasons,omitempty"`
+	Tokens      summaryTokens  `json:"tokens"`
 	// Cost is the run cost in fractional USD, copied verbatim from pi's
 	// own per-turn accounting (ralph no longer prices tokens itself).
 	Cost float64 `json:"cost"`
-	// ByModel groups tokens and cost by (provider, model, api) so the
-	// grouped data survives even though rich panel formatting is a
-	// later slice.
+	// ByModel groups tokens and cost by (provider, effective-model, api)
+	// so a multi-provider run is never collapsed into one number.
 	ByModel []summaryModel `json:"by_model"`
 	// Partial is true when no terminal agent_end was ever folded in, so
-	// Tokens/Cost are the best-effort partial sum of the assistant
+	// Tokens/Cost/Turns are the best-effort partial sum of the assistant
 	// message_end usages (the process-died-early fallback).
 	Partial bool        `json:"partial,omitempty"`
 	Time    summaryTime `json:"time"`
@@ -336,14 +414,14 @@ type summary struct {
 
 type summaryTokens struct {
 	Input      int `json:"input"`
+	Output     int `json:"output"`
 	CacheRead  int `json:"cache_read"`
 	CacheWrite int `json:"cache_write"`
-	Output     int `json:"output"`
 	Total      int `json:"total"`
 }
 
-// summaryModel is one (provider, model, api) row of the per-model
-// breakdown.
+// summaryModel is one (provider, effective-model, api) row of the
+// per-model breakdown, carrying that pair's own tokens and cost.
 type summaryModel struct {
 	Provider string        `json:"provider"`
 	Model    string        `json:"model"`
@@ -394,10 +472,24 @@ func (s *stats) snapshot(reqs string, exit exitReason) summary {
 
 	tk := s.tokens
 	cost := s.cost
+	turns := s.turns
+	stops := s.stopReasons
+	lastStop := s.lastStopReason
 	partial := !s.agentEndSeen
 	if partial {
 		tk = s.partialTokens
 		cost = s.partialCost
+		turns = s.partialTurns
+		stops = s.partialStops
+		lastStop = s.partialLastReason
+	}
+
+	// The by-value stop tally is only meaningful (and only rendered)
+	// when the run actually mixed reasons; for the common single-reason
+	// run the headline StopReason already says everything.
+	var stopTally map[string]int
+	if len(stops) > 1 {
+		stopTally = maps.Clone(stops)
 	}
 
 	byModel := make([]summaryModel, 0, len(s.byModel))
@@ -421,18 +513,21 @@ func (s *stats) snapshot(reqs string, exit exitReason) summary {
 	})
 
 	return summary{
-		Reqs:       reqs,
-		Model:      s.model,
-		Exit:       exit.String(),
-		Iterations: s.iterations,
-		Events:     maps.Clone(s.events),
-		Blocks:     maps.Clone(s.blocks),
-		ToolCalls:  s.toolCalls,
-		ToolErrors: s.toolErrors,
-		Tokens:     toSummaryTokens(tk),
-		Cost:       cost,
-		ByModel:    byModel,
-		Partial:    partial,
+		Reqs:        reqs,
+		Model:       s.model,
+		Exit:        exit.String(),
+		Iterations:  s.iterations,
+		Turns:       turns,
+		Events:      maps.Clone(s.events),
+		Blocks:      maps.Clone(s.blocks),
+		ToolCalls:   s.toolCalls,
+		ToolErrors:  s.toolErrors,
+		StopReason:  lastStop,
+		StopReasons: stopTally,
+		Tokens:      toSummaryTokens(tk),
+		Cost:        cost,
+		ByModel:     byModel,
+		Partial:     partial,
 		Time: summaryTime{
 			Start:        s.startTime,
 			End:          end,
@@ -453,11 +548,55 @@ func (s *stats) iterationCount() int {
 	return s.iterations
 }
 
-// writeText renders sum to w in the operator-facing panel format.
-// width controls the bracketing horizontal rule; pass the value of
-// [ui.Theme.Width], or 0 to fall back to [ui.RuleFallbackWidth]. The
-// rich per-model panel is a later slice; here the breakdown is printed
-// as a basic block so the grouped data is visible without being lost.
+// modelLabel renders the operator-facing identifier for one per-model
+// breakdown row: "provider/effective-model", with the secondary pi api
+// attribute in parentheses when present (the same model can be served
+// through different pi APIs, so it is shown but is not part of the
+// single-vs-breakdown distinctness — that is keyed on the Q6
+// (provider, effectiveModel) pair only).
+func (m summaryModel) label() string {
+	label := m.Provider + "/" + m.Model
+	if m.API != "" {
+		label += " (" + m.API + ")"
+	}
+	return label
+}
+
+// distinctPairs counts the distinct Q6 (provider, effectiveModel) pairs
+// in the breakdown, ignoring the secondary api attribute. Exactly one
+// pair ⇒ the panel renders a single concise cost row; more than one ⇒
+// the full per-pair breakdown, so a multi-provider run is never
+// collapsed into one number.
+func distinctPairs(rows []summaryModel) int {
+	seen := make(map[[2]string]struct{}, len(rows))
+	for _, r := range rows {
+		seen[[2]string{r.Provider, r.Model}] = struct{}{}
+	}
+	return len(seen)
+}
+
+// writeTokenBreakdown prints the five-stream pi token accounting under
+// the given two-space-plus indent, used both for the run total and for
+// each per-model row.
+func writeTokenBreakdown(w io.Writer, indent string, t summaryTokens) {
+	fmt.Fprintf(w, "%sinput:        %s\n", indent, ui.FormatNumber(t.Input))
+	fmt.Fprintf(w, "%soutput:       %s\n", indent, ui.FormatNumber(t.Output))
+	fmt.Fprintf(w, "%scache read:   %s\n", indent, ui.FormatNumber(t.CacheRead))
+	fmt.Fprintf(w, "%scache write:  %s\n", indent, ui.FormatNumber(t.CacheWrite))
+	fmt.Fprintf(w, "%stotal:        %s\n", indent, ui.FormatNumber(t.Total))
+}
+
+// writeText renders sum to w in the operator-facing panel format. It is
+// the human-readable twin of the results.jsonl record: every section
+// here has a [summary] field behind it and vice versa. width controls
+// the bracketing horizontal rule; pass the value of [ui.Theme.Width],
+// or 0 to fall back to [ui.RuleFallbackWidth].
+//
+// The cost section implements the Q6 rule: pi's authoritative USD total
+// is always shown; then, if exactly one (provider, effectiveModel) pair
+// drove the whole run, a single concise row; if it varied, the full
+// per-pair breakdown (each pair its own token breakdown + cost) so a
+// multi-provider run is never collapsed into one number.
 func (sum summary) writeText(w io.Writer, width int) {
 	rule := ui.BuildRule(width)
 
@@ -473,7 +612,25 @@ func (sum summary) writeText(w io.Writer, width int) {
 	if sum.Partial {
 		fmt.Fprintln(w, "partial:     true (no agent_end observed; figures are a partial sum)")
 	}
-	fmt.Fprintf(w, "iterations:  %d\n\n", sum.Iterations)
+	fmt.Fprintf(w, "iterations:  %d\n", sum.Iterations)
+	fmt.Fprintf(w, "turns:       %d\n", sum.Turns)
+	if sum.StopReason != "" {
+		fmt.Fprintf(w, "stop reason: %s\n", sum.StopReason)
+	}
+	// The by-value tally is only carried when the run mixed reasons;
+	// for a single-reason run the headline above already says it all.
+	if len(sum.StopReasons) > 1 {
+		fmt.Fprintln(w, "stop reasons:")
+		reasons := make([]string, 0, len(sum.StopReasons))
+		for k := range sum.StopReasons {
+			reasons = append(reasons, k)
+		}
+		sort.Strings(reasons)
+		for _, k := range reasons {
+			fmt.Fprintf(w, "  %-*s %d\n", statsLabelWidth, k, sum.StopReasons[k])
+		}
+	}
+	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "events:")
 	writeCountSection(w, sum.Events, orderedEventTypes)
@@ -488,22 +645,27 @@ func (sum summary) writeText(w io.Writer, width int) {
 	fmt.Fprintf(w, "  %-*s %d\n\n", statsLabelWidth, "errors", sum.ToolErrors)
 
 	fmt.Fprintln(w, "tokens:")
-	fmt.Fprintf(w, "  input:        %s\n", ui.FormatNumber(sum.Tokens.Input))
-	fmt.Fprintf(w, "  cache read:   %s\n", ui.FormatNumber(sum.Tokens.CacheRead))
-	fmt.Fprintf(w, "  cache write:  %s\n", ui.FormatNumber(sum.Tokens.CacheWrite))
-	fmt.Fprintf(w, "  output:       %s\n", ui.FormatNumber(sum.Tokens.Output))
-	fmt.Fprintf(w, "  total:        %s\n\n", ui.FormatNumber(sum.Tokens.Total))
+	writeTokenBreakdown(w, "  ", sum.Tokens)
+	fmt.Fprintln(w)
 
 	fmt.Fprintf(w, "cost:        %s\n", formatUSD(sum.Cost))
-	if len(sum.ByModel) > 0 {
+	switch {
+	case len(sum.ByModel) == 0:
+		// No usage was folded in at all (e.g. a run that produced no
+		// assistant turns); the total above is the whole story.
+	case distinctPairs(sum.ByModel) == 1:
+		// Exactly one (provider, effectiveModel) pair drove the run:
+		// one concise row is enough, no redundant breakdown.
+		m := sum.ByModel[0]
+		fmt.Fprintf(w, "  %s  tokens=%s cost=%s\n",
+			m.label(), ui.FormatNumber(m.Tokens.Total), formatUSD(m.Cost))
+	default:
+		// Multiple pairs: the full per-pair breakdown, each with its
+		// own token breakdown and cost — never collapsed.
 		fmt.Fprintln(w, "by model:")
 		for _, m := range sum.ByModel {
-			label := m.Provider + "/" + m.Model
-			if m.API != "" {
-				label += " (" + m.API + ")"
-			}
-			fmt.Fprintf(w, "  %s  tokens=%s cost=%s\n",
-				label, ui.FormatNumber(m.Tokens.Total), formatUSD(m.Cost))
+			fmt.Fprintf(w, "  %s  cost=%s\n", m.label(), formatUSD(m.Cost))
+			writeTokenBreakdown(w, "    ", m.Tokens)
 		}
 	}
 	fmt.Fprintln(w)

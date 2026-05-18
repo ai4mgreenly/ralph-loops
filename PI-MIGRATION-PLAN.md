@@ -180,7 +180,21 @@ isolation rationale), `skel/OVERVIEW.md`, `cmd/ralph/usage.go`,
 Update `init_test.go`/`reset_test.go`/`usage_test.go`. Acceptance:
 build+test green.
 
-### G4 — Stats panel enrichment — `pending`
+### G4 — Stats panel enrichment — `done-verified` (2026-05-17)
+
+Verified independently: `make build`/`make test` green (8/8),
+`TestStats_ExactSumFromFixture` PASS, no `context-window` vestige.
+Full Q6 panel: token breakdown; total cost + per-(provider,
+effectiveModel) rule (single pair → concise row, multi → full
+breakdown, never collapsed); turn/tool-call/tool-error counts;
+stopReason headline + by-value tally when mixed; ralph wall-clock
+retained. `results.jsonl` schema locked + doc-commented (tokens
+object, cost number, `by_model` array always present, `partial`).
+Q14c: synthetic `internal/loop/testdata/exact-sum.jsonl` with
+dyadic-rational costs (honest float64 equality) asserting exact
+token/cost sums across 2 (provider,effectiveModel) pairs. Captured
+turns + stopReason inside stats.go only (no `iteration.go` change).
+Original spec below (kept for provenance):
 
 Q6 (full). Richer panel: tokens in/out/cacheRead/cacheWrite/total, pi
 cost + (provider, effectiveModel) breakdown, turn/tool-call/tool-error
@@ -261,3 +275,8 @@ this is done-verified.
   prioritized locked Q13 over the check and flagged it; independent
   sharper grep confirmed only the old *uppercase* control protocol
   was removed. Next: G4 (stats panel enrichment).
+- `2026-05-17` — **G4 done-verified** (commit follows). Full Q6
+  panel + locked `results.jsonl` schema + Q14c deterministic
+  exact-sum test (dyadic-rational costs, exact float64 equality, 2
+  provider pairs). Independent verify green. Next: G5 (live smoke +
+  fixture-regen make target + remaining fixture cases).
