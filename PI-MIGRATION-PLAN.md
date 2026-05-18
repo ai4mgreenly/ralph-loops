@@ -130,7 +130,20 @@ fixture-driven tests prove: DONE sentinel → StatusDone, CONTINUE →
 StatusContinue, missing/garbled sentinel → CONTINUE, no `agent_end`
 → iteration error.
 
-### G2 — CLI flag surface — `pending`
+### G2 — CLI flag surface — `done-verified` (2026-05-17)
+
+Verified independently: gofmt/vet clean, `make build`+`make test`
+green (8/8), removed flags (`--engine`/`--effort`/`--config-dir`/
+`--1m-context`/`--enable-claudeai-mcp-servers`/
+`--dangerously-skip-permissions`) rejected as undefined. Added
+`--provider`/`--thinking`; `--model` opaque pass-through; all three
+forwarded only when set, no ralph default/validation (pi validates).
+Default run → agent's full `read,bash,edit,write,grep,find,ls`
+allowlist (literal owned by `internal/agent`, not duplicated in cmd);
+operator `--tools` narrows. `kickoffPrompt` rewritten to a pure
+RALPH-STATUS nudge (no "read AGENTS.md"). `usage.go` flag docs
+updated. cmd-only slice; `internal/*` untouched.
+Original spec below (kept for provenance):
 
 Q7. `cmd/ralph/main.go`: delete `--engine`, `--config-dir`,
 `--1m-context`, `--enable-claudeai-mcp-servers`,
@@ -219,3 +232,8 @@ this is done-verified.
   no-sentinel→CONTINUE) + loop fixture tests (continue→re-iterate,
   truncated→`errStreamEnded`, truncated+cancelled-ctx→`ErrInterrupted`
   precedence). Next: G2 (CLI flag surface).
+- `2026-05-17` — **G2 done-verified** (commit follows). Q7 flag
+  surface + Q8 kickoffPrompt rewrite landed in `cmd/ralph` only.
+  Independent verify: gofmt/vet clean, `make build`/`make test` 8/8
+  green, `--engine`/`--effort` rejected as undefined flags. Next: G3
+  (scaffold/templates/docs purge).

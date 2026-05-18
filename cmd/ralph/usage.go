@@ -87,20 +87,40 @@ FLAGS (loop subcommand)
   --app-root=PATH                      application source subdirectory,
                                        relative to the project root
                                        (default: %q)
+  --provider=ID                        provider id forwarded to pi
+                                       verbatim as --provider. Optional
+                                       pass-through: ralph applies no
+                                       default and does no validation —
+                                       empty omits the flag so pi uses
+                                       its own configured default
+                                       (default: %q).
   --model=NAME                         model identifier forwarded to pi
-                                       verbatim (pi's provider/id and
-                                       model:thinking forms pass through
-                                       opaque). Empty uses pi's own
+                                       verbatim as --model (pi's
+                                       provider/id and model:thinking
+                                       forms pass through opaque; ralph
+                                       never parses it). Optional
+                                       pass-through, pi-validated: empty
+                                       omits the flag so pi uses its own
                                        configured default. Cost comes
                                        from pi itself, so any model is
                                        accepted (default: %q).
+  --thinking=LEVEL                     thinking level forwarded to pi
+                                       verbatim as --thinking. pi is the
+                                       validator (off|minimal|low|medium|
+                                       high|xhigh) — ralph applies no
+                                       default, mapping, or check. Empty
+                                       omits the flag so pi uses its own
+                                       configured default (default: %q).
   --duration=DURATION                  wall-clock budget, Go duration
                                        syntax: 30s, 90m, 4h, 1h30m.
                                        Empty = unlimited (default).
   --tools=LIST                         comma-separated tool list
-                                       forwarded to pi as --tools.
-                                       Empty = pi's built-in allowlist
-                                       (default).
+                                       forwarded to pi verbatim as
+                                       --tools. Empty (the default)
+                                       gives the build agent pi's full
+                                       built-in allowlist
+                                       (read,bash,edit,write,grep,find,
+                                       ls); an explicit list narrows it.
   --verbose[=BOOL]                     echo low-signal stream events
                                        (the pi session banner and the
                                        known-but-unused carriers)
@@ -140,11 +160,16 @@ EXAMPLES
       cd my-app
       ralph
 
-  Custom budget and a different model:
-      ralph --model=opus --duration=2h
+  Custom budget and a pinned provider/model (values are whatever pi
+  accepts; ralph forwards them untouched):
+      ralph --provider=PROVIDER --model=MODEL --duration=2h
 
-  Disable a default-on flag:
-      ralph --1m-context=false
+  Raise pi's thinking level for a harder slice (pi validates the
+  level; ralph forwards it untouched):
+      ralph --thinking=high
+
+  Narrow the agent's tools to read-only inspection:
+      ralph --tools=read,grep,find,ls
 
   Run against a project without cd'ing into it first:
       ralph --duration=2h /path/to/project
@@ -172,7 +197,9 @@ REQUIREMENT IDS
 		version,
 		defaultReqs,
 		defaultAppRoot,
+		defaultProvider,
 		defaultModel,
+		defaultThinking,
 		defaultOutputLines,
 	)
 }

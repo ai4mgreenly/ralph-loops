@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ai4mgreenly/ralph-loops/internal/agent"
 	"github.com/ai4mgreenly/ralph-loops/internal/idgen"
+	"github.com/ai4mgreenly/ralph-loops/internal/loop"
 )
 
 // runCapture invokes run() with the given args, captures stdout/stderr,
@@ -590,14 +594,172 @@ func TestRun_Help_AfterOtherFlags(t *testing.T) {
 	}
 }
 
-// TestRun_Loop_RejectsUnknownEngineFlag confirms the --engine knob was
-// removed under the pi migration: passing it is now an unknown-flag
-// usage error, not a recognised option.
-func TestRun_Loop_RejectsUnknownEngineFlag(t *testing.T) {
-	code, _, _ := runCapture("--engine=anything")
-	if code != exitUsage {
-		t.Errorf("exit = %d, want %d (--engine should be an unknown flag now)", code, exitUsage)
+// TestRun_Loop_RejectsRemovedClaudeFlags confirms every dead claude-era
+// knob stays deleted under the pi migration (Q7): each is now an
+// unknown-flag usage error, not a recognised option. --effort is
+// included: pi's native --thinking replaces it and ralph exposes no
+// effort knob.
+func TestRun_Loop_RejectsRemovedClaudeFlags(t *testing.T) {
+	removed := []string{
+		"--engine=anything",
+		"--config-dir=/tmp/x",
+		"--1m-context",
+		"--1m-context=false",
+		"--one-m-context",
+		"--enable-claudeai-mcp-servers",
+		"--dangerously-skip-permissions",
+		"--effort=high",
 	}
+	for _, flag := range removed {
+		t.Run(flag, func(t *testing.T) {
+			code, _, _ := runCapture(flag)
+			if code != exitUsage {
+				t.Errorf("exit = %d, want %d (%s must be an unknown flag now)", code, exitUsage, flag)
+			}
+		})
+	}
+}
+
+// capturingSpawner records the agent.Config every Spawn is handed and
+// then fails the spawn, so loop.Run resolves the full
+// option→agent.Config mapping (the pi pass-through contract) without a
+// real pi child. The recorded Config is the exact set of values that
+// would have been turned into pi argv tokens by internal/agent.
+type capturingSpawner struct {
+	got    *agent.Config
+	called bool
+}
+
+func (c *capturingSpawner) Spawn(_ context.Context, cfg agent.Config) (loop.Session, error) {
+	c.called = true
+	got := cfg
+	c.got = &got
+	// Returning an error stops the loop immediately after the config is
+	// captured; runLoop maps it to a runtime (non-usage) exit. We only
+	// assert the captured Config, not the run outcome.
+	return nil, errCaptureStop
+}
+
+var errCaptureStop = errors.New("capturing spawner: stop after first spawn")
+
+// captureAgentConfig runs the loop subcommand with the given extra
+// flags against a throwaway project root, intercepting loop.Run with a
+// stub that injects a capturingSpawner. It returns the agent.Config the
+// flag surface produced. This drives the REAL flag→loop.Option→
+// agent.Config path end to end, so it proves what pi would actually be
+// invoked with.
+func captureAgentConfig(t *testing.T, extraFlags ...string) agent.Config {
+	t.Helper()
+
+	tmp := t.TempDir()
+	appRoot := filepath.Join(tmp, "app-root")
+	if err := os.MkdirAll(appRoot, 0o755); err != nil {
+		t.Fatalf("mkdir app-root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appRoot, "AGENTS.md"), []byte("persona\n"), 0o644); err != nil {
+		t.Fatalf("write app AGENTS.md: %v", err)
+	}
+	reqsDir := filepath.Join(tmp, "reqs")
+	if err := os.MkdirAll(reqsDir, 0o755); err != nil {
+		t.Fatalf("mkdir reqs: %v", err)
+	}
+
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+
+	cap := &capturingSpawner{}
+	origLoopRun := loopRun
+	loopRun = func(ctx context.Context, cfg loop.Config, opts ...loop.Option) error {
+		// Append WithSpawner LAST so it wins over any production default,
+		// then delegate to the real loop.Run: this exercises the genuine
+		// option-resolution + agentConfig projection, only the subprocess
+		// is faked out.
+		return loop.Run(ctx, cfg, append(opts, loop.WithSpawner(cap))...)
+	}
+	t.Cleanup(func() { loopRun = origLoopRun })
+
+	// Flags must precede the PROJECT_ROOT positional: Go's flag package
+	// stops flag parsing at the first non-flag token, so a leading
+	// positional would make every --flag look like an extra positional.
+	args := append(append([]string{}, extraFlags...), tmp)
+	runCapture(args...)
+
+	if !cap.called {
+		t.Fatalf("spawner was never called for args %v", extraFlags)
+	}
+	return *cap.got
+}
+
+// TestRun_Loop_FlagContract is the end-to-end proof of decision Q7: the
+// flag surface forwards --provider/--model/--thinking only when the
+// operator sets them (no ralph-side default), passes them through
+// verbatim, and yields pi's full built-in tool allowlist by default
+// while letting an explicit --tools narrow it.
+func TestRun_Loop_FlagContract(t *testing.T) {
+	// (a) No provider/model/thinking flags → none forwarded; ralph adds
+	// no default of its own. An empty Tools is what the agent layer
+	// later expands into the full allowlist.
+	t.Run("defaults_pass_nothing_through", func(t *testing.T) {
+		cfg := captureAgentConfig(t)
+		if cfg.Provider != "" {
+			t.Errorf("Provider = %q, want empty (ralph applies no default)", cfg.Provider)
+		}
+		if cfg.Model != "" {
+			t.Errorf("Model = %q, want empty (ralph applies no default)", cfg.Model)
+		}
+		if cfg.Thinking != "" {
+			t.Errorf("Thinking = %q, want empty (ralph applies no default)", cfg.Thinking)
+		}
+		if cfg.Tools != "" {
+			t.Errorf("Tools = %q, want empty so the agent layer expands the full allowlist", cfg.Tools)
+		}
+	})
+
+	// (b) Each of provider/model/thinking set → forwarded verbatim, with
+	// NO ralph parsing/validation. The thinking value is deliberately
+	// not a member of pi's level set to prove ralph does not validate it.
+	t.Run("set_values_pass_through_verbatim", func(t *testing.T) {
+		cfg := captureAgentConfig(t,
+			"--provider=some-provider",
+			"--model=vendor/model-x:high",
+			"--thinking=not-a-real-level",
+		)
+		if cfg.Provider != "some-provider" {
+			t.Errorf("Provider = %q, want %q (verbatim)", cfg.Provider, "some-provider")
+		}
+		if cfg.Model != "vendor/model-x:high" {
+			t.Errorf("Model = %q, want %q (opaque verbatim)", cfg.Model, "vendor/model-x:high")
+		}
+		if cfg.Thinking != "not-a-real-level" {
+			t.Errorf("Thinking = %q, want %q (ralph must NOT validate; pi is the validator)", cfg.Thinking, "not-a-real-level")
+		}
+	})
+
+	// (c) Default tools: the cmd layer forwards an EMPTY Tools so the
+	// agent layer (which owns the literal allowlist and tests it in
+	// internal/agent's TestBuildArgs_DefaultToolsAllowlist) expands it
+	// into pi's full seven-tool built-in set. The cmd-side obligation —
+	// not duplicating the literal here, just forwarding "" — is what
+	// makes that expansion fire; we assert exactly that.
+	t.Run("default_tools_forward_empty_for_full_allowlist", func(t *testing.T) {
+		cfg := captureAgentConfig(t)
+		if cfg.Tools != "" {
+			t.Errorf("Tools = %q, want empty; a non-empty value would suppress the agent layer's full allowlist", cfg.Tools)
+		}
+	})
+
+	// (d) An operator --tools narrows the allowlist and is passed
+	// through to the agent layer verbatim (the agent layer then forwards
+	// it to pi unchanged because it is non-empty).
+	t.Run("operator_tools_narrow_verbatim", func(t *testing.T) {
+		cfg := captureAgentConfig(t, "--tools=read,grep")
+		if cfg.Tools != "read,grep" {
+			t.Errorf("Tools = %q, want %q (verbatim, narrows the default allowlist)", cfg.Tools, "read,grep")
+		}
+	})
 }
 
 // TestRun_Help_IsPiExclusive pins the pi-exclusive manual: it documents

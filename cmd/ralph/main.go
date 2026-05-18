@@ -32,12 +32,24 @@ import (
 // value here is what unstamped builds (e.g. `go run`) report.
 var version = "dev"
 
-// kickoffPrompt is the single-iteration nudge sent to the agent. The
-// standing operator instructions live in the app-root AGENTS.md file
-// scaffolded by `ralph init`; claude auto-loads that file from the
-// working directory, so the kickoff only needs to wake the agent and
-// point it at the standing instructions.
-const kickoffPrompt = "Read AGENTS.md if you have not already, then perform one iteration of work as described there."
+// loopRun is the indirection through which runLoop reaches the driver.
+// Production points it at [loop.Run]; tests swap it for a capturing
+// stub so the flag→option mapping (the pi pass-through contract for
+// --provider/--model/--thinking/--tools) can be asserted without
+// forking a real pi child. It is a var, not a direct call, purely so
+// the cmd-layer flag surface is testable in isolation.
+var loopRun = loop.Run
+
+// kickoffPrompt is the single-iteration nudge sent to the agent. Under
+// the pi migration the build-agent persona and its standing
+// instructions are injected as pi's system prompt (ralph forwards the
+// app-root AGENTS.md via --append-system-prompt), so there is no file
+// for the agent to discover and the kickoff must NOT tell it to read
+// one. The nudge only wakes the agent for a single iteration and pins
+// the status contract: the loop decides DONE vs CONTINUE solely from
+// the bare last line of the agent's final reply, so that line must be
+// exactly `RALPH-STATUS: DONE` or `RALPH-STATUS: CONTINUE`.
+const kickoffPrompt = "Perform exactly one iteration of the work described in your instructions, then stop. End your final reply with a bare last line that is exactly `RALPH-STATUS: DONE` (the spec is fully implemented and verified) or `RALPH-STATUS: CONTINUE` (more iterations remain), with nothing after it."
 
 // Default values for every flag the loop subcommand accepts. Centralised
 // here so the help text and the FlagSet stay in sync.
@@ -50,10 +62,21 @@ const (
 	defaultReqs           = "reqs"
 	defaultAppRoot        = "app-root"
 	defaultUnverifiedReqs = "../reqs"
-	// defaultModel is empty: ralph is pi-exclusive and no longer
-	// imposes a model. An empty --model omits pi's --model flag so pi
-	// uses its own configured default.
-	defaultModel       = ""
+	// defaultProvider, defaultModel, and defaultThinking are all empty
+	// on purpose: ralph is a pure pass-through for pi's provider/model/
+	// thinking selection and imposes NO ralph-side default for any of
+	// them. An empty value omits the corresponding pi flag entirely, so
+	// pi falls back to its own ~/.pi/agent/settings.json. ralph never
+	// parses, validates, or maps these values — pi is the validator
+	// (e.g. it owns the off|minimal|low|medium|high|xhigh thinking set).
+	defaultProvider = ""
+	defaultModel    = ""
+	defaultThinking = ""
+	// defaultTools is empty so ralph forwards no --tools value of its
+	// own. The agent layer turns an empty Tools into pi's full built-in
+	// allowlist (read,bash,edit,write,grep,find,ls); a non-empty
+	// operator --tools narrows it and is passed through verbatim. The
+	// allowlist literal is owned by internal/agent, not duplicated here.
 	defaultTools       = ""
 	defaultOutputLines = 10
 )
@@ -245,9 +268,11 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 	var (
 		reqs        = fs.String("reqs", defaultReqs, "path to requirements directory, relative to the project root")
 		appRoot     = fs.String("app-root", defaultAppRoot, "path to the application source subdirectory, relative to the project root")
-		model       = fs.String("model", defaultModel, "model identifier forwarded to pi verbatim; empty uses pi's configured default")
+		provider    = fs.String("provider", defaultProvider, "provider id forwarded to pi verbatim; empty omits --provider so pi uses its own default")
+		model       = fs.String("model", defaultModel, "model identifier forwarded to pi verbatim (provider/id and model:thinking forms pass through opaque); empty omits --model so pi uses its own default")
+		thinking    = fs.String("thinking", defaultThinking, "thinking level forwarded to pi verbatim and validated by pi (off|minimal|low|medium|high|xhigh); empty omits --thinking so pi uses its own default")
 		duration    time.Duration
-		tools       = fs.String("tools", defaultTools, "comma-separated tool list forwarded to pi; empty means pi's built-in allowlist")
+		tools       = fs.String("tools", defaultTools, "comma-separated tool list forwarded to pi verbatim; empty gives the build agent pi's full built-in allowlist (read,bash,edit,write,grep,find,ls)")
 		verbose     = fs.Bool("verbose", false, "echo low-signal stream events (the pi session banner and known-but-unused carriers)")
 		raw         = fs.Bool("raw", false, "debug passthrough: dump pi stdout verbatim as JSONL, suppress all decoration, run one iteration")
 		outputLines = fs.Int("output-lines", defaultOutputLines, "max lines of tool output to replay per result before truncating with `...`")
@@ -316,8 +341,16 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		SystemPromptFile: systemPromptFile,
 		Theme:            theme,
 	}
+	// Provider/model/thinking are pure pass-throughs: forward whatever
+	// the operator gave verbatim. ralph applies no default and does no
+	// validation/mapping — an empty value reaches the agent layer as ""
+	// and is omitted from pi's argv, so pi uses its own settings.json.
+	// --tools is likewise forwarded verbatim; an empty value lets the
+	// agent layer expand it to pi's full built-in allowlist.
 	opts := []loop.Option{
+		loop.WithProvider(*provider),
 		loop.WithModel(*model),
+		loop.WithThinking(*thinking),
 		loop.WithVersion(version),
 		loop.WithDuration(duration),
 		loop.WithTools(*tools),
@@ -326,7 +359,7 @@ func runLoop(args []string, stdout, stderr io.Writer) int {
 		loop.WithOutputLines(*outputLines),
 	}
 
-	if err := loop.Run(context.Background(), cfg, opts...); err != nil {
+	if err := loopRun(context.Background(), cfg, opts...); err != nil {
 		fmt.Fprintf(stderr, "ralph: %s\n", err)
 		return exitRuntime
 	}

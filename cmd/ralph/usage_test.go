@@ -31,10 +31,44 @@ func TestWriteUsage_ContainsVersionAndDefaults(t *testing.T) {
 		"app-root",
 		// The --app-root flag is documented in the FLAGS section.
 		"--app-root",
+		// Q7 final flag surface: the three pi pass-throughs are
+		// documented.
+		"--provider=ID",
+		"--model=NAME",
+		"--thinking=LEVEL",
+		// The default-tools behaviour is spelled out: an empty --tools
+		// yields pi's full built-in allowlist.
+		"--tools=LIST",
+		"read,bash,edit,write,grep,find,",
+		// pi is the validator for thinking; ralph applies no default.
+		"off|minimal|low|medium|",
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
 			t.Errorf("writeUsage output missing %q", w)
+		}
+	}
+
+	// The dead claude-era knobs must not survive anywhere in the manual,
+	// nor any claude/stream-json/Anthropic wording in the flag prose.
+	// The check is case-insensitive so no casing of the vendor wording
+	// slips back in.
+	lower := strings.ToLower(out)
+	bannedSubstrings := []string{
+		"--engine",
+		"--config-dir",
+		"--1m-context",
+		"--one-m-context",
+		"--enable-claudeai-mcp-servers",
+		"--dangerously-skip-permissions",
+		"--effort",
+		"claude",
+		"stream-json",
+		"anthropic",
+	}
+	for _, b := range bannedSubstrings {
+		if strings.Contains(lower, b) {
+			t.Errorf("writeUsage output still mentions removed/claude wording %q", b)
 		}
 	}
 }
