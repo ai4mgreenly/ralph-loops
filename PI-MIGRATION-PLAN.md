@@ -202,7 +202,21 @@ counts, stopReason; ralph wall-clock timings retained; `results.jsonl`
 schema updated to the pi shape. Acceptance: build+test green;
 known-fixed-number fixture asserts exact cost/token sums.
 
-### G5 — Test corpus + live smoke + regen target — `pending`
+### G5 — Test corpus + live smoke + regen target — `done-verified` (2026-05-17)
+
+Verified independently (from repo root, absolute paths): `make test`
+8/8, `TestLive_PiSmoke` SKIPs cleanly ungated, `tool-error`/
+`multi-turn` fixture tests pass, `go vet -tags pilive
+./internal/agent/` compiles (gated live path not bitrotted),
+`regen.sh` carries `</dev/null` (Q9, load-bearing, commented) and
+explicitly excludes `exact-sum.jsonl`, `make fixtures` target wired.
+Live smoke is triple-gated (build tag `pilive` + `RALPH_PI_LIVE=1` +
+`pi` on PATH). Two new real fixtures captured by the orchestrator
+(`tool-error.jsonl` isError:true; `multi-turn.jsonl` 2 read+edit
+pairs, DONE) complete the Q14a corpus. Orchestrator note: `exact-sum`
+lives in `internal/loop/testdata/` (not stream/) — subagent flagged
+the brief's table error; exclusion enforced structurally regardless.
+Original spec below (kept for provenance):
 
 Q14b/c/d. Gated live smoke (`RALPH_PI_LIVE=1` / build tag,
 auto-skip unauthed); documented `make` target to regenerate the
@@ -280,3 +294,12 @@ this is done-verified.
   exact-sum test (dyadic-rational costs, exact float64 equality, 2
   provider pairs). Independent verify green. Next: G5 (live smoke +
   fixture-regen make target + remaining fixture cases).
+- `2026-05-17` — **G5 done-verified** (commit follows). Gated live
+  smoke (Q14b, triple-gated), `make fixtures` regen target +
+  documented script (Q14d, `</dev/null` load-bearing), Q14a corpus
+  completed with `tool-error`/`multi-turn` real fixtures + tests.
+  Orchestrator process note: an earlier verification run failed
+  spuriously because a prior `cd …/testdata` persisted in the shell
+  (violates `rules`: never cd); re-verified from repo root with
+  absolute paths — all green. Henceforth absolute paths only. Next:
+  G6 (final sweep & migration close).

@@ -6,7 +6,7 @@ GOLANGCI_LINT_VERSION := v1.62.2
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build install test test-race cover bench lint fmt fmt-check tidy tidy-check tools clean check
+.PHONY: help build install test test-race cover bench lint fmt fmt-check tidy tidy-check tools clean check fixtures
 
 help: ## Print this help
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | \
@@ -76,3 +76,24 @@ clean: ## Remove build and coverage artifacts
 	rm -rf bin
 	rm -f coverage.*
 	go clean -testcache
+
+# fixtures regenerates internal/stream/testdata/ from LIVE pi (Q14(d)).
+#
+# This is NOT part of `make test` and is intentionally not in `check`.
+# Run it only when pi's `-p --mode json` event format drifts (pi is 0.x;
+# its event vocabulary moves fast) and the frozen captures no longer
+# match reality — usually signalled by TestLive_PiSmoke failing or the
+# stream tests breaking after a pi upgrade.
+#
+# COST/PREREQS: every capture is a REAL `pi -p --mode json` run against
+# live oauth. It spends real API budget and requires `pi` installed and
+# authed (~/.pi/agent/auth.json). CI/unauthed environments cannot run it
+# and must not. The script redirects pi's stdin from /dev/null (pi hangs
+# forever on an unclosed stdin — a prior capture confirmed this) and
+# derives truncated.jsonl from the freshly captured done.jsonl.
+#
+# exact-sum.jsonl is the hand-authored Q14(c) deterministic fixture and
+# is NEVER regenerated (it lives under internal/loop/testdata/ and the
+# script excludes it by name regardless).
+fixtures: ## Regenerate internal/stream/testdata from LIVE pi (costs API; needs pi authed)
+	internal/stream/testdata/regen.sh

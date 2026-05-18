@@ -29,6 +29,38 @@ config.
 - Tests use `_test.go` files and table-driven cases where it shortens
   the file. New tests should pass with `-race`.
 
+## pi fixtures and the live smoke test
+
+ralph drives the `pi` CLI and decodes its native `-p --mode json` event
+stream. The decoder is tested against a corpus of **real captured** pi
+runs under `internal/stream/testdata/` (plus one derived
+`truncated.jsonl`). These fixtures are frozen and checked in; ordinary
+`make test` never touches pi.
+
+- **`exact-sum.jsonl`** (under `internal/loop/testdata/`) is the only
+  *hand-authored* fixture. It carries fixed token/cost numbers for the
+  deterministic exact-sum tally test and is **never regenerated**.
+
+- **`make fixtures`** regenerates the real-captured corpus from live
+  pi. Run it **only** when pi's event format drifts (pi is 0.x; its
+  event vocabulary moves fast) and the frozen captures no longer match
+  reality. It runs `internal/stream/testdata/regen.sh`, which performs
+  real `pi -p --mode json` calls: it **costs live API budget** and
+  needs `pi` installed and authed (`~/.pi/agent/auth.json`). The script
+  redirects pi's stdin from `/dev/null` (pi hangs forever on an
+  unclosed stdin) and explicitly never overwrites `exact-sum.jsonl`.
+
+- **`TestLive_PiSmoke`** (`internal/agent/`) is a gated live smoke
+  test: the early warning for pi 0.x format drift. It is double-gated
+  so CI and unauthed environments always skip cleanly — it needs the
+  `pilive` build tag *and* `RALPH_PI_LIVE=1` *and* `pi` on `$PATH`. Run
+  it deliberately with:
+
+      RALPH_PI_LIVE=1 go test -tags pilive ./internal/agent/ \
+          -run TestLive_PiSmoke -v
+
+  It costs a real API call. The default build does not compile it.
+
 ## Commit messages
 
 Look at `git log --oneline` for the convention. In short:
